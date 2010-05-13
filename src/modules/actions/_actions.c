@@ -20,8 +20,7 @@
  */
 
 /*
- * Copyright 2010 Sun Microsystems, Inc.  All rights reserved.
- * Use is subject to license terms.
+ * Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
  */
 
 #include <Python.h>
@@ -98,7 +97,10 @@ set_invaliderr(const char *str, const char *msg)
 static PyObject *
 _fromstr(PyObject *self, PyObject *args)
 {
-	char *s, *str, *keystr, *slashmap = NULL;
+	char *s = NULL;
+	char *str = NULL;
+	char *keystr = NULL;
+	char *slashmap = NULL;
 	int strl;
 	int i, ks, vs, keysize;
 	char quote;
@@ -118,7 +120,13 @@ _fromstr(PyObject *self, PyObject *args)
 #define malformed(msg) set_malformederr(str, i, (msg))
 #define invalid(msg) set_invaliderr(str, (msg))
 
-	if (PyArg_ParseTuple(args, "s#", &str, &strl) == 0) {
+	/*
+	 * The action string is currently assumed to be a stream of bytes that
+	 * are valid UTF-8.  This method works regardless of whether the string
+	 * object provided is a Unicode object, string object, or a character
+	 * buffer.
+	 */
+	if (PyArg_ParseTuple(args, "et#", "utf-8", &str, &strl) == 0) {
 		PyErr_SetString(PyExc_ValueError, "could not parse argument");
 		return (NULL);
 	}
@@ -126,15 +134,20 @@ _fromstr(PyObject *self, PyObject *args)
 	s = strpbrk(str, " \t");
 
 	i = strl;
-	if (s == NULL)
+	if (s == NULL) {
+		PyMem_Free(str);
 		return (malformed("no attributes"));
+	}
 
-	if ((type = PyString_FromStringAndSize(str, s - str)) == NULL)
+	if ((type = PyString_FromStringAndSize(str, s - str)) == NULL) {
+		PyMem_Free(str);
 		return (NULL);
+	}
 
 	ks = vs = s - str;
 	state = WS;
 	if ((attrs = PyDict_New()) == NULL) {
+		PyMem_Free(str);
 		Py_DECREF(type);
 		return (NULL);
 	}
@@ -145,6 +158,7 @@ _fromstr(PyObject *self, PyObject *args)
 
 			if (str[i] == ' ' || str[i] == '\t') {
 				if (PyDict_Size(attrs) > 0 || hash != NULL) {
+					PyMem_Free(str);
 					Py_DECREF(type);
 					Py_DECREF(attrs);
 					Py_XDECREF(hash);
@@ -152,16 +166,20 @@ _fromstr(PyObject *self, PyObject *args)
 				}
 				else {
 					if ((hash = PyString_FromStringAndSize(
-						keystr, keysize)) == NULL)
+						keystr, keysize)) == NULL) {
+						PyMem_Free(str);
 						return (NULL);
+					}
 					state = WS;
 				}
 			} else if (str[i] == '=') {
 				if ((key = PyString_FromStringAndSize(
-					keystr, keysize)) == NULL)
+					keystr, keysize)) == NULL) {
+					PyMem_Free(str);
 					return (NULL);
-
+				}
 				if (keysize == 4 && strncmp(keystr, "data", keysize) == 0) {
+					PyMem_Free(str);
 					Py_DECREF(key);
 					Py_DECREF(type);
 					Py_DECREF(attrs);
@@ -170,6 +188,7 @@ _fromstr(PyObject *self, PyObject *args)
 				}
 
 				if (i == ks) {
+					PyMem_Free(str);
 					Py_DECREF(key);
 					Py_DECREF(type);
 					Py_DECREF(attrs);
@@ -177,6 +196,7 @@ _fromstr(PyObject *self, PyObject *args)
 					return (malformed("impossible: missing key"));
 				}
 				else if (++i == strl) {
+					PyMem_Free(str);
 					Py_DECREF(key);
 					Py_DECREF(type);
 					Py_DECREF(attrs);
@@ -188,6 +208,7 @@ _fromstr(PyObject *self, PyObject *args)
 					quote = str[i];
 					vs = i + 1;
 				} else if (str[i] == ' ' || str[i] == '\t') {
+					PyMem_Free(str);
 					Py_DECREF(key);
 					Py_DECREF(type);
 					Py_DECREF(attrs);
@@ -199,6 +220,7 @@ _fromstr(PyObject *self, PyObject *args)
 					vs = i;
 				}
 			} else if (str[i] == '\'' || str[i] == '\"') {
+				PyMem_Free(str);
 				Py_DECREF(type);
 				Py_DECREF(attrs);
 				Py_XDECREF(hash);
@@ -218,8 +240,10 @@ _fromstr(PyObject *self, PyObject *args)
 				if (slashmap == NULL) {
 					int smlen = strl - (i - vs);
 					slashmap = calloc(1, smlen + 1);
-					if (slashmap == NULL)
+					if (slashmap == NULL) {
+						PyMem_Free(str);
 						return (PyErr_NoMemory());
+					}
 				}
 				i++;
 				if (str[i] == '\\' || str[i] == quote) {
@@ -234,6 +258,7 @@ _fromstr(PyObject *self, PyObject *args)
 					attrlen = i - vs;
 					sattr = calloc(1, attrlen + 1);
 					if (sattr == NULL) {
+						PyMem_Free(str);
 						free(slashmap);
 						return (PyErr_NoMemory());
 					}
@@ -255,28 +280,37 @@ _fromstr(PyObject *self, PyObject *args)
 
 					if ((attr = PyString_FromStringAndSize(
 						sattr, attrlen - o)) == NULL) {
+						PyMem_Free(str);
 						free(sattr);
 						return (NULL);
 					}
 					free(sattr);
 				} else if ((attr = PyString_FromStringAndSize(
-					&str[vs], i - vs)) == NULL) 
+					&str[vs], i - vs)) == NULL) {
+					PyMem_Free(str);
 					return (NULL);
-				if (add_to_attrs(attrs, key, attr) == -1)
+				}
+
+				if (add_to_attrs(attrs, key, attr) == -1) {
+					PyMem_Free(str);
 					return (NULL);
+				}
 			}
 		} else if (state == UQVAL) {
 			if (str[i] == ' ' || str[i] == '\t') {
 				state = WS;
 				attr = PyString_FromStringAndSize(&str[vs], i - vs);
-				if (add_to_attrs(attrs, key, attr) == -1)
+				if (add_to_attrs(attrs, key, attr) == -1) {
+					PyMem_Free(str);
 					return (NULL);
+				}
 			}
 		} else if (state == WS) {
 			if (str[i] != ' ' && str[i] != '\t') {
 				state = KEY;
 				ks = i;
 				if (str[i] == '=') {
+					PyMem_Free(str);
 					Py_DECREF(type);
 					Py_DECREF(attrs);
 					Py_XDECREF(hash);
@@ -290,6 +324,7 @@ _fromstr(PyObject *self, PyObject *args)
 		if (slashmap != NULL)
 			free(slashmap);
 
+		PyMem_Free(str);
 		Py_DECREF(key);
 		Py_DECREF(type);
 		Py_DECREF(attrs);
@@ -297,6 +332,7 @@ _fromstr(PyObject *self, PyObject *args)
 		return (malformed("unfinished quoted value"));
 	}
 	if (state == KEY) {
+		PyMem_Free(str);
 		Py_DECREF(type);
 		Py_DECREF(attrs);
 		Py_XDECREF(hash);
@@ -305,10 +341,13 @@ _fromstr(PyObject *self, PyObject *args)
 
 	if (state == UQVAL) {
 		attr = PyString_FromStringAndSize(&str[vs], i - vs);
-		if (add_to_attrs(attrs, key, attr) == -1)
+		if (add_to_attrs(attrs, key, attr) == -1) {
+			PyMem_Free(str);
 			return (NULL);
+		}
 	}
 
+	PyMem_Free(str);
 	if (hash == NULL)
 		hash = Py_None;
 

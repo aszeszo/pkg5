@@ -29,6 +29,7 @@ import difflib
 import errno
 import gettext
 import os
+import pprint
 import shutil
 import signal
 import string
@@ -487,6 +488,12 @@ class Pkg5TestCase(unittest.TestCase):
         
         def assertEqualDiff(self, expected, actual):
                 """Compare two strings."""
+
+                if not isinstance(expected, basestring):
+                        expected = pprint.pformat(expected)
+                if not isinstance(actual, basestring):
+                        actual = pprint.pformat(actual)
+
                 self.assertEqual(expected, actual,
                     "Actual output differed from expected output.\n" +
                     "\n".join(difflib.unified_diff(
@@ -975,6 +982,11 @@ class Pkg5TestSuite(unittest.TestSuite):
                 unittest.TestSuite.__init__(self, tests)
                 self.timing = {}
 
+                # The site module deletes the function to change the
+                # default encoding so a forced reload of sys has to
+                # be done at least once.
+                reload(sys)
+
         def cleanup_and_die(self, inst, info):
                 print >> sys.stderr, \
                     "\nCtrl-C: Attempting cleanup during %s" % info
@@ -993,8 +1005,21 @@ class Pkg5TestSuite(unittest.TestSuite):
                         persistent_setup = getattr(self._tests[0],
                             "persistent_setup", False)
                 except IndexError:
-                        # No tests, thats ok.
+                        # No tests; that's ok.
                         return
+
+                # This is needed because the import of some modules (such as
+                # pygtk or pango) causes the default encoding for Python to be
+                # changed which can can cause tests to succeed when they should
+                # fail due to unicode issues:
+                #     https://bugzilla.gnome.org/show_bug.cgi?id=132040
+                default_utf8 = getattr(self._tests[0], "default_utf8", False)
+                if not default_utf8:
+                        # Now reset to the default a standard Python
+                        # distribution uses.
+                        sys.setdefaultencoding("ascii")
+                else:
+                        sys.setdefaultencoding("utf-8")
 
                 def setUp_donothing():
                         pass
