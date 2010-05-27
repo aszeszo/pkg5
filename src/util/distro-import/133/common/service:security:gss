@@ -2,6 +2,9 @@ package service/security/gss
 consolidation "osnet"
 classification "System/Security"
 import SUNWgssc
+depend service/security/kerberos-5
+depend system/library/security/gss/diffie-hellman
+depend system/library/security/gss/spnego
 
 chattr etc/gss/gsscred.conf \
 	original_name=SUNWgssc:etc/gss/gsscred.conf

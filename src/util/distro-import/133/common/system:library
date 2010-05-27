@@ -12,6 +12,7 @@ $(i386_ONLY)chattr lib/libc.so.1 drop preserve
 $(i386_ONLY)chattr usr/lib/libc/libc_hwcap1.so.1 reboot-needed=true
 $(i386_ONLY)chattr usr/lib/libc/libc_hwcap2.so.1 reboot-needed=true
 $(i386_ONLY)chattr usr/lib/libc/libc_hwcap3.so.1 reboot-needed=true
+depend system/library/storage/scsi-plugins
 end package
 
 package SUNWcsl

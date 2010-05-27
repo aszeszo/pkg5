@@ -2,6 +2,7 @@ package runtime/perl-584
 consolidation "osnet"
 classification "Development/Perl"
 import SUNWperl584core
+depend runtime/perl-584/extra
 version 5.8.4
 end package
 

@@ -247,4 +247,7 @@ add driver name=pts \
     perms="1 0620 root tty" \
     perms="2 0620 root tty" \
     perms="3 0620 root tty"
+
+depend release/name
+depend system/data/keyboard/keytables
 end package

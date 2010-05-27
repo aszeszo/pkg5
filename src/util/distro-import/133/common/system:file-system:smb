@@ -9,6 +9,7 @@ add driver name=nsmb \
     perms="* 0666 root sys" \
     devlink="type=ddi_pseudo;name=nsmb\t\D"
 
+depend system/library/iconv/utf-8
 end package
 
 package SUNWsmbfs
