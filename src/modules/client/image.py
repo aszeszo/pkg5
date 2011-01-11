@@ -21,7 +21,7 @@
 #
 
 #
-# Copyright (c) 2007, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2007, 2011, Oracle and/or its affiliates. All rights reserved.
 #
 
 import atexit
@@ -568,6 +568,10 @@ class Image(object):
                 # one, any old data is removed first.
                 if purge and os.path.exists(self.imgdir):
                         for entry in os.listdir(self.imgdir):
+                                if entry == "ssl":
+                                        # Preserve certs and keys directory
+                                        # as a special exception.
+                                        continue
                                 epath = os.path.join(self.imgdir, entry)
                                 try:
                                         if os.path.isdir(epath):
