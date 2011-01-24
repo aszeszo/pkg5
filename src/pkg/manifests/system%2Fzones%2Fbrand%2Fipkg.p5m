@@ -18,7 +18,7 @@
 #
 # CDDL HEADER END
 #
-# Copyright (c) 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2010, 2011, Oracle and/or its affiliates. All rights reserved.
 #
 
 set name=pkg.fmri value=pkg:/system/zones/brand/ipkg@$(PKGVERS)
@@ -27,7 +27,7 @@ set name=pkg.description value="A branded zone whose software is managed using t
 set name=info.classification value=org.opensolaris.category.2008:System/Packaging
 set name=com.oracle.service.bugid \
     last-fmri=package/pkg@0.5.11,5.11-0.151.0.1:20101104T233545Z \
-    value=7011650
+    value=7011650 value=7012085
 set name=variant.arch value=$(ARCH)
 
 dir path=etc
