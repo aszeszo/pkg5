@@ -20,7 +20,7 @@
 # CDDL HEADER END
 #
 
-# Copyright (c) 2007, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2007, 2011, Oracle and/or its affiliates. All rights reserved.
 
 import calendar
 import cStringIO
@@ -63,7 +63,7 @@ def get_release_notes_url():
 
         # TBD: replace with a call to api.info() that can return a "release"
         # attribute of form YYYYMM against the SUNWsolnm package
-        return "http://docs.sun.com/doc/821-1479"
+        return "http://download.oracle.com/docs/cd/E19963-01/"
 
 def time_to_timestamp(t):
         """convert seconds since epoch to %Y%m%dT%H%M%SZ format"""
