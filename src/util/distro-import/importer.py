@@ -19,8 +19,9 @@
 #
 # CDDL HEADER END
 #
+
 #
-# Copyright (c) 2009, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2009, 2011, Oracle and/or its affiliates. All rights reserved.
 #
 
 import fnmatch
@@ -56,7 +57,7 @@ from pkg.bundle.SolarisPackageDirBundle import SolarisPackageDirBundle
 from pkg.misc import emsg
 from pkg.portable import PD_LOCAL_PATH, PD_PROTO_DIR, PD_PROTO_DIR_LIST
 
-CLIENT_API_VERSION = 46
+CLIENT_API_VERSION = 70
 PKG_CLIENT_NAME = "importer.py"
 pkg.client.global_settings.client_name = PKG_CLIENT_NAME
 
@@ -69,9 +70,8 @@ gettext.install("import", "/usr/lib/locale")
 # to global name table. Actions are annotated to include svr4 source
 # pkg & path
 
-
 basename_dict = {}   # basenames to action lists
-branch_dict = {}     # 
+branch_dict = {}     #
 cons_dict = {}       # consolidation incorporation dictionaries
 file_repo = False    #
 curpkg = None        # which IPS package we're currently importing
@@ -104,6 +104,8 @@ summary_detritus = [", (usr)", ", (root)", " (usr)", " (root)", " (/usr)", \
 svr4pkgsseen = {}    #svr4 pkgs seen - pkgs indexed by name
 timestamp_files = [] # patterns of files that retain timestamps from svr4 pkgs
 tmpdirs = []
+# consolidations to unincorporate via an empty incorporation
+unincorporate_via_empty = []
 wos_path = []        # list of search pathes for svr4 packages
 
 local_smf_manifests = tempfile.mkdtemp(prefix="pkg_smf.") # where we store our SMF manifests
@@ -177,8 +179,8 @@ class Package(object):
                 else:
                         hollow = False
 
-                # Only pull the actual SVR4 file data into the bundle if it's likely
-                # to contain an SMF manifest.
+                # Only pull the actual SVR4 file data into the bundle if it's
+                # likely to contain an SMF manifest.
                 for a in bundle:
                         if a.name == "file" and \
                             smf_manifest.has_smf_manifest_dir(a.attrs["path"]):
@@ -202,8 +204,8 @@ class Package(object):
                                         print "excluding %s from %s" % \
                                             (action.attrs["path"], imppkg_name)
                                 continue
- 
-                        if action.name == "unknown":
+
+                        if action.name in ["unknown", "legacy", "set"]:
                                 continue
 
                         action.attrs["importer.source"] = "svr4pkg"
@@ -214,7 +216,7 @@ class Package(object):
                                 # The "path" attribute is confusing and
                                 # unnecessary for licenses.
                                 del action.attrs["path"]
-                        
+
                         if action.name == "file":
                                 # is this a file for which we need a timestamp?
                                 basename = os.path.basename(action.attrs["path"])
@@ -224,13 +226,19 @@ class Package(object):
                                 else:
                                         del action.attrs["timestamp"]
 
-                                # is this file likely to be an SMF manifest? If so,
-                                # save a copy of the file to use for dependency analysis
+                                # is this file likely to be an SMF manifest?
+                                # If so, save a copy of the file to use for
+                                # dependency analysis
                                 if smf_manifest.has_smf_manifest_dir(action.attrs["path"]):
                                         fetch_file(action, local_smf_manifests)
-                                        
+
                         if hollow:
                                 action.attrs["variant.opensolaris.zone"] = "global"
+
+                        # we can drop all pkg.send.convert keys
+                        for key in action.attrs.keys():
+                                if key.startswith("pkg.send.convert"):
+                                        del action.attrs[key]
 
                         self.check_perms(action)
                         self.actions.append(action)
@@ -271,7 +279,7 @@ class Package(object):
 
         def chattr(self, fname, line):
                 matches = [
-                    a 
+                    a
                     for a in self.actions
                     if "path" in a.attrs and a.attrs["path"] == fname
                 ]
@@ -331,7 +339,7 @@ class Package(object):
                 o = [
                         f
                         for f in self.actions
-                        if "path" in f.attrs and 
+                        if "path" in f.attrs and
                             fnmatch.fnmatchcase(f.attrs["path"], glob) and
                             (not type or type == f.name)
                      ]
@@ -389,8 +397,8 @@ def check_pathdict_actions(my_path_dict, remove_dups=False, allow_dir_goofs=Fals
         # investigate all paths w/ multiple actions
         errorlist = []
         for p in my_path_dict:
-                # check to make sure all higher parts of path are indeed directories -
-                # avoid publishing through symlinks
+                # check to make sure all higher parts of path are indeed
+                # directories - avoid publishing through symlinks
                 tmp = p
 
                 while True:
@@ -423,19 +431,38 @@ def check_pathdict_actions(my_path_dict, remove_dups=False, allow_dir_goofs=Fals
                                 errorlist.append("Multiple %s actions with same path and different targets:\n\t%s\n" %
                                     (dups[0].name, "\n\t".join(str(d) for d in dups)))
                         continue
-                        
+
                 elif dups[0].name != "dir":
-                        errorlist.append("Multiple actions with the same path that aren't directories:\n\t%s\n" %
-                            ("\n\t".join(str(d) for d in dups)))
+                        # we have already merged package-level variants into the
+                        # this action, so passing {} is ok.
+                        conflict, vars = conflicting_variants(dups, {})
+                        if conflict:
+                                errorlist.append("Multiple actions with the same path that aren't directories:\n\t%s\n" %
+                                    ("\n\t".join(str(d) for d in dups)))
                         continue
 
-                # construct glommed attrs dict; this check could be more thorough
+                # construct glommed attrs dict; this check could be more
+                # thorough
                 dkeys = set([
                     k
                     for d in dups
                     for k in d.attrs.keys()
                 ])
-                ga = dict(zip(dkeys, [set([d.attrs.get(k, None) for d in dups]) for k in dkeys]))
+
+                # create a dictionary of all attribute values for a given
+                # attribute across our duplicates.  Each item in the dictionary
+                # should be a set of seen values for that attribute.
+                ga = {}
+                for k in dkeys:
+                        ga[k] = [d.attrs.get(k, None) for d in dups]
+                        l = []
+                        for item in ga[k]:
+                                if isinstance(item, set):
+                                        l.append(frozenset(item))
+                                else:
+                                        l.append(item)
+                        ga[k] = set(l)
+
                 for g in ga:
                         if len(ga[g]) == 1:
                                 continue
@@ -446,15 +473,52 @@ def check_pathdict_actions(my_path_dict, remove_dups=False, allow_dir_goofs=Fals
                                         print >> sys.stderr, "%s\n" % dir_error
                                 else:
                                         errorlist.append(dir_error)
-                        
+
                         elif remove_dups and g.startswith("variant.") and None in ga[g]:
-                                # remove any dirs that are zone variants if same dir w/o variant exists
+                                # remove any dirs that are zone variants if same
+                                # dir w/o variant exists
                                 for d in dups:
                                         if d.attrs.get(g) != None:
                                                 d.attrs["importer.deleteme"] = "True"
                                                 if 1 or show_debug:
                                                         print "removing %s as hollow dup" % d
         return errorlist
+
+def conflicting_variants(actions, pkg_vars):
+        """Given a set of actions, determine that none of the actions
+        have matching variant values for any variant."""
+
+        conflicts = False
+        conflict_vars = set()
+        action_list = []
+
+        for action in actions:
+                action_list.append(action)
+
+        # compare every action in the list with every other,
+        # determining what actions have conflicting variants
+        # The comparison is commutative.
+        for i in range(0, len(action_list)):
+                action = action_list[i]
+                var = action.get_variant_template()
+                # if we don't declare any variants on a given
+                # action, then it's automatically a conflict
+                if len(var) == 0:
+                        conflicts = True
+                vc = variant.VariantCombinations(var, True)
+                for j in range(i + 1, len(action_list)):
+                        cmp_action = action_list[j]
+                        cmp_var = variant.VariantCombinations(
+                            cmp_action.get_variant_template(), True)
+                        if vc.intersects(cmp_var):
+                                intersection = vc.intersection(cmp_var)
+                                intersection.simplify(pkg_vars,
+                                    assert_on_different_domains=False)
+                                conflicts = True
+                                for k in intersection.sat_set:
+                                        if len(k) != 0:
+                                                conflict_vars.add(k)
+        return conflicts, conflict_vars
 
 def start_package(pkgname):
         set_macro("PKGNAME", urllib.quote(pkgname, ""))
@@ -467,27 +531,25 @@ def end_package(pkg):
         elif "-" not in pkg.version:
                 pkg.version += "-%s" % pkg_branch
 
-       # add description actions
+        # add description actions
         if pkg.desc:
-                pkg.actions.append( actions.attribute.AttributeAction(None,
+                pkg.actions.append(actions.attribute.AttributeAction(None,
                     name="pkg.description", value=pkg.desc))
-
         if pkg.summary:
-                pkg.actions.extend([
-                    actions.attribute.AttributeAction(None,
-                        name="pkg.summary", value=pkg.summary),
-                    actions.attribute.AttributeAction(None,
-                        name="description", value=pkg.summary)
-                ])
+                pkg.actions.append(actions.attribute.AttributeAction(None,
+                    name="pkg.summary", value=pkg.summary))
         if pkg.classification:
                 pkg.actions.append(actions.attribute.AttributeAction(None,
                     name="info.classification", value=pkg.classification))
 
-        # add dependency on consolidation incorporation if not obsolete or renamed
-        if pkg.consolidation and not pkg.obsolete_branch and not pkg.rename_branch:
+        # add dependency on consolidation incorporation if not obsolete
+        # or renamed or if part of an unincorporated consolidation
+        if pkg.consolidation and \
+            pkg.consolidation not in unincorporate_via_empty and \
+            not pkg.obsolete_branch and not pkg.rename_branch:
                 action = actions.fromstr(
                     "depend fmri=consolidation/%s/%s-incorporation "
-                    "type=require importer.no-version=true" % 
+                    "type=require importer.no-version=true" %
                     (pkg.consolidation, pkg.consolidation))
                 pkg.actions.append(action)
 
@@ -547,14 +609,14 @@ def publish_action(t, pkg, a):
         except TypeError, e:
                 print a.attrs
                 print a.name
-                
+
                 raise
-        
+
 def publish_pkg(pkg, proto_dir):
         """ send this package to the repo """
 
         smf_fmris = []
-        
+
         svr4_pkg_list = sorted(list(set([
             a.attrs["importer.svr4pkg"]
             for a in pkg.actions
@@ -633,7 +695,7 @@ def publish_pkg(pkg, proto_dir):
                 for fmri in smf_fmris:
                         values = values + " value=%s" % fmri
                 publish_action(t, pkg,
-                    actions.fromstr("set name=opensolaris.smf.fmri %s" % values))
+                    actions.fromstr("set name=org.opensolaris.smf.fmri %s" % values))
 
         # publish any actions w/ data defined in import file
         for a in pkg.actions:
@@ -739,7 +801,7 @@ def search_dicts(path):
                         newpath = os.path.normpath(
                                     os.path.join(os.path.split(np)[0], nt))
                         assert path.startswith(np)
-                        ret = [pkgpath_dict[p][0]] 
+                        ret = [pkgpath_dict[p][0]]
                         next = search_dicts(path.replace(np, newpath))
                         if next:
                                 ret += next
@@ -750,7 +812,7 @@ def search_dicts(path):
 
 def get_smf_fmris(file, action_path):
         """ pull the delivered SMF FMRIs from file, associated with action_path """
-        
+
         if smf_manifest.has_smf_manifest_dir(action_path):
                 instance_mf, instance_deps = smf_manifest.parse_smf_manifest(file)
                 if instance_mf:
@@ -802,7 +864,7 @@ def gen_hardlink_depend_actions(action):
         target = action.attrs["target"]
         path = action.attrs["path"]
         if not target.startswith("/"):
-                target = os.path.normpath( os.path.join(os.path.split(path)[0],
+                target = os.path.normpath(os.path.join(os.path.split(path)[0],
                     target))
         return [actions.fromstr(
             "depend importer.file=%s fmri=none type=require importer.source=hardlink" %
@@ -822,7 +884,8 @@ def gen_file_depend_actions(action, fname, proto_dir):
                 # add #!/ dependency
                 if l.startswith("#!/"):
                         p = (l[2:].split()[0]) # first part of string is path (removes options)
-                        # we don't handle dependencies through links, so fix up the common one
+                        # we don't handle dependencies through links, so fix up
+                        # the common one
                         if p.startswith("/bin"):
                                 p = "/usr" + p
                         return_actions.append(actions.fromstr("depend fmri=none importer.file=%s type=require importer.depsource=%s" %
@@ -834,9 +897,8 @@ def gen_file_depend_actions(action, fname, proto_dir):
 
                 # handle smf manifests
                 if smf_manifest.has_smf_manifest_dir(path):
-                        
-                        # pkg.flavor.* used by pkgdepend wants PD_LOCAL_PATH, PD_PROTO_DIR
-                        # and PD_PROTO_DIR_LIST set
+                        # pkg.flavor.* used by pkgdepend wants PD_LOCAL_PATH,
+                        # PD_PROTO_DIR and PD_PROTO_DIR_LIST set
                         action.attrs[PD_LOCAL_PATH] = fname
                         action.attrs[PD_PROTO_DIR] = proto_dir
                         action.attrs[PD_PROTO_DIR_LIST] = [proto_dir]
@@ -862,7 +924,7 @@ def gen_file_depend_actions(action, fname, proto_dir):
                 rp = []
         else:
                 deps = [
-                    a 
+                    a
                     for d in ed.get("deps", [])
                     for a in d[0].split()
                     ]
@@ -979,7 +1041,7 @@ def get_manifest(server_pub, fmri):
         if not fmri: # no matching fmri
                 return null_manifest
 
-        return manifest_cache.setdefault((server_pub, fmri), 
+        return manifest_cache.setdefault((server_pub, fmri),
             fetch_manifest(server_pub, fmri))
 
 def fetch_manifest(server_pub, fmri):
@@ -1032,7 +1094,7 @@ def load_catalog(server_pub):
         for k in d:
                 d[k].sort(reverse=True)
 
-        catalog_dict[server_pub] = d        
+        catalog_dict[server_pub] = d
 
 def expand_fmri(server_pub, fmri_string, constraint=version.CONSTRAINT_AUTO):
         """ from specified server, find matching fmri using CONSTRAINT_AUTO
@@ -1040,13 +1102,18 @@ def expand_fmri(server_pub, fmri_string, constraint=version.CONSTRAINT_AUTO):
         if server_pub not in catalog_dict:
                 load_catalog(server_pub)
 
-        fmri = pkg.fmri.PkgFmri(fmri_string, "5.11")        
+        fmri = pkg.fmri.PkgFmri(fmri_string, "5.11")
 
         for f in catalog_dict[server_pub].get(fmri.pkg_name, []):
                 if not fmri.version or f.version.is_successor(fmri.version, constraint):
                         return f
         return None
 
+def get_latest_fmris(server_pub):
+        """From specified server, get latest version of all fmris"""
+        if server_pub not in catalog_dict:
+                load_catalog(server_pub)
+        return set(catalog_dict[server_pub][f][-1] for f in catalog_dict[server_pub])
 
 def get_dependencies(server_pub, fmri_list):
         s = set()
@@ -1060,7 +1127,7 @@ def _get_dependencies(s, server_pub, fmri):
         s.add(fmri)
         for a in get_manifest(server_pub, fmri).gen_actions_by_type("depend"):
                 if a.attrs["type"] == "incorporate":
-                        new_fmri = expand_fmri(server_pub, a.attrs["fmri"]) 
+                        new_fmri = expand_fmri(server_pub, a.attrs["fmri"])
                         if new_fmri and new_fmri not in s: # ignore missing, already planned
                                 _get_dependencies(s, server_pub, new_fmri)
 
@@ -1114,7 +1181,7 @@ def get_smf_packages(server_url, manifest_locations, filter):
                                 fmris.add(pfmri.get_fmri())
 
         return [pkg.fmri.PkgFmri(pfmri) for pfmri in fmris]
-        
+
 def zap_strings(instr, strings):
         """takes an input string and a list of strings to be removed, ignoring
         case"""
@@ -1126,7 +1193,7 @@ def zap_strings(instr, strings):
                         if i < 0:
                                 break
                         instr = instr[0:i] + instr[i + len(ls):]
-        return instr 
+        return instr
 
 def get_branch(name):
         return branch_dict.get(name, def_branch)
@@ -1137,7 +1204,7 @@ def set_macro(key, value):
 def clear_macro(key):
         del macro_definitions["$(%s)" % key]
 
-def get_arch(): # use value of arch macro or platform 
+def get_arch(): # use value of arch macro or platform
         return macro_definitions.get("$ARCH", platform.processor())
 
 def read_full_line(lexer, continuation='\\'):
@@ -1189,7 +1256,7 @@ class tokenlexer(shlex.shlex):
                 """ simple replacement of $(ARCH) with a non-special
                 value defined on the command line is trivial.  Since
                 shlex's read_token routine also strips comments and
-                white space, this read_token cannot return either 
+                white space, this read_token cannot return either
                 one so any macros that translate to either spaces or
                 # (comment) need to be removed from the token stream."""
 
@@ -1391,7 +1458,7 @@ def SolarisParse(mf):
 def repo_add_content(path_to_repo, path_to_proto):
         """Fire up depo to add content and rebuild search index"""
 
-        cmdname = os.path.join(path_to_proto, "usr/bin/pkgrepo") 
+        cmdname = os.path.join(path_to_proto, "usr/bin/pkgrepo")
         argstr = "%s -s %s refresh" % (cmdname, path_to_repo)
 
         print "Adding content & rebuilding search indicies synchronously...."
@@ -1432,10 +1499,11 @@ def main_func():
         global curpkg
         global xport
         global xport_cfg
+        global unincorporate_via_empty
 
-        
+
         try:
-                _opts, _args = getopt.getopt(sys.argv[1:], "AB:C:D:E:I:J:G:NR:T:b:dj:m:ns:v:w:p:")
+                _opts, _args = getopt.getopt(sys.argv[1:], "AB:C:D:E:I:J:G:NR:T:U:b:dj:m:ns:v:w:p:")
         except getopt.GetoptError, _e:
                 print "unknown option", _e.opt
                 sys.exit(1)
@@ -1459,7 +1527,7 @@ def main_func():
                                 raise RuntimeError("Invalid prototype area specified.")
                         # Clean up relative ../../, etc. out of path to proto
                         g_proto_area = os.path.realpath(arg)
-                elif  opt == "-s":
+                elif opt == "-s":
                         def_repo = arg
                         if def_repo.startswith("file://"):
                                 file_repo = True
@@ -1501,6 +1569,8 @@ def main_func():
                         reference_uris.append(arg)
                 elif opt == "-T":
                         timestamp_files.append(arg)
+                elif opt == "-U":
+                        unincorporate_via_empty.append(arg)
 
         if not def_branch:
                 print "need a branch id (build number)"
@@ -1564,7 +1634,7 @@ def main_func():
         for _mf in filelist:
                 SolarisParse(_mf)
 
-        # Remove pkgs we're not touching  because we're skipping that
+        # Remove pkgs we're not touching because we're skipping that
         # consolidation
 
         pkgs_to_elide = [
@@ -1585,11 +1655,11 @@ def main_func():
                 except KeyError:
                         print "excluded package %s not in pkgdict" % pkg
 
-        # Unless we are publishing all obsolete and renamed packages 
+        # Unless we are publishing all obsolete and renamed packages
         # (-A command line option), remove obsolete and renamed packages
-        # that weren't obsoleted or renamed at this branch and create 
+        # that weren't obsoleted or renamed at this branch and create
         # a dictionary (called or_pkgs_per_con) of obsoleted and renamed
-        # packages per consolidation.  The version portion of the fmri 
+        # packages per consolidation.  The version portion of the fmri
         # will contain the branch that the package was obsoleted or renamed at.
         or_pkgs_per_con = {}
         obs_or_renamed_pkgs = {}
@@ -1633,7 +1703,7 @@ def main_func():
         # we've now pulled any SMF manifests found in the repository for this
         # branch, as well as those present in the packages to import.
         # Update our SMF manifest cache now.
-        smf_manifest.SMFManifestDependency.populate_cache(local_smf_manifests,
+        smf_manifest.SMFManifestDependency.populate_cache([local_smf_manifests],
             force_update=True)
 
         print "Second pass: global crosschecks", datetime.now()
@@ -1667,7 +1737,7 @@ def main_func():
                         if action.attrs["type"] == "require" and "fmri" in action.attrs:
                                 fmri = action.attrs["fmri"].split("@")[0] # remove version
                                 if fmri.startswith("pkg:/"): # remove pkg:/ if exists
-                                        fmri = fmri[5:] 
+                                        fmri = fmri[5:]
                                 if fmri in obs_or_renamed_pkgs:
                                         tup = obs_or_renamed_pkgs[fmri]
                                         s = "Pkg %s has 'require' dependency on pkg %s, which is %s" % (
@@ -1695,26 +1765,43 @@ def main_func():
                         server, fmri_string = uri.split("@", 1)
                         server_pub = transport.setup_publisher(server,
                             "reference", xport, xport_cfg, remote_prefix=True)
-                        for pfmri in get_dependencies(server_pub, [fmri_string]):
+                        if fmri_string == "*":
+                                fmri_set = get_latest_fmris(server_pub)
+                        else:
+                                fmri_set = get_dependencies(server_pub, [fmri_string])
+
+                        for pfmri in fmri_set:
                                 if pfmri is None:
                                         continue
                                 if pfmri.get_name() in pkgdict:
                                         continue # ignore pkgs already seen
                                 pfmri_str = "%s@%s" % (pfmri.get_name(), pfmri.get_version())
                                 fmridict[pfmri.get_name()] = pfmri_str
-                                for action in get_manifest(server_pub, pfmri).gen_actions(excludes):
+                                mf = get_manifest(server_pub, pfmri)
+                                pkg_vars = mf.get_all_variants()
+                                for action in mf.gen_actions(excludes):
                                         if "path" not in action.attrs:
                                                 continue
                                         if action.name == "unknown":
-                                                # we don't care about unknown actions -
-                                                # mispublished packages with eg. SVR4
-                                                # pkginfo files result in duplicate paths,
-                                                # causing errors in check_pathdict_actions
-                                                # "Multiple actions on different types
                                                 # with the same path"
+                                                # we don't care about unknown
+                                                # actions - mispublished
+                                                # packages with eg. SVR4 pkginfo
+                                                # files result in duplicate
+                                                # paths, causing errors in
+                                                # check_pathdict_actions
+                                                # "Multiple actions on different
+                                                # types with the same path"
                                                 print "INFO: ignoring action in %s: %s" \
                                                     % (pfmri_str, str(action))
                                                 continue
+
+                                        # merge the package level variants into
+                                        # this action
+                                        variants = action.get_variant_template()
+                                        variants.merge_unknown(pkg_vars)
+                                        action.attrs.update(variants)
+
                                         action.attrs["importer.ipspkg"] = pfmri_str
                                         path_dict.setdefault(action.attrs["path"], []).append(action)
                                         if action.name in ["file", "link", "hardlink"]:
@@ -1747,28 +1834,32 @@ def main_func():
                 curpkg.summary = "%s consolidation incorporation" % cons
                 curpkg.desc = "This incorporation constrains packages " \
                         "from the %s consolidation." % cons
+                curpkg.classification = \
+                    "org.opensolaris.category.2008:Meta Packages/Incorporations"
 
-                # Add packages that aren't renamed or obsoleted
-                or_pkgs = or_pkgs_per_con.get(cons, {})
-                curpkg.actions.append(actions.fromstr(
-                    "set name=pkg.depend.install-hold value=core-os.%s" % cons))
+                if cons not in unincorporate_via_empty:
+                        # Add packages that aren't renamed or obsoleted
+                        or_pkgs = or_pkgs_per_con.get(cons, {})
+                        curpkg.actions.append(actions.fromstr(
+                            "set name=pkg.depend.install-hold value=core-os.%s" % cons))
 
-                for depend in cons_dict[cons]:
-                        if depend not in or_pkgs:
+                        for depend in cons_dict[cons]:
+                                if depend not in or_pkgs:
+                                        action = actions.fromstr(
+                                            "depend fmri=%s type=incorporate" % depend)
+                                        action.attrs["importer.source"] = "depend"
+                                        curpkg.actions.append(action)
+
+                        # Add in the obsoleted and renamed packages for this
+                        # consolidation.
+                        for name, version in or_pkgs.iteritems():
                                 action = actions.fromstr(
-                                    "depend fmri=%s type=incorporate" % depend)
+                                    "depend fmri=%s@%s type=incorporate" %
+                                        (name, version))
                                 action.attrs["importer.source"] = "depend"
                                 curpkg.actions.append(action)
-
-                # Add in the obsoleted and renamed packages for this
-                # consolidation.
-                for name, version in or_pkgs.iteritems():
-                        action = actions.fromstr(
-                            "depend fmri=%s@%s type=incorporate" %
-                                (name, version))
-                        action.attrs["importer.source"] = "depend"
-                        curpkg.actions.append(action)
                         obsoleted_renamed_pkgs.append("%s@%s" % (name, version))
+
                 action = actions.fromstr("set " \
                     "name=org.opensolaris.consolidation value=%s" % cons)
                 action.attrs["importer.source"] = "add"
@@ -1776,20 +1867,33 @@ def main_func():
                 end_package(curpkg)
                 curpkg = None
 
-        # Generate entire consolidation if we're generating any consolidation incorps
+        #
+        # Generate entire incorporation if we're generating any consolidation
+        # incorporations
+        #
         if consolidation_incorporations:
                 curpkg = start_package("entire")
-                curpkg.summary = "incorporation to lock all system packages to same build" 
+                curpkg.summary = "Incorporation to lock all system packages " \
+                    "to the same build"
                 curpkg.desc = "This package constrains " \
                     "system package versions to the same build.  WARNING: Proper " \
                     "system update and correct package selection depend on the " \
                     "presence of this incorporation.  Removing this package will " \
                     "result in an unsupported system."
+                curpkg.classification = \
+                    "org.opensolaris.category.2008:Meta Packages/Incorporations"
                 curpkg.actions.append(actions.fromstr(
                     "set name=pkg.depend.install-hold value=core-os"))
+                curpkg.actions.append(actions.fromstr(
+                    "set name=variant.opensolaris.zone value=global value=nonglobal"))
+                curpkg.actions.append(actions.fromstr(
+                    "depend fmri=feature/package/dependency/self type=parent " \
+                    "variant.opensolaris.zone=nonglobal"))
 
                 for incorp in consolidation_incorporations:
-                        action = actions.fromstr("depend fmri=%s type=incorporate" % incorp)
+                        action = actions.fromstr(
+                            "depend fmri=%s type=incorporate "
+                            "facet.version-lock.%s=true" % (incorp, incorp))
                         action.attrs["importer.source"] = "auto-generated"
                         curpkg.actions.append(action)
                         action = actions.fromstr("depend fmri=%s type=require" % incorp)
@@ -1798,10 +1902,13 @@ def main_func():
                         curpkg.actions.append(action)
 
                 for extra in extra_entire_contents:
-                        action = actions.fromstr("depend fmri=%s type=incorporate" % extra)
+                        extra_noversion = extra.split("@")[0] # remove version
+                        action = actions.fromstr(
+                            "depend fmri=%s type=incorporate "
+                            "facet.version-lock.%s=true"
+                            % (extra, extra_noversion))
                         action.attrs["importer.source"] = "command-line"
                         curpkg.actions.append(action)
-                        extra_noversion = extra.split("@")[0] # remove version
                         action = actions.fromstr("depend fmri=%s type=require" % extra_noversion)
                         action.attrs["importer.source"] = "command-line"
                         action.attrs["importer.no-version"] = "true"
@@ -1815,15 +1922,15 @@ def main_func():
                                 f
                                 for l in cons_dict.values()
                                 for f in l
-                                ]) 
+                                ])
                 incorporated_pkgs |= set(consolidation_incorporations)
                 incorporated_pkgs |= set(["entire", "redistributable"])
                 incorporated_pkgs |= set(obsoleted_renamed_pkgs)
-                                
+
                 unincorps = set(pkgdict.keys()) - incorporated_pkgs
                 if unincorps:
-                        # look through these; if they have only set actions they're
-                        # ancient obsoleted pkgs - ignore them.
+                        # look through these; if they have only set actions
+                        # they're ancient obsoleted pkgs - ignore them.
                         for f in unincorps.copy():
                                 for a in pkgdict[f].actions:
                                         if a.name != "set":
@@ -1833,7 +1940,7 @@ def main_func():
 
                         print "The following non-empty unincorporated pkgs are not part of any consolidation"
                         for f in unincorps:
-                                print f      
+                                print f
         if just_these_pkgs:
                 newpkgs = set(pkgdict[name]
                               for name in pkgdict.keys()
@@ -1884,11 +1991,11 @@ def main_func():
                         sys.exit(code)
 
         print "Done:", datetime.now()
-        elapsed = time.clock() - start_time 
+        elapsed = time.clock() - start_time
         print "publication took %d:%.2d" % (elapsed/60, elapsed % 60)
         cleanup()
         sys.exit(0)
-        
+
 if __name__ == "__main__":
         main_func()
 

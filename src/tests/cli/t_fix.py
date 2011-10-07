@@ -20,7 +20,7 @@
 # CDDL HEADER END
 #
 
-# Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2008, 2011, Oracle and/or its affiliates. All rights reserved.
 
 import testutils
 if __name__ == "__main__":
@@ -32,6 +32,7 @@ import pkg.fmri as fmri
 import pkg.manifest as manifest
 import pkg.portable as portable
 import pkg.misc as misc
+import shutil
 import time
 import unittest
 
@@ -92,6 +93,8 @@ class TestFix(pkg5unittest.SingleDepotTestCase):
             add dir path=/tmp mode=755 owner=root group=root
             add dir mode=0755 owner=root group=root path=/var
             add dir mode=0755 owner=root group=root path=/var/run
+            add dir mode=0755 owner=root group=root path=/system
+            add dir mode=0755 owner=root group=root path=/system/volatile
             add file tmp/empty path=/etc/driver_aliases mode=644 owner=root group=sys preserve=true
             add file tmp/empty path=/etc/name_to_major mode=644 owner=root group=sys preserve=true
             add file tmp/empty path=/etc/driver_classes mode=644 owner=root group=sys
@@ -118,21 +121,6 @@ class TestFix(pkg5unittest.SingleDepotTestCase):
                         pfmri.publisher = None
                         sfmri = pfmri.get_short_fmri().replace("pkg:/", "")
                         self.plist[sfmri] = pfmri
-
-        def file_inode(self, path):
-                file_path = os.path.join(self.get_img_path(), path)
-                st = os.stat(file_path)
-                return st.st_ino
-
-        def file_size(self, path):
-                file_path = os.path.join(self.get_img_path(), path)
-                st = os.stat(file_path)
-                return st.st_size
-
-        def file_append(self, path, string):
-                file_path = os.path.join(self.get_img_path(), path)
-                with open(file_path, "a+") as f:
-                        f.write("\n%s\n" % string)
 
         def test_01_basics(self):
                 """Basic fix test: install the amber package, modify one of the
@@ -170,6 +158,13 @@ class TestFix(pkg5unittest.SingleDepotTestCase):
                 # check that we didn't reindex
                 new_mtime = os.stat(index_file).st_mtime
                 self.assertEqual(orig_mtime, new_mtime)
+
+                # Verify that removing the publisher of a package that needs
+                # fixing results in graceful failure (not a traceback).
+                self.file_append(victim, "foobar")
+                self.pkg("set-publisher -P --no-refresh -g %s foo" % self.rurl)
+                self.pkg("unset-publisher test")
+                self.pkg("fix", exit=1)
 
         def test_02_hardlinks(self):
                 """Hardlink test: make sure that a file getting fixed gets any
@@ -211,8 +206,10 @@ class TestFix(pkg5unittest.SingleDepotTestCase):
                 size2 = self.file_size(victim)
                 self.assertNotEqual(size1, size2)
 
-                # Verify that the fix will fail since the license requires
-                # acceptance.
+                # Verify that the fix will fail if the license file needs fixing
+                # since the license action requires acceptance.
+                img = self.get_img_api_obj().img
+                shutil.rmtree(os.path.join(img.imgdir, "license"))
                 self.pkg("fix licensed", exit=6)
 
                 # Verify that when the fix failed, it displayed the license

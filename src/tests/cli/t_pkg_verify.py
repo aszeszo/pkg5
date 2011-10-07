@@ -20,7 +20,7 @@
 # CDDL HEADER END
 #
 
-# Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2008, 2011, Oracle and/or its affiliates. All rights reserved.
 
 import testutils
 if __name__ == "__main__":
@@ -68,28 +68,23 @@ class TestPkgVerify(pkg5unittest.SingleDepotTestCase):
                 self.make_misc_files(self.misc_files)
                 self.pkgsend_bulk(self.rurl, self.foo10)
 
-        def test_pkg_verify_bad_opts(self):
+        def test_00_bad_opts(self):
                 """ test pkg verify with bad options """
 
                 self.image_create(self.rurl)
                 self.pkg("verify -vq", exit=2)
 
-        def test_bug_1463(self):
-                """When multiple FMRIs are given to pkg verify,
-                if any of them aren't installed it should fail."""
-
-                self.image_create(self.rurl)
-                self.pkg("install foo")
-                self.pkg("verify foo nonexistent", exit=1)
-                self.pkg("uninstall foo")
-
-        def test_0_verify(self):
+        def test_01_basics(self):
                 """Ensure that verify returns failure as expected when packages
                 are not correctly installed."""
 
                 # XXX either this should be more comprehensive or more testing
                 # needs to be added somewhere else appropriate.
                 self.image_create(self.rurl)
+
+                # Create a dummy publisher so that test publisher can be removed
+                # and added back as needed.
+                self.pkg("set-publisher -P ignored")
 
                 # Should fail since foo is not installed.
                 self.pkg("verify foo", exit=1)
@@ -101,8 +96,25 @@ class TestPkgVerify(pkg5unittest.SingleDepotTestCase):
                 # fatal.
                 self.pkg("verify foo")
 
+                # Should not fail if publisher is disabled and package is ok.
+                self.pkg("set-publisher -d test")
+                self.pkg("verify foo")
+
+                # Should not fail if publisher is removed and package is ok.
+                self.pkg("unset-publisher test")
+                self.pkg("verify foo")
+
+                # Should fail with exit code 1 if publisher is removed and
+                # package is not ok.
+                portable.remove(os.path.join(self.get_img_path(), "usr", "bin",
+                    "bobcat"))
+                self.pkg("verify foo", exit=1)
+                self.pkg("set-publisher -p %s" % self.rurl)
+                self.pkg("fix foo")
+
                 # Informational messages should not be output unless -v
                 # is provided.
+                self.pkg("set-publisher -p %s" % self.rurl)
                 self.pkg("verify foo | grep bobcat", exit=1)
                 self.pkg("verify -v foo | grep bobcat")
 
@@ -141,6 +153,31 @@ class TestPkgVerify(pkg5unittest.SingleDepotTestCase):
 
                 # ...but it should not be treated as a fatal error.
                 self.pkg("verify foo")
+
+        def test_02_installed(self):
+                """When multiple FMRIs are given to pkg verify, if any of them
+                aren't installed it should fail."""
+
+                self.image_create(self.rurl)
+                self.pkg("install foo")
+                self.pkg("verify foo nonexistent", exit=1)
+                self.pkg("uninstall foo")
+
+        def test_03_invalid(self):
+                """Test that pkg verify handles invalid input gracefully."""
+
+                self.image_create(self.rurl)
+
+                # Verify invalid package causes graceful exit.
+                self.pkg("verify _not_valid", exit=1)
+
+                # Verify unmatched input fails gracefully.
+                self.pkg("verify no/such/package", exit=1)
+
+                # Verify invalid package name and unmatched input combined with
+                # installed package name results in graceful failure.
+                self.pkg("install foo")
+                self.pkg("verify _not_valid no/such/package foo", exit=1)
 
 
 if __name__ == "__main__":

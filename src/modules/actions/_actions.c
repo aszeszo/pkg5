@@ -20,7 +20,7 @@
  */
 
 /*
- * Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2008, 2011, Oracle and/or its affiliates. All rights reserved.
  */
 
 #include <Python.h>
@@ -29,6 +29,8 @@
 
 static PyObject *MalformedActionError;
 static PyObject *InvalidActionError;
+
+static char *notident = "hash attribute not identical to positional hash";
 
 static int
 add_to_attrs(PyObject *attrs, PyObject *key, PyObject *attr)
@@ -91,10 +93,12 @@ _fromstr(PyObject *self, PyObject *args)
 {
 	char *s = NULL;
 	char *str = NULL;
+	char *hashstr = NULL;
 	char *keystr = NULL;
-	char *slashmap = NULL;
+	int *slashmap = NULL;
 	int strl;
 	int i, ks, vs, keysize;
+	int smlen, smpos;
 	char quote;
 	PyObject *type = NULL;
 	PyObject *hash = NULL;
@@ -123,7 +127,8 @@ _fromstr(PyObject *self, PyObject *args)
 	Py_XDECREF(type);\
 	Py_XDECREF(attr);\
 	Py_XDECREF(attrs);\
-	Py_XDECREF(hash);
+	Py_XDECREF(hash);\
+	free(hashstr);
 
 	/*
 	 * The action string is currently assumed to be a stream of bytes that
@@ -150,6 +155,8 @@ _fromstr(PyObject *self, PyObject *args)
 		return (NULL);
 	}
 
+	PyString_InternInPlace(&type);
+
 	ks = vs = s - str;
 	state = WS;
 	if ((attrs = PyDict_New()) == NULL) {
@@ -174,6 +181,7 @@ _fromstr(PyObject *self, PyObject *args)
 						CLEANUP_REFS;
 						return (NULL);
 					}
+					hashstr = strndup(keystr, keysize);
 					state = WS;
 				}
 			} else if (str[i] == '=') {
@@ -229,15 +237,28 @@ _fromstr(PyObject *self, PyObject *args)
 				if (i == strl - 1)
 					break;
 				/*
-				 * "slashmap" is a simple bitmap (bytemap?)
-				 * keeping track of what characters are
-				 * backslashes that need to be removed
-				 * from the final attribute string.
-				 * All other bytes are NUL bytes.
+				 * "slashmap" is a list of the positions of the
+				 * backslashes that need to be removed from the
+				 * final attribute string.
 				 */
 				if (slashmap == NULL) {
-					int smlen = strl - (i - vs);
-					slashmap = calloc(1, smlen + 1);
+					smlen = 16;
+					slashmap = calloc(smlen, sizeof(int));
+					if (slashmap == NULL) {
+						PyMem_Free(str);
+						return (PyErr_NoMemory());
+					}
+					smpos = 0;
+					/*
+					 * Terminate slashmap with an invalid
+					 * value so we don't think there's a
+					 * slash right at the beginning.
+					 */
+					slashmap[smpos] = -1;
+				} else if (smpos == smlen - 1) {
+					smlen *= 2;
+					slashmap = realloc(slashmap,
+						smlen * sizeof(int));
 					if (slashmap == NULL) {
 						PyMem_Free(str);
 						return (PyErr_NoMemory());
@@ -245,7 +266,13 @@ _fromstr(PyObject *self, PyObject *args)
 				}
 				i++;
 				if (str[i] == '\\' || str[i] == quote) {
-					slashmap[i - 1 - vs] = '\\';
+					slashmap[smpos++] = i - 1 - vs;
+					/*
+					 * Keep slashmap properly terminated so
+					 * that a realloc()ed array doesn't give
+					 * us random slash positions.
+					 */
+					slashmap[smpos] = -1;
 				}
 			} else if (str[i] == quote) {
 				state = WS;
@@ -266,7 +293,7 @@ _fromstr(PyObject *self, PyObject *args)
 					 * slashmap indicates we should.
 					 */
 					for (j = 0, o = 0; j < attrlen; j++) {
-						if (slashmap[j] == '\\') {
+						if (slashmap[o] == j) {
 							o++;
 							continue;
 						}
@@ -292,9 +319,21 @@ _fromstr(PyObject *self, PyObject *args)
 					}
 				}
 
-				if (add_to_attrs(attrs, key, attr) == -1) {
-					CLEANUP_REFS;
-					return (NULL);
+				if (!strncmp(keystr, "hash=", 5)) {
+					char *as = PyString_AsString(attr);
+					if (hashstr && strcmp(as, hashstr)) {
+						invalid(notident);
+						CLEANUP_REFS;
+						return (NULL);
+					}
+					hash = attr;
+					attr = NULL;
+				} else {
+					PyString_InternInPlace(&attr);
+					if (add_to_attrs(attrs, key, attr) == -1) {
+						CLEANUP_REFS;
+						return (NULL);
+					}
 				}
 			}
 		} else if (state == UQVAL) {
@@ -302,9 +341,21 @@ _fromstr(PyObject *self, PyObject *args)
 				state = WS;
 				Py_XDECREF(attr);
 				attr = PyString_FromStringAndSize(&str[vs], i - vs);
-				if (add_to_attrs(attrs, key, attr) == -1) {
-					CLEANUP_REFS;
-					return (NULL);
+				if (!strncmp(keystr, "hash=", 5)) {
+					char *as = PyString_AsString(attr);
+					if (hashstr && strcmp(as, hashstr)) {
+						invalid(notident);
+						CLEANUP_REFS;
+						return (NULL);
+					}
+					hash = attr;
+					attr = NULL;
+				} else {
+					PyString_InternInPlace(&attr);
+					if (add_to_attrs(attrs, key, attr) == -1) {
+						CLEANUP_REFS;
+						return (NULL);
+					}
 				}
 			}
 		} else if (state == WS) {
@@ -337,9 +388,21 @@ _fromstr(PyObject *self, PyObject *args)
 	if (state == UQVAL) {
 		Py_XDECREF(attr);
 		attr = PyString_FromStringAndSize(&str[vs], i - vs);
-		if (add_to_attrs(attrs, key, attr) == -1) {
-			CLEANUP_REFS;
-			return (NULL);
+		if (!strncmp(keystr, "hash=", 5)) {
+			char *as = PyString_AsString(attr);
+			if (hashstr && strcmp(as, hashstr)) {
+				invalid(notident);
+				CLEANUP_REFS;
+				return (NULL);
+			}
+			hash = attr;
+			attr = NULL;
+		} else {
+			PyString_InternInPlace(&attr);
+			if (add_to_attrs(attrs, key, attr) == -1) {
+				CLEANUP_REFS;
+				return (NULL);
+			}
 		}
 	}
 

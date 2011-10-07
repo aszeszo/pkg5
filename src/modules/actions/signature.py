@@ -21,7 +21,7 @@
 #
 
 #
-# Copyright (c) 2009, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2009, 2011, Oracle and/or its affiliates. All rights reserved.
 #
 
 import os
@@ -72,13 +72,16 @@ class SignatureAction(generic.Action):
                         return False
                 return True
 
+        def needsdata(self, orig, pkgplan):
+                return self.has_payload
+
         @staticmethod
         def make_opener(pth):
                 def file_opener():
                         return open(pth, "rb")
                 return file_opener
 
-        def __set_chain_certs_data(self, chain_certs):
+        def __set_chain_certs_data(self, chain_certs, chash_dir):
                 """Store the information about the certs needed to validate
                 this signature in the signature.
 
@@ -88,6 +91,8 @@ class SignatureAction(generic.Action):
                 self.chain_cert_openers = []
                 hshes = []
                 sizes = []
+                chshes = []
+                csizes = []
                 for pth in chain_certs:
                         if not os.path.exists(pth):
                                 raise pkg.actions.ActionDataError(
@@ -108,13 +113,45 @@ class SignatureAction(generic.Action):
                         with file_opener() as fh:
                                 hsh, data = misc.get_data_digest(fh,
                                     length=fs.st_size, return_content=True)
-                        hshes.append(hsh)                        
+                        hshes.append(hsh)
+                        csize, chash = misc.compute_compressed_attrs(hsh,
+                            None, data, fs.st_size, chash_dir)
+                        csizes.append(csize)
+                        chshes.append(chash.hexdigest())
                 if hshes:
                         # These attributes are stored as a single value with
                         # spaces in it rather than multiple values to ensure
                         # the ordering remains consistent.
                         self.attrs["chain.sizes"] = " ".join(sizes)
                         self.attrs["chain"] = " ".join(hshes)
+                        self.attrs["chain.chashes"] = " ".join(chshes)
+                        self.attrs["chain.csizes"] = " ".join(csizes)
+
+        def get_size(self):
+                res = generic.Action.get_size(self)
+                for s in self.attrs.get("chain.sizes", "").split():
+                        res += int(s)
+                return res
+
+        def get_action_chain_csize(self):
+                res = 0
+                for s in self.attrs.get("chain.csizes", "").split():
+                        res += int(s)
+                return res
+
+        def get_chain_csize(self, chain):
+                for c, s in zip(self.attrs.get("chain", "").split(),
+                    self.attrs.get("chain.csizes", "").split()):
+                        if c == chain:
+                                return int(s)
+                return None
+
+        def get_chain_size(self, chain):
+                for c, s in zip(self.attrs.get("chain", "").split(),
+                    self.attrs.get("chain.sizes", "").split()):
+                        if c == chain:
+                                return int(s)
+                return None
 
         def sig_str(self, a, version):
                 """Create a stable string representation of an action that
@@ -193,12 +230,22 @@ class SignatureAction(generic.Action):
                      (b.sig_str(self, version) for b in acts)
                      if a is not None)))
 
-        def get_chain_certs(self, pub):
-                """Retrieve the intermediate certificates needed to validate
-                this signature."""
+        def retrieve_chain_certs(self, pub):
+                """Retrieve the chain certificates needed to validate this
+                signature."""
 
                 for c in self.attrs.get("chain", "").split():
                         pub.get_cert_by_hash(c, only_retrieve=True)
+
+        def get_chain_certs(self):
+                """Return a list of the chain certificates needed to validate
+                this signature."""
+                return self.attrs.get("chain", "").split()
+
+        def get_chain_certs_chashes(self):
+                """Return a list of the chain certificates needed to validate
+                this signature."""
+                return self.attrs.get("chain.chashes", "").split()
 
         def is_signed(self):
                 """Returns True if this action is signed using a key, instead
@@ -222,7 +269,8 @@ class SignatureAction(generic.Action):
                                 return None, h
                 return None, None
 
-        def verify_sig(self, acts, pub, required_names=None):
+        def verify_sig(self, acts, pub, trust_anchors, use_crls,
+            required_names=None):
                 """Try to verify this signature.  It can return True or
                 None.  None means we didn't know how to verify this signature.
                 If we do know how to verify the signature but it doesn't verify,
@@ -233,6 +281,9 @@ class SignatureAction(generic.Action):
 
                 The 'pub' parameter is the publisher that published the
                 package this action signed.
+
+                The 'trust_anchors' parameter contains the trust anchors to use
+                when verifying the signature.
 
                 The 'required_names' parameter is a set of strings that must
                 be seen as a CN in the chain of trust for the certificate."""
@@ -267,18 +318,21 @@ class SignatureAction(generic.Action):
                 # Verify a signature that's not just a hash.
                 if self.sig_alg is None:
                         return None
-                # Get the approved CA certs for this publisher.
-                ca_dict = pub.get_ca_certs()
                 # Get the certificate paired with the key which signed this
                 # action.
                 cert = pub.get_cert_by_hash(self.hash, verify_hash=True)
                 # Make sure that the intermediate certificates that are needed
                 # to validate this signature are present.
-                self.get_chain_certs(pub)
+                self.retrieve_chain_certs(pub)
                 try:
+                        # This import is placed here to break a circular
+                        # import seen when merge.py is used.
+                        from pkg.client.publisher import CODE_SIGNING_USE
                         # Verify the certificate whose key created this
                         # signature action.
-                        pub.verify_chain(cert, ca_dict, required_names)
+                        pub.verify_chain(cert, trust_anchors, 0, use_crls,
+                            required_names=required_names,
+                            usages=CODE_SIGNING_USE)
                 except apx.SigningException, e:
                         e.act = self
                         raise
@@ -294,7 +348,8 @@ class SignatureAction(generic.Action):
                             "value. Res: %s") % res)
                 return True
 
-        def set_signature(self, acts, key_path=None, chain_paths=misc.EmptyI):
+        def set_signature(self, acts, key_path=None, chain_paths=misc.EmptyI,
+            chash_dir=None):
                 """Sets the signature value for this action.
 
                 The 'acts' parameter is the iterable of actions this action
@@ -306,7 +361,10 @@ class SignatureAction(generic.Action):
                 The 'chain_paths' parameter is an iterable of paths to
                 certificates which are needed to form the chain of trust from
                 the certificate associated with the key in 'key_path' to one of
-                the CAs for the publisher of the actions."""
+                the CAs for the publisher of the actions.
+
+                The 'chash_dir' parameter is the temporary directory to use
+                while calculating the compressed hashes for chain certs."""
 
                 # Turning this into a list makes debugging vastly more
                 # tractable.
@@ -329,11 +387,11 @@ class SignatureAction(generic.Action):
                         # If a private key is used, then the certificate it's
                         # paired with must be provided.
                         assert self.data is not None
-                        self.__set_chain_certs_data(chain_paths)
+                        self.__set_chain_certs_data(chain_paths, chash_dir)
 
                         try:
                                 priv_key = m2.RSA.load_key(key_path)
-                        except m2.RSA.RSAError, e:
+                        except m2.RSA.RSAError:
                                 raise apx.BadFileFormat(_("%s was expected to "
                                     "be a RSA key but could not be read "
                                     "correctly.") % key_path)
@@ -355,8 +413,75 @@ class SignatureAction(generic.Action):
                 if self.hash is not None:
                         res.append((self.name, "certificate", self.hash,
                             self.hash))
-                res.append((self.name, "hash type",
+                res.append((self.name, "algorithm",
                     self.attrs["algorithm"], self.attrs["algorithm"]))
                 res.append((self.name, "signature", self.attrs["value"],
                     self.attrs["value"]))
                 return res
+
+        def identical(self, other, hsh):
+                """Check whether another action is identical to this
+                signature."""
+                # Only signature actions can be identical to other signature
+                # actions.
+                if self.name != other.name:
+                        return False
+                # If the code signing certs are identical, the more checking is
+                # needed.
+                if hsh == other.hash or self.hash == other.hash:
+                        # If the algorithms are using different algorithms or
+                        # have different versions, then they're not identical.
+                        if self.attrs["algorithm"]  != \
+                            other.attrs["algorithm"] or \
+                            self.attrs["version"] != other.attrs["version"]:
+                                return False
+                        # If the values are the same, then they're identical.
+                        if self.attrs["value"] == other.attrs["value"]:
+                                return True
+                        raise apx.AlmostIdentical(hsh,
+                            self.attrs["algorithm"], self.attrs["version"])
+                return False
+        def __getstate__(self):
+                """This object doesn't have a default __dict__, instead it
+                stores its contents via __slots__.  Hence, this routine must
+                be provide to translate this object's contents into a
+                dictionary for pickling"""
+
+                pstate = generic.Action.__getstate__(self)
+                state = {}
+                for name in SignatureAction.__slots__:
+                        if not hasattr(self, name):
+                                continue
+                        state[name] = getattr(self, name)
+                return (state, pstate)
+
+        def __setstate__(self, state):
+                """This object doesn't have a default __dict__, instead it
+                stores its contents via __slots__.  Hence, this routine must
+                be provide to translate a pickled dictionary copy of this
+                object's contents into a real in-memory object."""
+
+                (state, pstate) = state
+                generic.Action.__setstate__(self, pstate)
+                for name in state:
+                        setattr(self, name, state[name])
+
+        def validate(self, fmri=None):
+                """Performs additional validation of action attributes that
+                for performance or other reasons cannot or should not be done
+                during Action object creation.  An ActionError exception (or
+                subclass of) will be raised if any attributes are not valid.
+                This is primarily intended for use during publication or during
+                error handling to provide additional diagonostics.
+
+                'fmri' is an optional package FMRI (object or string) indicating
+                what package contained this action.
+                """
+
+                # 'value' can only be required at publication time since signing
+                # relies on the ability to construct actions without one despite
+                # the fact that it is the key attribute.
+                generic.Action._validate(self, fmri=fmri,
+                    numeric_attrs=("pkg.csize", "pkg.size"),
+                    required_attrs=("value",), single_attrs=("algorithm",
+                    "chash", "value"))

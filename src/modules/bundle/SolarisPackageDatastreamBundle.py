@@ -21,15 +21,17 @@
 #
 
 #
-# Copyright (c) 2007, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2007, 2011, Oracle and/or its affiliates. All rights reserved.
 #
 
 import os
 import stat
 import pkg.misc as misc
 
-from pkg.sysvpkg import SolarisPackage
+from pkg.sysvpkg import SolarisPackage, MultiPackageDatastreamException
 from pkg.actions import *
+from pkg.bundle.SolarisPackageDirBundle import SolarisPackageDirBundle
+from pkg.bundle import InvalidBundleException
 
 typemap = {
         stat.S_IFBLK: "block-special",
@@ -41,13 +43,26 @@ typemap = {
         stat.S_IFSOCK: "socket"
 }
 
-class SolarisPackageDatastreamBundle(object):
+class SolarisPackageDatastreamBundle(SolarisPackageDirBundle):
         """XXX Need a class comment."""
 
         def __init__(self, filename, targetpaths=()):
+                filename = os.path.normpath(filename)
                 self.pkg = SolarisPackage(filename)
                 self.pkgname = self.pkg.pkginfo["PKG"]
                 self.filename = filename
+
+                # map the path name to the SVR4 class it belongs to and
+                # maintain a set of pre/post install/remove and class action
+                # scripts this package uses.
+                self.class_actions_dir = {}
+                self.class_action_names = set()
+                self.scripts = set()
+
+                self.hollow = self.pkg.pkginfo.get("SUNW_PKG_HOLLOW",
+                    "").lower() == "true"
+                self.pkginfo_actions = self.get_pkginfo_actions(
+                    self.pkg.pkginfo)
 
                 # SolarisPackage.manifest is a list.  Cache it into a dictionary
                 # based on pathname.  The cpio archive contains the files as
@@ -60,13 +75,42 @@ class SolarisPackageDatastreamBundle(object):
 
                 for p in self.pkg.manifest:
                         if p.type in "fevdsl":
-                                if p.pathname.startswith("/"):
-                                        dir = "root"
+                                if p.pathname[0] == "/":
+                                        d = "root"
                                 else:
-                                        dir = "reloc/"
-                                self.pkgmap[dir + p.pathname] = p
+                                        d = "reloc/"
+                                self.pkgmap[d + p.pathname] = p
+                                self.class_actions_dir[p.pathname] = p.klass
+                                self.class_action_names.add(p.klass)
                         elif p.type == "i":
                                 self.pkgmap["install/" + p.pathname] = p
+
+        def _walk_bundle(self):
+                for act in self.pkginfo_actions:
+                        yield act.attrs.get("path"), act
+
+                for p in self.pkg.datastream:
+                        yield p.name, (self.pkgmap, p, p.name)
+
+                # for some reason, some packages may have directories specified
+                # in the pkgmap that don't exist in the archive.  They need to
+                # be found and iterated as well.
+                #
+                # Some of the blastwave packages also have directories in the
+                # archive that don't exist in the package metadata.  I don't see
+                # a whole lot of point in faking those up.
+                for p in self.pkg.manifest:
+                        if p.type not in "lsd":
+                                continue
+
+                        if p.pathname[0] == "/":
+                                d = "root"
+                        else:
+                                d = "reloc/"
+                        path = d + p.pathname
+                        if (p.type == "d" and path not in self.pkg.datastream) or \
+                            p.type in "ls":
+                                yield path, (self.pkgmap, None, path)
 
         def __iter__(self):
                 """Iterate through the datastream.
@@ -81,34 +125,14 @@ class SolarisPackageDatastreamBundle(object):
                    file type in the archive is the same as the file type in the
                    package map.
                 """
-                for p in self.pkg.datastream:
-                        act = self.action(self.pkgmap, p, p.name)
+                for path, data in self._walk_bundle():
+                        if type(data) != tuple:
+                                yield data
+                                continue
+
+                        act = self.action(*data)
                         if act:
                                 yield act
-
-                # for some reason, some packages may have directories specified
-                # in the pkgmap that don't exist in the archive.  They need to
-                # be found and iterated as well.
-                #
-                # Some of the blastwave packages also have directories in the
-                # archive that don't exist in the package metadata.  I don't see
-                # a whole lot of point in faking those up.
-                for p in self.pkg.manifest:
-                        if p.pathname.startswith("/"):
-                                dir = "root"
-                        else:
-                                dir = "reloc/"
-                        if p.type == "d" and \
-                            dir + p.pathname not in self.pkg.datastream:
-                                act = self.action(self.pkgmap, None,
-                                    dir + p.pathname)
-                                if act:
-                                        yield act
-                        if p.type in "ls":
-                                act = self.action(self.pkgmap, None,
-                                    dir + p.pathname)
-                                if act:
-                                        yield act
 
         def action(self, pkgmap, ci, path):
                 try:
@@ -116,6 +140,8 @@ class SolarisPackageDatastreamBundle(object):
                 except KeyError:
                         # XXX Return an unknown instead of a missing, for now.
                         return unknown.UnknownAction(path=path)
+
+                act = None
 
                 # If any one of the mode, owner, or group is "?", then we're
                 # clearly not capable of delivering the object correctly, so
@@ -125,28 +151,49 @@ class SolarisPackageDatastreamBundle(object):
                         return None
 
                 if mapline.type in "fev":
-                        return file.FileAction(ci.extractfile(),
+                        act = file.FileAction(ci.extractfile(),
                             mode=mapline.mode, owner=mapline.owner,
                             group=mapline.group, path=mapline.pathname,
                             timestamp=misc.time_to_timestamp(int(mapline.modtime)))
                 elif mapline.type in "dx":
-                        return directory.DirectoryAction(mode = mapline.mode,
+                        act = directory.DirectoryAction(mode = mapline.mode,
                             owner=mapline.owner, group=mapline.group,
                             path=mapline.pathname)
                 elif mapline.type == "s":
-                        return link.LinkAction(path=mapline.pathname,
+                        act = link.LinkAction(path=mapline.pathname,
                             target=mapline.target)
                 elif mapline.type == "l":
-                        return hardlink.HardLinkAction(path=mapline.pathname,
+                        act = hardlink.HardLinkAction(path=mapline.pathname,
                             target=mapline.target)
-		elif mapline.type == "i" and mapline.pathname == "copyright":
-			return license.LicenseAction(data=ci.extractfile(),
-			    license="%s.copyright" % self.pkgname,
-			    path=mapline.pathname)
+                elif mapline.type == "i" and mapline.pathname == "copyright":
+                        # XXX path is set there because the importer relies on
+                        # it; when the importer dies, this can too.
+                        act = license.LicenseAction(data=ci.extractfile(),
+                            license="%s.copyright" % self.pkgname,
+                            path=mapline.pathname)
+                        act.hash = "install/copyright"
                 elif mapline.type == "i":
+                        if mapline.pathname not in ["depend", "pkginfo"]:
+                                # check to see if we've seen this script
+                                # before
+                                script = mapline.pathname
+                                if script.startswith("i.") and \
+                                    script.replace("i.", "", 1) in \
+                                    self.class_action_names:
+                                        pass
+                                elif script.startswith("r.") and \
+                                    script.replace("r.", "", 1) in \
+                                    self.class_action_names:
+                                        pass
+                                else:
+                                        self.scripts.add(script)
                         return None
                 else:
-                        return unknown.UnknownAction(path=mapline.pathname)
+                        act = unknown.UnknownAction(path=mapline.pathname)
+
+                if self.hollow and act:
+                        act.attrs[self.hollow_attr] = "true"
+                return act
 
 def test(filename):
         if not os.path.isfile(filename):
@@ -155,5 +202,10 @@ def test(filename):
         try:
                 SolarisPackage(filename)
                 return True
+        except MultiPackageDatastreamException:
+                raise InvalidBundleException(
+                    _("Multi-package datastreams are not supported.\n"
+                    "Please use pkgtrans(1) to convert this bundle to "
+                    "multiple\nfilesystem format packages."))
         except:
                 return False

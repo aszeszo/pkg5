@@ -21,7 +21,7 @@
 #
 
 #
-# Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2008, 2011, Oracle and/or its affiliates. All rights reserved.
 #
 
 import errno
@@ -57,8 +57,17 @@ class ProgressTracker(object):
             External consumers should base their subclasses on the
             NullProgressTracker class. """
 
-        def __init__(self):
+        def __init__(self, parsable_version=None, quiet=False, verbose=0):
+
+                self.parsable_version = parsable_version
+                self.quiet = quiet
+                self.verbose = verbose
+
                 self.reset()
+
+        def set_linked_name(self, lin):
+                """Called once an image determines it's linked image name."""
+                return
 
         def reset_download(self):
                 self.dl_started = False
@@ -98,7 +107,9 @@ class ProgressTracker(object):
                 self.ind_phase_last = "None"
 
                 self.item_cur_nitems = 0
+                self.item_cur_nbytes = 0
                 self.item_goal_nitems = 0
+                self.item_goal_nbytes = 0
                 self.item_phase = "None"
                 self.item_phase_last = "None"
 
@@ -181,6 +192,34 @@ class ProgressTracker(object):
                 self.ver_cur_fmri = None
                 self.ver_output_done()
 
+        def archive_set_goal(self, arcname, nitems, nbytes):
+                self.item_phase = arcname
+                self.item_goal_nitems = nitems
+                self.item_goal_nbytes = nbytes
+
+        def archive_add_progress(self, nitems, nbytes):
+                self.item_cur_nitems += nitems
+                self.item_cur_nbytes += nbytes
+                if self.item_goal_nitems > 0:
+                        self.archive_output()
+
+        def archive_done(self):
+                """ Call when all archiving is finished """
+                if self.item_goal_nitems != 0:
+                        self.archive_output_done()
+
+                if self.item_cur_nitems != self.item_goal_nitems:
+                        logger.error("\nExpected %s files, archived %s files "
+                            "instead." % (self.item_goal_nitems,
+                            self.item_cur_nitems))
+                if self.item_cur_nbytes != self.item_goal_nbytes:
+                        logger.error("\nExpected %s bytes, archived %s bytes "
+                            "instead." % (self.item_goal_nbytes,
+                            self.item_cur_nbytes))
+
+                assert self.item_cur_nitems == self.item_goal_nitems
+                assert self.item_cur_nbytes == self.item_goal_nbytes
+
         def download_set_goal(self, npkgs, nfiles, nbytes):
                 self.dl_goal_npkgs = npkgs
                 self.dl_goal_nfiles = nfiles
@@ -226,9 +265,15 @@ class ProgressTracker(object):
                             "instead." % (self.dl_goal_nbytes,
                             self.dl_cur_nbytes))
 
-                assert self.dl_cur_npkgs == self.dl_goal_npkgs
-                assert self.dl_cur_nfiles == self.dl_goal_nfiles
-                assert self.dl_cur_nbytes == self.dl_goal_nbytes
+                assert self.dl_cur_npkgs == self.dl_goal_npkgs, \
+                    "Expected %s packages but got %s" % \
+                    (self.dl_goal_npkgs, self.dl_cur_npkgs)
+                assert self.dl_cur_nfiles == self.dl_goal_nfiles, \
+                    "Expected %s files but got %s" % \
+                    (self.dl_goal_nfiles, self.dl_cur_nfiles)
+                assert self.dl_cur_nbytes == self.dl_goal_nbytes, \
+                    "Expected %s bytes but got %s" % \
+                    (self.dl_goal_nbytes, self.dl_cur_nbytes)
 
         def download_get_progress(self):
                 return (self.dl_cur_npkgs, self.dl_cur_nfiles,
@@ -290,14 +335,28 @@ class ProgressTracker(object):
                 self.send_cur_nbytes = 0
                 self.send_goal_nbytes = nsendbytes
 
-        def republish_start_pkg(self, pkgname):
+        def republish_start_pkg(self, pkgname, getbytes=None, sendbytes=None):
                 self.cur_pkg = pkgname
-                if self.dl_goal_nbytes != 0:
+
+                if getbytes is not None:
+                        # Allow reset of GET and SEND amounts on a per-package
+                        # basis.  This allows the user to monitor the overall
+                        # progress of the operation in terms of total packages
+                        # while not requiring the program to pre-process all
+                        # packages to determine total byte sizes before starting
+                        # the operation.
+                        assert sendbytes is not None
+                        self.dl_cur_nbytes = 0
+                        self.dl_goal_nbytes = getbytes
+                        self.send_cur_nbytes = 0
+                        self.send_goal_nbytes = sendbytes
+
+                if self.item_goal_nitems != 0:
                         self.republish_output()
 
         def republish_end_pkg(self):
                 self.item_cur_nitems += 1
-                if self.dl_goal_nbytes != 0:
+                if self.item_goal_nitems != 0:
                         self.republish_output()
 
         def upload_add_progress(self, nbytes):
@@ -309,7 +368,7 @@ class ProgressTracker(object):
 
         def republish_done(self):
                 """ Call when all downloading is finished """
-                if self.dl_goal_nbytes != 0:
+                if self.item_goal_nitems != 0:
                         self.republish_output_done()
 
         #
@@ -362,6 +421,18 @@ class ProgressTracker(object):
                 raise NotImplementedError("eval_output_done() not implemented "
                     "in superclass")
 
+        def li_recurse_start(self, lin):
+                """Called when we recurse into a child linked image."""
+
+                raise NotImplementedError("li_recurse_start() not implemented "
+                    "in superclass")
+
+        def li_recurse_end(self, lin):
+                """Called when we return from a child linked image."""
+
+                raise NotImplementedError("li_recurse_end() not implemented "
+                    "in superclass")
+
         def ver_output(self):
                 raise NotImplementedError("ver_output() not implemented in "
                     "superclass")
@@ -381,6 +452,14 @@ class ProgressTracker(object):
         def ver_output_done(self):
                 raise NotImplementedError("ver_output_done() not implemented "
                     "in superclass")
+
+        def archive_output(self):
+                raise NotImplementedError("archive_output() not implemented in "
+                    "superclass")
+
+        def archive_output_done(self):
+                raise NotImplementedError("archive_output_done() not "
+                    "implemented in superclass")
 
         def dl_output(self):
                 raise NotImplementedError("dl_output() not implemented in "
@@ -441,8 +520,9 @@ class QuietProgressTracker(ProgressTracker):
         """ This progress tracker outputs nothing, but is semantically
             intended to be "quiet"  See also NullProgressTracker below. """
 
-        def __init__(self):
-                ProgressTracker.__init__(self)
+        def __init__(self, parsable_version=None):
+                ProgressTracker.__init__(self,
+                    parsable_version=parsable_version, quiet=True)
 
         def cat_output_start(self):
                 return
@@ -471,6 +551,12 @@ class QuietProgressTracker(ProgressTracker):
         def eval_output_done(self):
                 return
 
+        def li_recurse_start(self, lin):
+                return
+
+        def li_recurse_end(self, lin):
+                return
+
         def ver_output(self):
                 return
 
@@ -484,6 +570,12 @@ class QuietProgressTracker(ProgressTracker):
                 return
 
         def ver_output_info(self, actname, info):
+                return
+
+        def archive_output(self):
+                return
+
+        def archive_output_done(self):
                 return
 
         def dl_output(self):
@@ -538,9 +630,17 @@ class CommandLineProgressTracker(ProgressTracker):
             and so is appropriate for sending through a pipe.  This code
             is intended to be platform neutral. """
 
-        def __init__(self):
-                ProgressTracker.__init__(self)
+        def __init__(self, parsable_version=None, quiet=False, verbose=0):
+                ProgressTracker.__init__(self,
+                    parsable_version=parsable_version, quiet=quiet,
+                    verbose=verbose)
                 self.last_printed_pkg = None
+                self.msg_prefix = ""
+
+        def set_linked_name(self, lin):
+                self.msg_prefix = ""
+                if lin:
+                        self.msg_prefix = _("Image %s ") % lin
 
         def cat_output_start(self):
                 return
@@ -568,6 +668,30 @@ class CommandLineProgressTracker(ProgressTracker):
 
         def eval_output_done(self):
                 return
+
+        def li_recurse_start(self, lin):
+                msg = _("Recursing into linked image: %s") % lin
+                msg = "%s%s" % (self.msg_prefix, msg)
+
+                try:
+                        print "%s\n" % msg
+                        sys.stdout.flush()
+                except IOError, e:
+                        if e.errno == errno.EPIPE:
+                                raise PipeError, e
+                        raise
+
+        def li_recurse_end(self, lin):
+                msg = _("Returning from linked image: %s") % lin
+                msg = "%s%s" % (self.msg_prefix, msg)
+
+                try:
+                        print "%s\n" % msg
+                        sys.stdout.flush()
+                except IOError, e:
+                        if e.errno == errno.EPIPE:
+                                raise PipeError, e
+                        raise
 
         def ver_output(self):
                 return
@@ -603,7 +727,7 @@ class CommandLineProgressTracker(ProgressTracker):
                 self.__generic_pkg_output(_("Download: %s ... "))
 
         def republish_output(self):
-                self.__generic_pkg_output(_("Republish : %s ... "))
+                self.__generic_pkg_output(_("Republish: %s ... "))
 
         def __generic_done(self):
                 try:
@@ -633,6 +757,13 @@ class CommandLineProgressTracker(ProgressTracker):
                                         raise PipeError, e
                                 raise
                         setattr(self, last_phase_attr, pattr)
+
+        def archive_output(self, force=False):
+                self.__generic_output("item_phase", "item_phase_last",
+                    force=force)
+
+        def archive_output_done(self):
+                self.__generic_done()
 
         def act_output(self, force=False):
                 self.__generic_output("act_phase", "act_phase_last",
@@ -681,14 +812,17 @@ class FancyUNIXProgressTracker(ProgressTracker):
         #
         TERM_DELAY = 0.10
 
-        def __init__(self):
-                ProgressTracker.__init__(self)
+        def __init__(self, parsable_version=None, quiet=False, verbose=0):
+                ProgressTracker.__init__(self,
+                    parsable_version=parsable_version, quiet=quiet,
+                    verbose=verbose)
 
                 self.act_started = False
                 self.ind_started = False
                 self.item_started = False
                 self.last_print_time = 0
                 self.clear_eol = ""
+                self.msg_prefix = ""
 
                 try:
                         import curses
@@ -709,6 +843,11 @@ class FancyUNIXProgressTracker(ProgressTracker):
                 self.spinner = 0
                 self.spinner_chars = "/-\|"
                 self.curstrlen = 0
+
+        def set_linked_name(self, lin):
+                self.msg_prefix = ""
+                if lin:
+                        self.msg_prefix = _("Image %s ") % lin
 
         def __generic_start(self, msg):
                 # Ensure the last message displayed is flushed in case the
@@ -763,13 +902,14 @@ class FancyUNIXProgressTracker(ProgressTracker):
                         print self.cr,
                         print " " * self.curstrlen,
                         print self.cr,
-                        s = _("Refreshing catalog %(current)d/%(total)d "
+                        msg = _("Refreshing catalog %(current)d/%(total)d "
                             "%(publisher)s") % {
                             "current": self.refresh_cur_pub_cnt,
                             "total": self.refresh_pub_cnt,
                             "publisher": self.refresh_cur_pub }
-                        self.curstrlen = len(s)
-                        print "%s" % s,
+                        msg = "%s%s" % (self.msg_prefix, msg)
+                        self.curstrlen = len(msg)
+                        print "%s" % msg,
                         self.needs_cr = True
                         sys.stdout.flush()
                 except IOError, e:
@@ -785,10 +925,12 @@ class FancyUNIXProgressTracker(ProgressTracker):
                 # corresponding operation did not complete successfully.
                 self.__generic_done()
 
-                s = _("Creating Plan")
-                self.curstrlen = len(s)
+                msg = _("Creating Plan")
+                msg = "%s%s" % (self.msg_prefix, msg)
+
+                self.curstrlen = len(msg)
                 try:
-                        print "%s" % s,
+                        print "%s" % msg,
                         self.needs_cr = True
                         sys.stdout.flush()
                 except IOError, e:
@@ -804,10 +946,12 @@ class FancyUNIXProgressTracker(ProgressTracker):
                 self.spinner = (self.spinner + 1) % len(self.spinner_chars)
                 try:
                         print self.cr,
-                        s = _("Creating Plan %c") % self.spinner_chars[
+                        msg = _("Creating Plan %c") % self.spinner_chars[
                             self.spinner]
-                        self.curstrlen = len(s)
-                        print "%s" % s,
+                        msg = "%s%s" % (self.msg_prefix, msg)
+
+                        self.curstrlen = len(msg)
+                        print "%s" % msg,
                         self.needs_cr = True
                         sys.stdout.flush()
                 except IOError, e:
@@ -819,6 +963,33 @@ class FancyUNIXProgressTracker(ProgressTracker):
                 self.__generic_done()
                 self.last_print_time = 0
 
+        def li_recurse_start(self, lin):
+                self.__generic_done()
+
+                msg = _("Recursing into linked image: %s") % lin
+                msg = "%s%s" % (self.msg_prefix, msg)
+
+                try:
+                        print "%s" % msg, self.cr
+                        self.curstrlen = len(msg)
+                        sys.stdout.flush()
+                except IOError, e:
+                        if e.errno == errno.EPIPE:
+                                raise PipeError, e
+                        raise
+
+        def li_recurse_end(self, lin):
+                msg = _("Returning from linked image: %s") % lin
+                msg = "%s%s" % (self.msg_prefix, msg)
+
+                try:
+                        print "%s" % msg, self.cr
+                        sys.stdout.flush()
+                except IOError, e:
+                        if e.errno == errno.EPIPE:
+                                raise PipeError, e
+                        raise
+
         def ver_output(self):
                 try:
                         assert self.ver_cur_fmri != None
@@ -829,7 +1000,7 @@ class FancyUNIXProgressTracker(ProgressTracker):
                         self.last_print_time = time.time()
                         self.spinner = (self.spinner + 1) % \
                             len(self.spinner_chars)
-                        s = "%-50s..... %c%c" % \
+                        s = "%-70s..... %c%c" % \
                             (self.ver_cur_fmri.get_pkg_stem(),
                              self.spinner_chars[self.spinner],
                              self.spinner_chars[self.spinner])
@@ -880,6 +1051,43 @@ class FancyUNIXProgressTracker(ProgressTracker):
                         if e.errno == errno.EPIPE:
                                 raise PipeError, e
                         raise
+
+        def archive_output(self, force=False):
+                if self.item_started and not force and \
+                    (time.time() - self.last_print_time) < self.TERM_DELAY:
+                        return
+
+                self.last_print_time = time.time()
+                try:
+                        # The first time, emit header.
+                        if not self.item_started:
+                                self.item_started = True
+                                if self.last_print_time:
+                                        print
+                                print "%-45s %11s %12s" % (_("ARCHIVE"),
+                                    _("FILES"), _("STORE (MB)"))
+                        else:
+                                print self.cr,
+
+                        s = "%-45.45s %11s %12s" % \
+                            (self.item_phase,
+                                "%d/%d" % \
+                                (self.item_cur_nitems,
+                                self.item_goal_nitems),
+                            "%.1f/%.1f" % \
+                                ((self.item_cur_nbytes / 1024.0 / 1024.0),
+                                (self.item_goal_nbytes / 1024.0 / 1024.0)))
+                        sys.stdout.write(s + self.clear_eol)
+                        self.needs_cr = True
+                        sys.stdout.flush()
+                except IOError, e:
+                        if e.errno == errno.EPIPE:
+                                raise PipeError, e
+                        raise
+
+        def archive_output_done(self):
+                self.archive_output(force=True)
+                self.__generic_simple_done()
 
         def dl_output(self, force=False):
                 if self.dl_started and not force and \
@@ -1036,11 +1244,13 @@ class FancyUNIXProgressTracker(ProgressTracker):
                 self.__generic_simple_done()
 
         def index_optimize(self):
-                self.ind_output_done()
                 self.ind_started = False
                 self.last_print_time = 0
                 try:
-                        print _("Optimizing Index...")
+                        msg = _("Optimizing Index...")
+                        msg = "%s%s" % (self.msg_prefix, msg)
+
+                        print msg
                         sys.stdout.flush()
                 except IOError, e:
                         if e.errno == errno.EPIPE:

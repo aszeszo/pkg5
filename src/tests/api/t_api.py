@@ -21,7 +21,7 @@
 #
 
 #
-# Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2008, 2011, Oracle and/or its affiliates. All rights reserved.
 #
 
 import testutils
@@ -33,16 +33,12 @@ import cStringIO
 import os
 import pkg.client.api as api
 import pkg.client.api_errors as api_errors
-import pkg.client.progress as progress
 import pkg.facet as facet
 import pkg.fmri as fmri
 import sys
 import tempfile
 import time
 import unittest
-
-API_VERSION = 46
-PKG_CLIENT_NAME = "pkg"
 
 class TestPkgApi(pkg5unittest.SingleDepotTestCase):
         # restart the depot for every test
@@ -55,6 +51,18 @@ class TestPkgApi(pkg5unittest.SingleDepotTestCase):
         foo12 = """
             open foo@1.2,5.11-0
             add file libc.so.1 mode=0555 owner=root group=bin path=/lib/libc.so.1
+            close """
+
+        foo11v = """
+            open foo@1.1,5.11-0
+            add set name=variant.arch value=i386 value=sparc
+            add file libc.so.1 mode=0555 owner=root group=bin path=/lib/libc.so.1 variant.arch=i386
+            close """
+
+        foo12v = """
+            open foo@1.2,5.11-0
+            add set name=variant.arch value=i386 value=sparc
+            add file libc.so.1 mode=0555 owner=root group=bin path=/lib/libc.so.1 variant.arch=i386
             close """
 
         bar10 = """
@@ -115,7 +123,6 @@ class TestPkgApi(pkg5unittest.SingleDepotTestCase):
   "publishers": [
     {
       "alias": "cat", 
-      "intermediate_certs": [], 
       "name": "bobcat", 
       "packages": [
         "pkg:/foo@1.0,5.11-0"
@@ -136,8 +143,7 @@ class TestPkgApi(pkg5unittest.SingleDepotTestCase):
           "registration_uri": "", 
           "related_uris": []
         }
-      ], 
-      "signing_ca_certs": []
+      ]
     }
   ], 
   "version": 1
@@ -157,14 +163,19 @@ class TestPkgApi(pkg5unittest.SingleDepotTestCase):
         def __try_bad_installs(self, api_obj):
 
                 self.assertRaises(api_errors.PlanExistsException,
-                    api_obj.plan_install,["foo"])
-
+                    lambda *args, **kwargs: list(
+                        api_obj.gen_plan_install(*args, **kwargs)),
+                    ["foo"])
                 self.assertRaises(api_errors.PlanExistsException,
-                    api_obj.plan_uninstall,["foo"], False)
+                    lambda *args, **kwargs: list(
+                        api_obj.gen_plan_uninstall(*args, **kwargs)),
+                    ["foo"])
                 self.assertRaises(api_errors.PlanExistsException,
-                    api_obj.plan_update_all, sys.argv[0])
+                    lambda *args, **kwargs: list(
+                        api_obj.gen_plan_update(*args, **kwargs)))
                 try:
-                        api_obj.plan_update_all(sys.argv[0])
+                        for pd in api_obj.gen_plan_update():
+                                continue
                 except api_errors.PlanExistsException:
                         pass
                 else:
@@ -199,7 +210,8 @@ class TestPkgApi(pkg5unittest.SingleDepotTestCase):
                 self.assertRaises(api_errors.PlanMissingException,
                     api_obj.prepare)
 
-                api_obj.plan_install(["foo"])
+                for pd in api_obj.gen_plan_install(["foo"]):
+                        continue
                 self.__try_bad_combinations_and_complete(api_obj)
                 api_obj.reset()
 
@@ -211,7 +223,8 @@ class TestPkgApi(pkg5unittest.SingleDepotTestCase):
                 self.pkgsend_bulk(self.rurl, self.foo12)
                 api_obj.refresh(immediate=True)
 
-                api_obj.plan_update_all(sys.argv[0])
+                for pd in api_obj.gen_plan_update():
+                        continue
                 self.__try_bad_combinations_and_complete(api_obj)
                 api_obj.reset()
 
@@ -219,7 +232,8 @@ class TestPkgApi(pkg5unittest.SingleDepotTestCase):
                     api_obj.prepare)
                 self.assert_(api_obj.describe() is None)
 
-                api_obj.plan_uninstall(["foo"], False)
+                for pd in api_obj.gen_plan_uninstall(["foo"]):
+                        continue
                 self.__try_bad_combinations_and_complete(api_obj)
                 api_obj.reset()
 
@@ -233,22 +247,24 @@ class TestPkgApi(pkg5unittest.SingleDepotTestCase):
                 self.pkgsend_bulk(self.rurl, self.foo10)
                 api_obj = self.image_create(self.rurl, prefix="bobcat")
 
-                recursive_removal = False
-
                 facets = facet.Facets({ "facet.devel": True })
-                api_obj.plan_change_varcets(facets=facets)
+                for pd in api_obj.gen_plan_change_varcets(facets=facets):
+                        continue
                 self._api_finish(api_obj)
 
-                api_obj.plan_install(["foo"])
+                for pd in api_obj.gen_plan_install(["foo"]):
+                        continue
                 self.assert_(api_obj.describe() is not None)
                 api_obj.reset()
                 self.assert_(api_obj.describe() is None)
-                api_obj.plan_install(["foo"])
+                for pd in api_obj.gen_plan_install(["foo"]):
+                        continue
                 self.assert_(api_obj.describe() is not None)
                 api_obj.prepare()
                 api_obj.reset()
                 self.assert_(api_obj.describe() is None)
-                api_obj.plan_install(["foo"])
+                for pd in api_obj.gen_plan_install(["foo"]):
+                        continue
                 self.assert_(api_obj.describe() is not None)
                 api_obj.prepare()
                 api_obj.execute_plan()
@@ -261,16 +277,19 @@ class TestPkgApi(pkg5unittest.SingleDepotTestCase):
                 self.pkgsend_bulk(self.rurl, self.foo12)
                 api_obj.refresh(immediate=True)
 
-                api_obj.plan_update_all(sys.argv[0])
+                for pd in api_obj.gen_plan_update():
+                        continue
                 self.assert_(api_obj.describe() is not None)
                 api_obj.reset()
                 self.assert_(api_obj.describe() is None)
-                api_obj.plan_update_all(sys.argv[0])
+                for pd in api_obj.gen_plan_update():
+                        continue
                 self.assert_(api_obj.describe() is not None)
                 api_obj.prepare()
                 api_obj.reset()
                 self.assert_(api_obj.describe() is None)
-                api_obj.plan_update_all(sys.argv[0])
+                for pd in api_obj.gen_plan_update():
+                        continue
                 self.assert_(api_obj.describe() is not None)
                 api_obj.prepare()
                 api_obj.execute_plan()
@@ -280,16 +299,19 @@ class TestPkgApi(pkg5unittest.SingleDepotTestCase):
                 self.pkg("list")
                 self.pkg("verify")
 
-                api_obj.plan_uninstall(["foo"], recursive_removal)
+                for pd in api_obj.gen_plan_uninstall(["foo"]):
+                        continue
                 self.assert_(api_obj.describe() is not None)
                 api_obj.reset()
                 self.assert_(api_obj.describe() is None)
-                api_obj.plan_uninstall(["foo"], recursive_removal)
+                for pd in api_obj.gen_plan_uninstall(["foo"]):
+                        continue
                 self.assert_(api_obj.describe() is not None)
                 api_obj.prepare()
                 api_obj.reset()
                 self.assert_(api_obj.describe() is None)
-                api_obj.plan_uninstall(["foo"], recursive_removal)
+                for pd in api_obj.gen_plan_uninstall(["foo"]):
+                        continue
                 self.assert_(api_obj.describe() is not None)
                 api_obj.prepare()
                 api_obj.execute_plan()
@@ -357,9 +379,7 @@ class TestPkgApi(pkg5unittest.SingleDepotTestCase):
                 # Now install a package, and verify that the entries in the
                 # known catalog for installed packages exist in the installed
                 # catalog and are identical.
-                progresstracker = progress.NullProgressTracker()
-                api_obj = api.ImageInterface(self.get_img_path(), API_VERSION,
-                    progresstracker, lambda x: False, PKG_CLIENT_NAME)
+                api_obj = self.get_img_api_obj()
                 img = api_obj.img
 
                 # Get image catalogs.
@@ -373,7 +393,8 @@ class TestPkgApi(pkg5unittest.SingleDepotTestCase):
                 self.assertTrue("foo" not in icat.names())
 
                 # Install the packages.
-                api_obj.plan_install(["quux@1.0"])
+                for pd in api_obj.gen_plan_install(["quux@1.0"]):
+                        continue
                 api_obj.prepare()
                 api_obj.execute_plan()
                 api_obj.reset()
@@ -402,9 +423,7 @@ class TestPkgApi(pkg5unittest.SingleDepotTestCase):
                 self.dc.stop()
                 self.dc.start()
 
-                progresstracker = progress.NullProgressTracker()
-                api_obj = api.ImageInterface(self.get_img_path(), API_VERSION,
-                    progresstracker, lambda x: False, PKG_CLIENT_NAME)
+                api_obj = self.get_img_api_obj()
                 api_obj.refresh(immediate=True)
                 img = api_obj.img
 
@@ -469,7 +488,27 @@ class TestPkgApi(pkg5unittest.SingleDepotTestCase):
                 accessible and return expected values."""
 
                 api_obj = self.image_create(self.rurl, prefix="bobcat")
-                self.assertEqual(api_obj.root, self.img_path)
+                self.assertEqual(api_obj.root, self.img_path())
+
+        def test_snapdir(self):
+                """Verify that image create ignores .zfs snapdir."""
+
+                # snapdir path
+                path = self.img_path()
+                snapdir = os.path.join(path, ".zfs")
+
+                # a .zfs directory is allowed
+                self.image_destroy()
+                os.mkdir(self.img_path())
+                os.mkdir(snapdir)
+                api_obj = self.image_create(destroy=False)
+
+                # a .zfs file is not allowed
+                self.image_destroy()
+                os.mkdir(self.img_path())
+                open(snapdir, 'w').close()
+                self.assertRaises(api_errors.CreatingImageInNonEmptyDir,
+                    self.image_create, destroy=False)
 
         def test_publisher_apis(self):
                 """Verify that the publisher api methods work as expected.
@@ -485,9 +524,11 @@ class TestPkgApi(pkg5unittest.SingleDepotTestCase):
                 self.assertTrue(api_obj.has_publisher("bobcat"))
 
                 # Verify preferred publisher prefix is returned correctly.
-                self.assertEqual(api_obj.get_preferred_publisher(), "bobcat")
+                self.assertEqual(api_obj.get_highest_ranked_publisher().prefix,
+                    "bobcat")
 
-                # Verify that get_publisher returned the correct publisher object.
+                # Verify that get_publisher returned the correct publisher
+                # object.
                 pub = api_obj.get_publisher(prefix="bobcat")
                 self.assertEqual(pub.prefix, "bobcat")
 
@@ -510,7 +551,7 @@ class TestPkgApi(pkg5unittest.SingleDepotTestCase):
 
                 # Now modify publisher information and update.
                 cpub.alias = "cat"
-                repo = cpub.selected_repository
+                repo = cpub.repository
                 repo.name = "source"
                 repo.description = "xkcd.net/325"
                 repo.legal_uris = ["http://xkcd.com/license.html"]
@@ -521,7 +562,7 @@ class TestPkgApi(pkg5unittest.SingleDepotTestCase):
                 # Verify that the update happened.
                 pub = api_obj.get_publisher(prefix="bobcat")
                 self.assertEqual(pub.alias, "cat")
-                repo = pub.selected_repository
+                repo = pub.repository
                 self.assertEqual(repo.name, "source")
                 self.assertEqual(repo.description, "xkcd.net/325")
                 self.assertEqual(repo.legal_uris[0],
@@ -538,8 +579,8 @@ class TestPkgApi(pkg5unittest.SingleDepotTestCase):
                     "mirrors", "name", "origins", "refresh_seconds",
                     "registered", "registration_uri", "related_uris",
                     "sort_policy"):
-                        srepo = pub.selected_repository
-                        crepo = cpub.selected_repository
+                        srepo = pub.repository
+                        crepo = cpub.repository
                         self.assertEqual(getattr(srepo, p), getattr(crepo, p))
                 cpub = None
 
@@ -590,7 +631,7 @@ class TestPkgApi(pkg5unittest.SingleDepotTestCase):
 
                         self.assertEqual(pub.prefix, "bobcat")
                         self.assertEqual(pub.alias, "cat")
-                        repo = pub.selected_repository
+                        repo = pub.repository
                         self.assertEqual(repo.name, "source")
                         self.assertEqual(repo.description, "xkcd.net/325")
                         self.assertEqual(repo.legal_uris[0],
@@ -715,6 +756,93 @@ class TestPkgApi(pkg5unittest.SingleDepotTestCase):
                 self.assertRaises(api_errors.InvalidP5IFile, api_obj.parse_p5i,
                     location=lcpath)
 
+                # Now install a package and remove all publishers and verify a
+                # publisher obj is returned by get_highest_ranked_publisher().
+                self._api_install(api_obj, ["foo"])
+                api_obj.remove_publisher("bobcat")
+                api_obj.remove_publisher("p5icat")
+                self.assert_(api_obj.get_highest_ranked_publisher().prefix,
+                    "bobcat")
+
+        def test_deprecated(self):
+                """Test deprecated api interfaces."""
+
+                self.pkgsend_bulk(self.rurl, self.foo10)
+                api_obj = self.image_create(self.rurl, prefix="bobcat",
+                    variants={"variant.arch": "i386"})
+                api_obj.reset()
+
+                # verify the old install interface
+                stuff_to_do = api_obj.plan_install(["foo"], noexecute=False)
+                self.assertTrue(stuff_to_do)
+                api_obj.prepare()
+                try:
+                        api_obj.execute_plan()
+                except api_errors.WrapSuccessfulIndexingException:
+                        pass
+                api_obj.reset()
+
+                self.pkgsend_bulk(self.rurl, self.foo11v)
+                self.pkgsend_bulk(self.rurl, self.foo12v)
+                api_obj.refresh(immediate=True)
+
+                # verify the old update interface
+                stuff_to_do = api_obj.plan_update(
+                    ["foo@1.1,5.11-0"], noexecute=False)
+                self.assertTrue(stuff_to_do)
+                api_obj.prepare()
+                try:
+                        api_obj.execute_plan()
+                except api_errors.WrapSuccessfulIndexingException:
+                        pass
+                api_obj.reset()
+
+                # verify the old update interface
+                stuff_to_do, s_image = api_obj.plan_update_all(noexecute=False)
+                self.assertTrue(stuff_to_do)
+                self.assertFalse(s_image)
+                api_obj.prepare()
+                try:
+                        api_obj.execute_plan()
+                except api_errors.WrapSuccessfulIndexingException:
+                        pass
+                api_obj.reset()
+
+                # remove a file from the image
+                os.remove(os.path.join(self.img_path(), "lib/libc.so.1"))
+
+                # verify the old revert interface
+                stuff_to_do = api_obj.plan_revert(["/lib/libc.so.1"],
+                    noexecute=False)
+                self.assertTrue(stuff_to_do)
+                api_obj.prepare()
+                try:
+                        api_obj.execute_plan()
+                except api_errors.WrapSuccessfulIndexingException:
+                        pass
+                api_obj.reset()
+
+                # verify the old change varcets interface
+                stuff_to_do = api_obj.plan_change_varcets(
+                    variants={"variant.arch": "sparc"}, noexecute=False)
+                self.assertTrue(stuff_to_do)
+                api_obj.prepare()
+                try:
+                        api_obj.execute_plan()
+                except api_errors.WrapSuccessfulIndexingException:
+                        pass
+                api_obj.reset()
+
+                # verify the old change uninstall interface
+                stuff_to_do = api_obj.plan_uninstall(["foo"], noexecute=False)
+                self.assertTrue(stuff_to_do)
+                api_obj.prepare()
+                try:
+                        api_obj.execute_plan()
+                except api_errors.WrapSuccessfulIndexingException:
+                        pass
+                api_obj.reset()
+
         def test_license(self):
                 """ Send various packages and then verify that install and
                 update operations will raise the correct exceptions or
@@ -726,7 +854,8 @@ class TestPkgApi(pkg5unittest.SingleDepotTestCase):
 
                 # First, test the basic install case to see if expected license
                 # data is returned.
-                api_obj.plan_install(["licensed@1.0"])
+                for pd in api_obj.gen_plan_install(["licensed@1.0"]):
+                        continue
 
                 def lic_sort(a, b):
                         adest = a[2]
@@ -781,7 +910,8 @@ class TestPkgApi(pkg5unittest.SingleDepotTestCase):
                 api_obj.reset()
 
                 # Next, check that an upgrade produces expected license data.
-                api_obj.plan_install(["licensed@1.2"])
+                for pd in api_obj.gen_plan_install(["licensed@1.2"]):
+                        continue
 
                 plan = api_obj.describe()
                 lics = sorted(plan.get_licenses(), cmp=lic_sort)
@@ -827,7 +957,8 @@ class TestPkgApi(pkg5unittest.SingleDepotTestCase):
 
                 # Plan will have to be re-created first before continuing.
                 api_obj.reset()
-                api_obj.plan_install(["licensed@1.2"])
+                for pd in api_obj.gen_plan_install(["licensed@1.2"]):
+                        continue
                 plan = api_obj.describe()
 
                 # Set the copyright as having been displayed.
@@ -848,102 +979,69 @@ class TestPkgApi(pkg5unittest.SingleDepotTestCase):
 
                 # Next, check that an update produces expected license
                 # data.
-                api_obj.plan_update_all(sys.argv[0])
+                for pd in api_obj.gen_plan_update():
+                        continue
 
                 plan = api_obj.describe()
-                lics = sorted(plan.get_licenses(), cmp=lic_sort)
+                lics = [l for l in plan.get_licenses()]
 
-                # Expect two license actions, both of which should be for the
-                # licensed@1.3 package.
-                self.assertEqual(len(lics), 2)
+                # Expect one license action which should be for the licensed@1.3
+                # package.  (Only one is expected since only one of the license
+                # actions changed since licensed@1.2.)
+                self.assertEqual(len(lics), 1)
 
                 # Now verify license entries for "licensed@1.3".
                 pfmri = fmri.PkgFmri(plist[2])
-                for dest_fmri, src, dest, accepted, displayed in lics:
-                        # License information should only be for "licensed@1.3".
-                        self.assertEqual(pfmri, dest_fmri)
+                dest_fmri, src, dest, accepted, displayed = lics[0]
 
-                        must_accept = False
-                        must_display = False
+                # License information should only be for "licensed@1.3".
+                self.assertEqual(pfmri, dest_fmri)
 
-                        # This is an an update, so src should be a LicenseInfo
-                        # object.
-                        self.assertEqual(type(src), api.LicenseInfo)
+                must_accept = False
+                must_display = False
 
-                        if dest.license.startswith("copyright."):
-                                # copyright must be displayed for dest.
-                                must_display = True
-                        elif dest.license.startswith("license."):
-                                # license must be accepted for dest.
-                                must_accept = True
+                # This is an an update, so src should be a LicenseInfo
+                # object.
+                self.assertEqual(type(src), api.LicenseInfo)
 
-                        # dest should be a LicenseInfo object.
-                        self.assertEqual(type(dest), api.LicenseInfo)
+                assert dest.license.startswith("license.")
+                # license must be accepted for dest.
+                must_accept = True
 
-                        # Verify LicenseInfo attributes.
-                        self.assertEqual(accepted, False)
-                        self.assertEqual(displayed, False)
-                        self.assertEqual(dest.must_accept, must_accept)
-                        self.assertEqual(dest.must_display, must_display)
+                # dest should be a LicenseInfo object.
+                self.assertEqual(type(dest), api.LicenseInfo)
 
-                        # Verify license text.
-                        text = dest.license
-                        self.assertEqual(dest.get_text(), text)
+                # Verify LicenseInfo attributes.
+                self.assertEqual(accepted, False)
+                self.assertEqual(displayed, False)
+                self.assertEqual(dest.must_accept, must_accept)
+                self.assertEqual(dest.must_display, must_display)
+
+                # Verify license text.
+                text = dest.license
+                self.assertEqual(dest.get_text(), text)
 
                 # Attempt to prepare plan; this should raise a license
                 # exception.
-                self.assertRaises(api_errors.PlanLicenseErrors,
-                    api_obj.prepare)
+                self.assertRaises(api_errors.PlanLicenseErrors, api_obj.prepare)
 
                 # Plan will have to be re-created first before continuing.
                 api_obj.reset()
-                api_obj.plan_update_all(sys.argv[0])
+                for pd in api_obj.gen_plan_update():
+                        continue
                 plan = api_obj.describe()
-                lics = sorted(plan.get_licenses(pfmri=pfmri), cmp=lic_sort)
 
                 # Set the license status of only one license.
                 api_obj.set_plan_license_status(pfmri, "license.licensed",
                     accepted=True)
-                lics = sorted(plan.get_licenses(pfmri=pfmri), cmp=lic_sort)
+                lics = [l for l in plan.get_licenses(pfmri=pfmri)]
 
-                # Verify only license.licensed was updated.
+                # Verify only license.licensed was updated and exists.
                 dest_fmri, src, dest, accepted, displayed = lics[0]
-                self.assertEqual(src.license, "copyright.licensed")
-                self.assertEqual(accepted, False)
-                self.assertEqual(displayed, False)
-
-                dest_fmri, src, dest, accepted, displayed = lics[1]
                 self.assertEqual(src.license, "license.licensed")
                 self.assertEqual(accepted, True)
                 self.assertEqual(displayed, False)
-
-                # Attempt to prepare plan; this should raise a license
-                # exception since the copyright wasn't displayed.
-                self.assertRaises(api_errors.PlanLicenseErrors,
-                    api_obj.prepare)
-
-                # Plan will have to be re-created first before continuing.
-                api_obj.reset()
-                api_obj.plan_update_all(sys.argv[0])
-                plan = api_obj.describe()
-
-                # Set the correct license status for all licenses.
-                api_obj.set_plan_license_status(pfmri, "copyright.licensed",
-                    displayed=True)
-                api_obj.set_plan_license_status(pfmri, "license.licensed",
-                    accepted=True)
-                lics = sorted(plan.get_licenses(pfmri=pfmri), cmp=lic_sort)
-
-                # Verify status for both license actions.
-                dest_fmri, src, dest, accepted, displayed = lics[0]
-                self.assertEqual(src.license, "copyright.licensed")
-                self.assertEqual(accepted, False)
-                self.assertEqual(displayed, True)
-
-                dest_fmri, src, dest, accepted, displayed = lics[1]
-                self.assertEqual(src.license, "license.licensed")
-                self.assertEqual(accepted, True)
-                self.assertEqual(displayed, False)
+                self.assertEqual(len(lics), 1)
 
                 # Prepare should succeed this time; so execute afterwards.
                 api_obj.prepare()
@@ -957,7 +1055,8 @@ class TestPkgApi(pkg5unittest.SingleDepotTestCase):
                 # Next, verify that an update to a newer version of a package
                 # where the license hasn't changed and it previously required
                 # acceptance is treated as already having been accepted.
-                api_obj.plan_update_all(sys.argv[0])
+                for pd in api_obj.gen_plan_update():
+                        continue
                 plan = api_obj.describe()
                 pfmri = fmri.PkgFmri(plist[5])
                 lics = sorted(plan.get_licenses(), cmp=lic_sort)
@@ -974,11 +1073,21 @@ class TestPkgApi(pkg5unittest.SingleDepotTestCase):
 
                 # Finally, verify that an uninstall won't trigger license
                 # errors as acceptance should never be applied to it.
-                api_obj.plan_uninstall(["*"], False)
+                for pd in api_obj.gen_plan_uninstall(["*"]):
+                        continue
                 api_obj.prepare()
                 api_obj.execute_plan()
                 api_obj.reset()
 
+        def test_syspub_version_error(self):
+                api_obj = self.image_create()
+                try:
+                        api_obj.write_syspub("", [], 999)
+                except api_errors.UnsupportedP5SVersion, e:
+                        str(e)
+                else:
+                        raise RuntimeError("Expected write_syspub to raise "
+                            "an exception.")
 
 if __name__ == "__main__":
         unittest.main()

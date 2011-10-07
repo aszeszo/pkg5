@@ -20,7 +20,7 @@
 # CDDL HEADER END
 #
 
-# Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2008, 2011, Oracle and/or its affiliates. All rights reserved.
 
 import testutils
 if __name__ == "__main__":
@@ -252,6 +252,25 @@ class TestImageUpdate(pkg5unittest.ManyDepotTestCase):
 
                 self.pkg("update '*@*'")
                 self.pkg("info bar@1.1 foo@1.1 incorp@1.1")
+
+                # Now rollback everything to 1.0, and then verify that
+                # '@latest' will take everything to the latest version.
+                self.pkg("update '*@1.0'")
+                self.pkg("info bar@1.0 foo@1.0 incorp@1.0")
+
+                self.pkg("update '*@latest'")
+                self.pkg("info bar@1.1 foo@1.1 incorp@1.1")
+
+        def test_bug_18536(self):
+                """Test that when a package specified on the command line can't
+                be upgraded because of a sticky publisher, the exception raised
+                is correct."""
+
+                self.image_create(self.rurl2)
+                self.pkg("install foo")
+                self.pkg("set-publisher -p %s" % self.rurl1)
+                self.pkg("update foo@1.1", exit=1)
+                self.assert_("test1" in self.errout)
 
 
 if __name__ == "__main__":

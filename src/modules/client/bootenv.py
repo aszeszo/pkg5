@@ -20,8 +20,9 @@
 # CDDL HEADER END
 #
 
-# Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2008, 2011, Oracle and/or its affiliates. All rights reserved.
 
+import errno
 import os
 import tempfile
 
@@ -29,17 +30,19 @@ from pkg.client import global_settings
 logger = global_settings.logger
 
 import pkg.client.api_errors as api_errors
+import pkg.misc as misc
+import pkg.portable as portable
 import pkg.pkgsubprocess as subprocess
 
 # Since pkg(1) may be installed without libbe installed
 # check for libbe and import it if it exists.
 try:
-        # First try importing using the new name (b147+)...
-        import libbe_py as be
+        # First try importing using the new name (b172+)...
+        import libbe as be
 except ImportError:
         try:
-                # ...then try importing using the old name (pre 147).
-                import libbe as be
+                # ...then try importing using the old name (pre 172).
+                import libbe_py as be
         except ImportError:
                 # All recovery actions are disabled when libbe can't be
                 # imported.
@@ -47,24 +50,24 @@ except ImportError:
 
 class BootEnv(object):
 
-        """A BootEnv object is an object containing the logic for
-        managing the recovery of image-modifying operations such
-        as install, uninstall, and update.
+        """A BootEnv object is an object containing the logic for managing the
+        recovery of image-modifying operations such as install, uninstall, and
+        update.
 
-        Recovery is only enabled for ZFS filesystems. Any operation
-        attempted on UFS will not be handled by BootEnv.
+        Recovery is only enabled for ZFS filesystems. Any operation attempted on
+        UFS will not be handled by BootEnv.
 
-        This class makes use of usr/lib/python*/vendor-packages/libbe_py.so as
-        the python wrapper for interfacing with usr/lib/libbe.  Both libraries
-        are delivered by the SUNWinstall-libs package (or by the install/beadm
-        package in newer builds).  This package is not required for pkg(1) to
-        operate successfully.  It is soft required, meaning if it exists the
+        This class makes use of usr/lib/python*/vendor-packages/libbe.py as the
+        python wrapper for interfacing with libbe.  Both libraries are delivered
+        by the install/beadm package.  This package is not required for pkg(1)
+        to operate successfully.  It is soft required, meaning if it exists the
         bootenv class will attempt to provide recovery support."""
 
         def __init__(self, img):
                 self.be_name = None
                 self.dataset = None
                 self.be_name_clone = None
+                self.be_name_clone_uuid = None
                 self.clone_dir = None
                 self.img = img
                 self.is_live_BE = False
@@ -77,20 +80,9 @@ class BootEnv(object):
 
                 assert self.root != None
 
-                # Check for the old beList() API since pkg(1) can be
-                # back published and live on a system without the latest libbe.
-                beVals = be.beList()
-                if isinstance(beVals[0], int):
-                        rc, self.beList = beVals
-                else:
-                        self.beList = beVals
-
-                # Happens e.g. in zones (at least, for now)
-                if not self.beList or rc != 0:
-                        raise RuntimeError, "nobootenvironments"
-
                 # Need to find the name of the BE we're operating on in order
                 # to create a snapshot and/or a clone of the BE.
+                self.beList = self.get_be_list(raise_error=True)
 
                 for i, beVals in enumerate(self.beList):
                         # pkg(1) expects a directory as the target of an
@@ -136,6 +128,10 @@ class BootEnv(object):
                         # 2nd field is the returned snapshot name
                         if err == 0:
                                 self.snapshot_name = snapshot_name
+                                # we require BootEnv to be initialised within
+                                # the context of a history operation, i.e.
+                                # after img.history.operation_name has been set.
+                                img.history.operation_snapshot = snapshot_name
                         else:
                                 logger.error(_("pkg: unable to create an auto "
                                     "snapshot. pkg recovery is disabled."))
@@ -147,6 +143,55 @@ class BootEnv(object):
                         # We will get here if we don't find find any BE's. e.g
                         # if were are on UFS.
                         raise RuntimeError, "recoveryDisabled"
+
+        def __get_new_be_name(self, suffix=None):
+                """Create a new boot environment name."""
+
+                new_bename = self.be_name
+                if suffix:
+                        new_bename += suffix
+                base, sep, rev = new_bename.rpartition("-")
+                if sep and rev.isdigit():
+                        # The source BE has already been auto-named, so we need
+                        # to bump the revision.  List all BEs, cycle through the
+                        # names and find the one with the same basename as
+                        # new_bename, and has the highest revision.  Then add
+                        # one to it.  This means that gaps in the numbering will
+                        # not be filled.
+                        rev = int(rev)
+                        maxrev = rev
+
+                        for d in self.beList:
+                                oben = d.get("orig_be_name", None)
+                                if not oben:
+                                        continue
+                                nbase, sep, nrev = oben.rpartition("-")
+                                if (not sep or nbase != base or
+                                    not nrev.isdigit()):
+                                        continue
+                                maxrev = max(int(nrev), rev)
+                else:
+                        # If we didn't find the separator, or if the rightmost
+                        # part wasn't an integer, then we just start with the
+                        # original name.
+                        base = new_bename
+                        maxrev = 0
+
+                good = False
+                num = maxrev
+                while not good:
+                        new_bename = "-".join((base, str(num)))
+                        for d in self.beList:
+                                oben = d.get("orig_be_name", None)
+                                if not oben:
+                                        continue
+                                if oben == new_bename:
+                                        break
+                        else:
+                                good = True
+
+                        num += 1
+                return new_bename
 
         def __store_image_state(self):
                 """Internal function used to preserve current image information
@@ -239,19 +284,81 @@ class BootEnv(object):
                         raise api_errors.BENamingNotSupported(be_name)
 
         @staticmethod
-        def get_be_list():
+        def get_be_list(raise_error=False):
                 # Check for the old beList() API since pkg(1) can be
                 # back published and live on a system without the 
                 # latest libbe.
                 rc = 0
+
                 beVals = be.beList()
+                # XXX temporary workaround for ON bug #7043482 (needed for
+                # successful test suite runs on b166-b167).
+                if portable.util.get_canonical_os_name() == "sunos":
+                        for entry in os.listdir("/proc/self/path"):
+                                try:
+                                        int(entry)
+                                except ValueError:
+                                        # Only interested in file descriptors.
+                                        continue
+
+                                fpath = os.path.join("/proc/self/path", entry)
+                                try:
+                                        if os.readlink(fpath) == \
+                                            "/etc/dev/cro_db":
+                                                os.close(int(entry))
+                                except OSError, e:
+                                        if e.errno not in (errno.ENOENT,
+                                            errno.EBADFD):
+                                                raise
+
                 if isinstance(beVals[0], int):
                         rc, beList = beVals
                 else:
                         beList = beVals
                 if not beList or rc != 0:
+                        if raise_error:
+                                # Happens e.g. in zones (for now) or live CD
+                                # environment.
+                                raise RuntimeError, "nobootenvironments"
                         beList = []
+
                 return beList
+
+        @staticmethod
+        def get_be_name(path):
+                """Looks for the name of the boot environment corresponding to
+                an image root, returning name and uuid """
+                beList = BootEnv.get_be_list()
+
+                for be in beList:
+                        be_name = be.get("orig_be_name")
+                        be_uuid = be.get("uuid_str")
+
+                        if not be_name or not be.get("mounted"):
+                                continue
+
+                        # Check if we're operating on the live BE.
+                        # If so it must also be active. If we are not
+                        # operating on the live BE, then verify
+                        # that the mountpoint of the BE matches
+                        # the path argument passed in by the user.
+                        if path == '/':
+                                if be.get("active"):
+                                        return be_name, be_uuid
+                        else:
+                                if be.get("mountpoint") == path:
+                                        return be_name, be_uuid
+                return None, None
+
+        @staticmethod
+        def get_uuid_be_dic():
+                """Return a dictionary of all boot environment names on the
+                system, keyed by uuid"""
+                beList = BootEnv.get_be_list()
+                uuid_bes = {}
+                for be in beList:
+                        uuid_bes[be.get("uuid_str")] = be.get("orig_be_name")
+                return uuid_bes
 
         @staticmethod
         def get_activated_be_name():
@@ -274,6 +381,32 @@ class BootEnv(object):
                                         return be.get("orig_be_name")
                 except AttributeError:
                         raise api_errors.BENamingNotSupported(be_name)
+
+        def create_backup_be(self, be_name=None):
+                """Create a backup BE if the BE being modified is the live one.
+
+                'be_name' is an optional string indicating the name to use
+                for the new backup BE."""
+
+                self.check_be_name(be_name)
+
+                if self.is_live_BE:
+                        # Create a clone of the live BE, but do not mount or
+                        # activate it.  Do nothing with the returned snapshot
+                        # name that is taken of the clone during beCopy.
+                        ret, be_name_clone, not_used = be.beCopy()
+                        if ret != 0:
+                                raise api_errors.UnableToCopyBE()
+
+                        if not be_name:
+                                be_name = self.__get_new_be_name(
+                                    suffix="-backup-1")
+                        ret = be.beRename(be_name_clone, be_name)
+                        if ret != 0:
+                                raise api_errors.UnableToRenameBE(
+                                    be_name_clone, be_name)
+                elif be_name is not None:
+                        raise api_errors.BENameGivenOnDeadBE(be_name)
 
         def init_image_recovery(self, img, be_name=None):
 
@@ -308,8 +441,12 @@ class BootEnv(object):
                                 raise api_errors.UnableToMountBE(
                                     self.be_name_clone, self.clone_dir)
 
+                        # record the UUID of this cloned boot environment
+                        not_used, self.be_name_clone_uuid = \
+                            BootEnv.get_be_name(self.clone_dir)
+
                         # Set the image to our new mounted BE.
-                        img.find_root(self.clone_dir)
+                        img.find_root(self.clone_dir, exact_match=True)
                 elif be_name is not None:
                         raise api_errors.BENameGivenOnDeadBE(be_name)
 
@@ -337,15 +474,18 @@ class BootEnv(object):
                             "cmd": " ".join(cmd), "ret": ret })
                     
                 
-        def activate_image(self):
-
+        def activate_image(self, set_active=True):
                 """Activate a clone of the BE being operated on.
                         If were operating on a non-live BE then
-                        destroy the snapshot."""
+                        destroy the snapshot.
 
+                'set_active' is an optional boolean indicating that the new
+                BE (if created) should be set as the active one on next boot.
+                """
 
                 def activate_live_be():
-                        if be.beActivate(self.be_name_clone) != 0:
+                        if set_active and \
+                            be.beActivate(self.be_name_clone) != 0:
                                 logger.error(_("pkg: unable to activate %s") \
                                     % self.be_name_clone)
                                 return
@@ -353,6 +493,8 @@ class BootEnv(object):
                         # Consider the last operation a success, and log it as
                         # ending here so that it will be recorded in the new
                         # image's history.
+                        self.img.history.operation_new_be = self.be_name_clone
+                        self.img.history.operation_new_be_uuid = self.be_name_clone_uuid
                         self.img.history.log_operation_end()
 
                         if be.beUnmount(self.be_name_clone) != 0:
@@ -364,21 +506,31 @@ class BootEnv(object):
 
                         os.rmdir(self.clone_dir)
 
-                        logger.info(_("""
-A clone of %s exists and has been updated and activated.
-On the next boot the Boot Environment %s will be mounted on '/'.
-Reboot when ready to switch to this updated BE.
-""") % \
-                            (self.be_name, self.be_name_clone))
+                        if set_active:
+                                logger.info(_("""
+A clone of %(be_name)s exists and has been updated and activated.
+On the next boot the Boot Environment %(be_name_clone)s will be
+mounted on '/'.  Reboot when ready to switch to this updated BE.
+""") % self.__dict__)
+                        else:
+                                logger.info(_("""
+A clone of %(be_name)s exists and has been updated.  To set the
+new BE as the active one on next boot, execute the following
+command as a privileged user and reboot when ready to switch to
+the updated BE:
+
+beadm activate %(be_name_clone)s
+""") % self.__dict__)
 
                 def activate_be():
                         # Delete the snapshot that was taken before we
-                        # updated the image and update the the boot archive.
-                        logger.info(_("%s has been updated successfully") % \
-                                (self.be_name))
+                        # updated the image and the boot archive.
+                        logger.info(_("%s has been updated successfully") %
+                            self.be_name)
 
                         os.rmdir(self.clone_dir)
                         self.destroy_snapshot()
+                        self.img.history.operation_snapshot = None
 
                 self.__store_image_state()
 
@@ -532,7 +684,7 @@ class BootEnvNull(object):
                 pass
 
         @staticmethod
-        def update_boot_archive(self):
+        def update_boot_archive():
                 pass
 
         @staticmethod
@@ -573,12 +725,25 @@ class BootEnvNull(object):
                 pass
 
         @staticmethod
+        def get_be_name(path):
+                return None, None
+
+        @staticmethod
+        def get_uuid_be_dic():
+                return misc.EmptyDict
+
+        @staticmethod
         def get_activated_be_name():
                 pass
 
         @staticmethod
         def get_active_be_name():
                 pass
+
+        @staticmethod
+        def create_backup_be(be_name=None):
+                if be_name is not None:
+                        raise api_errors.BENameGivenOnDeadBE(be_name)
 
         @staticmethod
         def init_image_recovery(img, be_name=None):

@@ -21,7 +21,7 @@
 #
 
 #
-# Copyright (c) 2007, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2007, 2011, Oracle and/or its affiliates. All rights reserved.
 #
 
 """module describing a generic packaging object
@@ -43,6 +43,73 @@ import pkg.portable as portable
 import pkg.variant as variant
 import stat
 
+# Used to define sort order between action types.
+_ORDER_DICT_LIST = [
+    "set",
+    "depend",
+    "group",
+    "user",
+    "dir",
+    "file",
+    "hardlink",
+    "link",
+    "driver",
+    "unknown",
+    "legacy",
+    "signature"
+]
+
+# EmptyI for argument defaults; no import to avoid pkg.misc dependency.
+EmptyI = tuple()
+
+def quote_attr_value(s):
+        """Returns a properly quoted version of the provided string suitable for
+        use as an attribute value for actions in string form."""
+
+        if " " in s or "'" in s or "\"" in s or s == "":
+                if "\"" not in s:
+                        return '"%s"' % s
+                elif "'" not in s:
+                        return "'%s'" % s
+                return '"%s"' % s.replace("\"", "\\\"")
+        return s
+
+class NSG(type):
+        """This metaclass automatically assigns a subclass of Action a
+        namespace_group member if it hasn't already been specified.  This is a
+        convenience for classes which are the sole members of their group and
+        don't want to hardcode something arbitrary and unique."""
+
+        __nsg = 0
+        def __new__(mcs, name, bases, dict):
+                nsg = None
+
+                # We only look at subclasses of Action, and we ignore multiple
+                # inheritance.
+                if name != "Action" and issubclass(bases[0], Action):
+                        # Iterate through the inheritance chain to see if any
+                        # parent class has a namespace_group member, and grab
+                        # its value.
+                        for c in bases[0].__mro__:
+                                if c == Action:
+                                        break
+                                nsg = getattr(c, "namespace_group", None)
+                                if nsg is not None:
+                                        break
+
+                        # If the class didn't have a namespace_group member
+                        # already, assign one.  If we found one in our traversal
+                        # above, use that, otherwise make one up.
+                        if "namespace_group" not in dict:
+                                if not nsg:
+                                        nsg = NSG.__nsg
+                                        # Prepare for the next class.
+                                        NSG.__nsg += 1
+                                dict["namespace_group"] = nsg
+
+                return type.__new__(mcs, name, bases, dict)
+
+
 class Action(object):
         """Class representing a generic packaging object.
 
@@ -62,10 +129,21 @@ class Action(object):
         # key_attr would be the driver name.  When 'key_attr' is None, it means
         # that all attributes of the action are distinguishing.
         key_attr = None
-        # 'globally_unique' is True if the key attribute of the action
-        # represents a key which must be unique in the space of all installed
-        # actions of that type.
-        globally_unique = False
+        # 'globally_identical' is True if all actions representing a single
+        # object on a system must be identical.
+        globally_identical = False
+        # 'refcountable' is True if the action type can safely be delivered
+        # multiple times.
+        refcountable = False
+        # 'namespace_group' is a string whose value is shared by actions which
+        # share a common namespace.  As a convenience to the classes which are
+        # the sole members of their group, this is set to a non-None value for
+        # subclasses by the NSG metaclass.
+        namespace_group = None
+        # 'unique_attrs' is a tuple listing the attributes which must be
+        # identical in order for an action to be safely delivered multiple times
+        # (for those that can be).
+        unique_attrs = ()
 
         # the following establishes the sort order between action types.
         # Directories must precede all
@@ -81,26 +159,40 @@ class Action(object):
         # Most types of actions do not have a payload.
         has_payload = False
 
+        # By default, leading slashes should be stripped from "path" attribute.
+        _strip_path = True
+
+        __metaclass__ = NSG
+
         def loadorderdict(self):
-                ol = [
-                        "set",
-                        "depend",
-                        "group",
-                        "user",
-                        "dir",
-                        "file",
-                        "hardlink",
-                        "link",
-                        "driver",
-                        "unknown",
-                        "legacy",
-                        "signature"
-                        ]
                 self.orderdict.update(dict((
-                    (pkg.actions.types[t], i) for i, t in enumerate(ol)
-                    )))
+                    (pkg.actions.types[t], i)
+                    for i, t in enumerate(_ORDER_DICT_LIST)
+                )))
                 self.__class__.unknown = \
                     self.orderdict[pkg.actions.types["unknown"]]
+
+        def __getstate__(self):
+                """This object doesn't have a default __dict__, instead it
+                stores its contents via __slots__.  Hence, this routine must
+                be provide to translate this object's contents into a
+                dictionary for pickling"""
+
+                state = {}
+                for name in Action.__slots__:
+                        if not hasattr(self, name):
+                                continue
+                        state[name] = getattr(self, name)
+                return state
+
+        def __setstate__(self, state):
+                """This object doesn't have a default __dict__, instead it
+                stores its contents via __slots__.  Hence, this routine must
+                be provide to translate a pickled dictionary copy of this
+                object's contents into a real in-memory object."""
+
+                for name in state:
+                        setattr(self, name, state[name])
 
         def __init__(self, data=None, **attrs):
                 """Action constructor.
@@ -118,7 +210,14 @@ class Action(object):
 
                 if not self.orderdict:
                         self.loadorderdict()
-                self.ord = self.orderdict.get(type(self), self.unknown)
+
+
+                # A try/except is used here instead of get() as it is
+                # consistently 2% faster.
+                try:
+                        self.ord = self.orderdict[type(self)]
+                except KeyError:
+                        self.ord = self.unknown
 
                 self.attrs = attrs
 
@@ -128,6 +227,45 @@ class Action(object):
                         self.data = None
                 else:
                         self.set_data(data)
+
+                if not self.key_attr:
+                        # Nothing more to do.
+                        return
+
+                # Test if method only string object will have is defined to
+                # determine if key attribute has been specified multiple times.
+                try:
+                        self.attrs[self.key_attr].decode
+                except KeyError:
+                        if self.name == "set" or self.name == "signature":
+                                # Special case for set and signature actions
+                                # since they allow two forms of syntax.
+                                return
+                        raise pkg.actions.InvalidActionError(str(self),
+                           _("no value specified for key attribute '%s'") %
+                           self.key_attr)
+                except AttributeError:
+                       if self.name != "depend" or \
+                           self.attrs.get("type") != "require-any":
+                                # Assume list since fromstr() will only ever
+                                # provide a string or list and decode method
+                                # wasn't found.  This is much faster than
+                                # checking isinstance or 'type() ==' in
+                                # a hot path.
+                                raise pkg.actions.InvalidActionError(str(self),
+                                   _("%s attribute may only be specified "
+                                   "once") % self.key_attr)
+
+                if self._strip_path:
+                        # Strip leading slash from path if requested.
+                        try:
+                                self.attrs["path"] = \
+                                    self.attrs["path"].lstrip("/")
+                        except KeyError:
+                                return
+                        if not self.attrs["path"]:
+                                raise pkg.actions.InvalidActionError(
+                                    str(self), _("Empty path attribute"))
 
         def set_data(self, data):
                 """This function sets the data field of the action.
@@ -216,18 +354,10 @@ class Action(object):
 
                 out = self.name
                 if hasattr(self, "hash") and self.hash is not None:
-                        out += " " + self.hash
-
-                def q(s):
-                        if " " in s or "'" in s or "\"" in s or s == "":
-                                if "\"" not in s:
-                                        return '"%s"' % s
-                                elif "'" not in s:
-                                        return "'%s'" % s
-                                else:
-                                        return '"%s"' % s.replace("\"", "\\\"")
+                        if "=" not in self.hash:
+                                out += " " + self.hash
                         else:
-                                return s
+                                self.attrs["hash"] = self.hash
 
                 # Sort so that we get consistent action attribute ordering.
                 # We pay a performance penalty to do so, but it seems worth it.
@@ -235,7 +365,8 @@ class Action(object):
                         v = self.attrs[k]
                         if isinstance(v, list) or isinstance(v, set):
                                 out += " " + " ".join([
-                                    "%s=%s" % (k, q(lmt)) for lmt in v
+                                    "=".join((k, quote_attr_value(lmt)))
+                                    for lmt in v
                                 ])
                         elif " " in v or "'" in v or "\"" in v or v == "":
                                 if "\"" not in v:
@@ -243,10 +374,20 @@ class Action(object):
                                 elif "'" not in v:
                                         out += " " + k + "='" + v + "'"
                                 else:
-                                        out += " " + k + "=\"" + v.replace("\"", "\\\"") + "\""
+                                        out += " " + k + "=\"" + \
+                                            v.replace("\"", "\\\"") + "\""
                         else:
                                 out += " " + k + "=" + v
+
+                # If we have a hash attribute, it's because we added it above;
+                # get rid of it now.
+                self.attrs.pop("hash", None)
+
                 return out
+
+        def __repr__(self):
+                return "<%s object at %#x: %s>" % (self.__class__, id(self),
+                    self)
 
         def sig_str(self, a, ver):
                 """Create a stable string representation of an action that
@@ -300,6 +441,22 @@ class Action(object):
 
                 return out
 
+        def __eq__(self, other):
+                if self.name == other.name and \
+                    getattr(self, "hash", None) == \
+                        getattr(other, "hash", None) and \
+                    self.attrs == other.attrs:
+                        return True
+                return False
+
+        def __ne__(self, other):
+                if self.name == other.name and \
+                    getattr(self, "hash", None) == \
+                        getattr(other, "hash", None) and \
+                    self.attrs == other.attrs:
+                        return False
+                return True
+
         def __cmp__(self, other):
                 """Compare actions for ordering.  The ordinality of a
                    given action is computed and stored at action
@@ -351,18 +508,18 @@ class Action(object):
                 return False
 
         def differences(self, other):
-                """Returns a list of attributes that have different values
-                between other and self"""
+                """Returns the attributes that have different values between
+                other and self."""
                 sset = set(self.attrs.keys())
                 oset = set(other.attrs.keys())
-                l = list(sset.symmetric_difference(oset))
+                l = sset.symmetric_difference(oset)
                 for k in sset & oset: # over attrs in both dicts
-                        if isinstance(self.attrs[k], list) and \
-                            isinstance(other.attrs[k], list):
+                        if type(self.attrs[k]) == list and \
+                            type(other.attrs[k]) == list:
                                 if sorted(self.attrs[k]) != sorted(other.attrs[k]):
-                                        l.append(k)
+                                        l.add(k)
                         elif self.attrs[k] != other.attrs[k]:
-                                l.append(k)
+                                l.add(k)
                 return (l)
 
         def consolidate_attrs(self):
@@ -455,7 +612,7 @@ class Action(object):
                                     locals()
                                 raise apx.ActionExecutionError(self,
                                     details=err_txt, error=e,
-                                    fmri=kw.get("fmri", None))
+                                    fmri=kw.get("fmri"))
                 else:
                         # XXX Because the filelist codepath may create
                         # directories with incorrect permissions (see
@@ -494,7 +651,7 @@ class Action(object):
                                     locals()
                                 raise apx.ActionExecutionError(self,
                                     details=err_txt, error=e,
-                                    fmri=kw.get("fmri", None))
+                                    fmri=kw.get("fmri"))
 
                         os.chmod(p, fs.st_mode)
                         try:
@@ -551,14 +708,16 @@ class Action(object):
                 correctly installed in the given image."""
                 return [], [], []
 
-        def validate_fsobj_common(self, fmri=None):
-                """Common validation logic for filesystem objects."""
+        def _validate_fsobj_common(self):
+                """Private, common validation logic for filesystem objects that
+                returns a list of tuples of the form (attr_name, error_message).
+                """
 
                 errors = []
 
                 bad_mode = False
-                raw_mode = self.attrs.get("mode", None)
-                if not raw_mode:
+                raw_mode = self.attrs.get("mode")
+                if not raw_mode or isinstance(raw_mode, list):
                         bad_mode = True
                 else:
                         mlen = len(raw_mode)
@@ -588,22 +747,27 @@ class Action(object):
                                 errors.append(("mode", _("mode is required; "
                                     "value must be of the form '644', "
                                     "'0644', or '04755'.")))
+                        elif isinstance(raw_mode, list):
+                                errors.append("mode", _("mode may only be "
+                                    "specified once"))
                         else:
                                 errors.append(("mode", _("'%s' is not a valid "
                                     "mode; value must be of the form '644', "
                                     "'0644', or '04755'.") % raw_mode))
 
-                owner = self.attrs.get("owner", "").rstrip()
-                if not owner:
-                        errors.append(("owner", _("owner is required")))
+                try:
+                        owner = self.attrs.get("owner", "").rstrip()
+                except AttributeError:
+                        errors.append(("owner", _("owner may only be specified "
+                            "once")))
 
-                group = self.attrs.get("group", "").rstrip()
-                if not group:
-                        errors.append(("group", _("group is required")))
+                try:
+                        group = self.attrs.get("group", "").rstrip()
+                except AttributeError:
+                        errors.append(("group", _("group may only be specified "
+                            "once")))
 
-                if errors:
-                        raise pkg.actions.InvalidActionAttributesError(self,
-                            errors, fmri=fmri)
+                return errors
 
         def get_fsobj_uid_gid(self, pkgplan, fmri):
                 """Returns a tuple of the form (owner, group) containing the uid
@@ -752,6 +916,12 @@ class Action(object):
                         lstat = os.lstat(path)
                 except OSError, e:
                         if e.errno == errno.ENOENT:
+                                if self.attrs.get("preserve", "") == "legacy":
+                                        # It's acceptable for files with
+                                        # preserve=legacy to be missing;
+                                        # nothing more to validate.
+                                        return (lstat, errors, warnings, info,
+                                            abort)
                                 errors.append(_("Missing: %s does not exist") %
                                     ftype_to_name(ftype))
                         elif e.errno == errno.EACCES:
@@ -799,6 +969,9 @@ class Action(object):
                 """Returns True if the action transition requires a
                 datastream."""
                 return False
+
+        def get_size(self):
+                return int(self.attrs.get("pkg.size", "0"))
 
         def attrlist(self, name):
                 """return list containing value of named attribute."""
@@ -895,7 +1068,7 @@ class Action(object):
                                         raise apx.ActionExecutionError(self,
                                             error=e, fmri=fmri)
 
-                                pkgplan.image.salvage(path)
+                                pkgplan.salvage(path)
 
         def postremove(self, pkgplan):
                 """Client-side method that performs post-remove actions."""
@@ -919,8 +1092,55 @@ class Action(object):
                 error handling to provide additional diagonostics.
 
                 'fmri' is an optional package FMRI (object or string) indicating
-                what package contained this action."""
-                pass
+                what package contained this action.
+                """
+
+                self._validate(fmri=fmri)
+
+        def _validate(self, fmri=None, numeric_attrs=EmptyI,
+             raise_errors=True, required_attrs=EmptyI, single_attrs=EmptyI):
+                """Common validation logic for all action types.
+
+                'fmri' is an optional package FMRI (object or string) indicating
+                what package contained this action.
+
+                'numeric_attrs' is a list of attributes that must have an
+                integer value.
+
+                'raise_errors' is a boolean indicating whether errors should be
+                raised as an exception or returned as a list of tuples of the
+                form (attr_name, error_message).
+
+                'single_attrs' is a list of attributes that should only be
+                specified once.
+                """
+
+                errors = []
+                for attr in self.attrs:
+                        if ((attr.startswith("facet.") or
+                            attr.startswith("variant.") or
+                            attr == "reboot-needed" or attr in single_attrs) and
+                            isinstance(self.attrs[attr], list)):
+                                errors.append((attr, _("%s may only be "
+                                    "specified once") % attr))
+                        elif attr in numeric_attrs:
+                                try:
+                                        int(self.attrs[attr])
+                                except (TypeError, ValueError):
+                                        errors.append((attr, _("%s must be an "
+                                            "integer") % attr))
+
+                for attr in required_attrs:
+                        val = self.attrs.get(attr)
+                        if not val or \
+                            (isinstance(val, basestring) and not val.strip()):
+                                errors.append((attr, _("%s is required") %
+                                    attr))
+
+                if raise_errors and errors:
+                        raise pkg.actions.InvalidActionAttributesError(self,
+                            errors, fmri=fmri)
+                return errors
 
         def fsobj_checkpath(self, pkgplan, final_path):
                 """Verifies that the specified path doesn't contain one or more
@@ -962,6 +1182,6 @@ class Action(object):
                 err_txt = _("Cannot install '%(final_path)s'; parent directory "
                     "%(parent_dir)s is a link to %(parent_target)s.  To "
                     "continue, move the directory to its original location and "
-                    "try again.") % locals() 
+                    "try again.") % locals()
                 raise apx.ActionExecutionError(self, details=err_txt,
                     fmri=fmri)

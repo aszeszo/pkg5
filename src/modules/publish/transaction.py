@@ -21,7 +21,7 @@
 #
 
 #
-# Copyright (c) 2007, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2007, 2011, Oracle and/or its affiliates. All rights reserved.
 #
 
 """Provides a set of publishing interfaces for interacting with a pkg(5)
@@ -146,7 +146,7 @@ class NullTransaction(object):
                 try:
                         # Perform additional publication-time validation of
                         # actions before further processing is done.
-                        action.validate()
+                        action.validate(fmri=self.pkg_name)
                 except actions.ActionError, e:
                         raise TransactionOperationError("add",
                             trans_id=self.trans_id, msg=str(e))
@@ -206,27 +206,28 @@ class TransportTransaction(object):
                 self.pkg_name = pkg_name
                 self.trans_id = trans_id
                 self.scheme = scheme
+                if scheme == "file":
+                        path = urllib.unquote(path)
                 self.path = path
                 self.progtrack = progtrack
                 self.transport = xport
                 self.publisher = pub
 
                 if scheme == "file":
-                        self.create_file_repo(origin_url, repo_props=repo_props,
+                        self.create_file_repo(repo_props=repo_props,
                             create_repo=create_repo)
                 elif scheme != "file" and create_repo:
                         raise UnsupportedRepoTypeOperationError("create_repo",
                             type=scheme)
 
-        def create_file_repo(self, origin_url, repo_props=EmptyDict,
-            create_repo=False):
+        def create_file_repo(self, repo_props=EmptyDict, create_repo=False):
 
                 if self.transport.publish_cache_contains(self.publisher):
                         return
 
                 if create_repo:
                         try:
-                                # For compatbility reasons, assume that
+                                # For compatibility reasons, assume that
                                 # repositories created using pkgsend
                                 # should be in version 3 format (single
                                 # publisher only).

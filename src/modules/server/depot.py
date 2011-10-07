@@ -21,7 +21,7 @@
 #
 
 #
-# Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2008, 2011, Oracle and/or its affiliates. All rights reserved.
 #
 
 import cherrypy
@@ -391,7 +391,7 @@ class DepotHTTP(_Depot):
                                 # Couldn't get pub.
                                 pass
                         else:
-                                repo = pub.selected_repository
+                                repo = pub.repository
                                 if repo:
                                         rs = repo.refresh_seconds
                 if rs is None:
@@ -2158,6 +2158,10 @@ class BackgroundTaskPlugin(SimplePlugin):
                         # Create and start a thread for the caller.
                         self.__thread = threading.Thread(target=self.run)
                         self.__thread.start()
+        # Priority must be higher than the Daemonizer plugin to avoid threads
+        # starting before fork().  Daemonizer has a priority of 65, as noted
+        # at this URI: http://www.cherrypy.org/wiki/BuiltinPlugins
+        start.priority = 66 
 
         def stop(self):
                 """Stop the background task plugin."""
@@ -2196,11 +2200,13 @@ class DepotConfig(object):
         __defs = {
             4: [
                 cfg.PropertySection("pkg", [
+                    cfg.PropList("address"),
                     cfg.PropDefined("cfg_file", allowed=["", "<pathname>"]),
                     cfg.Property("content_root"),
                     cfg.PropList("debug", allowed=["", "headers"]),
                     cfg.PropList("disable_ops"),
-                    cfg.PropDefined("file_root", allowed=["", "<pathname>"]),
+                    cfg.PropDefined("image_root", allowed=["",
+                        "<abspathname>"]),
                     cfg.PropDefined("inst_root", allowed=["", "<pathname>"]),
                     cfg.PropBool("ll_mirror"),
                     cfg.PropDefined("log_access", allowed=["", "stderr",
@@ -2215,7 +2221,8 @@ class DepotConfig(object):
                     cfg.PropBool("readonly"),
                     cfg.PropInt("socket_timeout"),
                     cfg.PropInt("sort_file_max_size",
-                        default=indexer.SORT_FILE_MAX_SIZE),
+                        default=indexer.SORT_FILE_MAX_SIZE,
+                        value_map={ "": indexer.SORT_FILE_MAX_SIZE }),
                     cfg.PropDefined("ssl_cert_file",
                         allowed=["", "<pathname>", "none"]),
                     cfg.PropDefined("ssl_dialog", allowed=["<exec:pathname>",

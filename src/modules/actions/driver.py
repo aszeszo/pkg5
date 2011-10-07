@@ -21,8 +21,7 @@
 #
 
 #
-# Copyright 2010 Sun Microsystems, Inc.  All rights reserved.
-# Use is subject to license terms.
+# Copyright (c) 2010, 2011, Oracle and/or its affiliates. All rights reserved.
 #
 
 """module describing a driver packaging object.
@@ -45,7 +44,7 @@ class DriverAction(generic.Action):
 
         name = "driver"
         key_attr = "name"
-        globally_unique = True
+        globally_identical = True
 
         usr_sbin = None
         add_drv = None
@@ -56,22 +55,14 @@ class DriverAction(generic.Action):
                 generic.Action.__init__(self, data, **attrs)
 
                 if not self.__class__.usr_sbin:
-                        usr_sbin = DebugValues.get("driver-cmd-dir",
-                            "/usr/sbin") + "/"
-                        self.__class__.usr_sbin = usr_sbin
-                        self.__class__.add_drv = usr_sbin + "add_drv"
-                        self.__class__.rem_drv = usr_sbin + "rem_drv"
-                        self.__class__.update_drv = usr_sbin + "update_drv"
+                        self.__usr_sbin_init()
 
                 #
                 # Clean up clone_perms.  This attribute may been specified either as:
-                # 
-                #  <minorname> <mode> <owner> <group>
-                #
+                #     <minorname> <mode> <owner> <group>
                 # or
+                #     <mode> <owner> <group>
                 #
-                #  <mode> <owner> <group>
-                # 
                 # In the latter case, the <minorname> is assumed to be
                 # the same as the driver name.  Correct any such instances
                 # here so that there is only one form, so that we can cleanly
@@ -93,6 +84,38 @@ class DriverAction(generic.Action):
                         self.attrs["clone_perms"] = new_cloneperms[0]
                 else:
                         self.attrs["clone_perms"] = new_cloneperms
+
+        def __usr_sbin_init(self):
+                """Initialize paths to device management commands that we will
+                execute when handling package driver actions"""
+
+                usr_sbin = DebugValues.get("driver-cmd-dir", "/usr/sbin") + "/"
+                self.__class__.usr_sbin = usr_sbin
+                self.__class__.add_drv = usr_sbin + "add_drv"
+                self.__class__.rem_drv = usr_sbin + "rem_drv"
+                self.__class__.update_drv = usr_sbin + "update_drv"
+
+        def __getstate__(self):
+                """This object doesn't have a default __dict__, instead it
+                stores its contents via __slots__.  Hence, this routine must
+                be provide to translate this object's contents into a
+                dictionary for pickling"""
+
+                pstate = generic.Action.__getstate__(self)
+                return (None, pstate)
+
+        def __setstate__(self, state):
+                """This object doesn't have a default __dict__, instead it
+                stores its contents via __slots__.  Hence, this routine must
+                be provide to translate a pickled dictionary copy of this
+                object's contents into a real in-memory object."""
+
+                (state, pstate) = state
+                assert state == None
+                generic.Action.__setstate__(self, pstate)
+
+                if not self.__class__.usr_sbin:
+                        self.__usr_sbin_init()
 
         @staticmethod
         def __call(args, fmt, fmtargs):
@@ -136,19 +159,24 @@ class DriverAction(generic.Action):
                 except IOError:
                         pass
 
-                alias_conflict = False
+                # Iterate through driver_aliases and the driver actions of the
+                # target image to see if this driver will bind to an alias that
+                # some other driver will bind to.  If we find that it will, and
+                # it's unclaimed by any other driver action, then we want to
+                # comment out (for easier recovery) the entry from the file.  If
+                # it's claimed by another driver action, then we should fail
+                # installation, as if two driver actions tried to deliver the
+                # same driver.  If it's unclaimed, but appears to belong to a
+                # driver of the same name as this one, we'll safely slurp it in
+                # with __get_image_data().
+                #
+                # XXX This check should be done in imageplan preexecution.
+
+                file_db = {}
+                alias_lines = {}
+                alias_conflict = None
                 lines = []
-                # Iterate through driver_aliases to see if this driver binds to
-                # an alias that some other driver already binds to.  If we find
-                # that it does, and it's unclaimed by any other driver action,
-                # then we want to comment out (for easier recovery) the entry
-                # from the file.  If it's claimed by another driver action, then
-                # we should fail installation, as if two driver actions tried to
-                # deliver the same driver.  If it's unclaimed, but appears to
-                # belong to a driver of the same name as this one, we'll safely
-                # slurp it in with __get_image_data().
                 try:
-                        driver_actions = image.imageplan.get_actions("driver")
                         for fields in DriverAction.__gen_read_binding_file(
                             image, "etc/driver_aliases", raw=True, minfields=2,
                             maxfields=2):
@@ -157,35 +185,74 @@ class DriverAction(generic.Action):
                                         continue
 
                                 name, alias = fields
+                                file_db.setdefault(name, set()).add(alias)
+                                alias_lines.setdefault(alias, []).append(
+                                    (name, len(lines)))
                                 lines.append("%s \"%s\"\n" % tuple(fields))
+                except IOError:
+                        pass
 
-                                if name != self.attrs["name"] and \
-                                    alias in self.attrlist("alias"):
-                                        alias_conflict = True
-                                        be_name = getattr(image.bootenv,
-                                            "be_name_clone", None)
-                                        errdict = {
-                                            "new": self.attrs["name"],
-                                            "old": name,
-                                            "alias": alias,
-                                            "line": len(lines),
-                                            "be": be_name,
-                                            "imgroot": image.get_root()
-                                        }
-                                        if name in driver_actions:
-                                                # XXX This check will eventually
-                                                # be done in preexecution.
-                                                raise RuntimeError("\
+                a2d = getattr(image.imageplan, "alias_to_driver", None)
+                driver_actions = image.imageplan.get_actions("driver")
+                if a2d is None:
+                        # For all the drivers we know will be in the final
+                        # image, remove them from the db we made by slurping in
+                        # the aliases file.  What's left is what we should be
+                        # checking for dups against, along with the rest of the
+                        # drivers.
+                        for name in driver_actions.iterkeys():
+                                file_db.pop(name, None)
+
+                        # Build a mapping of aliases to driver names based on
+                        # the target image's driver actions.
+                        a2d = {}
+                        for alias, name in (
+                            (a, n)
+                            for n, act_list in driver_actions.iteritems()
+                            for act in act_list
+                            for a in act.attrlist("alias")
+                        ):
+                                a2d.setdefault(alias, set()).add(name)
+
+                        # Enhance that mapping with data from driver_aliases.
+                        for name, aliases in file_db.iteritems():
+                                for alias in aliases:
+                                        a2d.setdefault(alias, set()).add(name)
+
+                        # Stash this on the imageplan so we don't have to do the
+                        # work again.
+                        image.imageplan.alias_to_driver = a2d
+
+                for alias in self.attrlist("alias"):
+                        names = a2d[alias]
+                        assert self.attrs["name"] in names
+                        if len(names) > 1:
+                                alias_conflict = alias
+                                break
+
+                if alias_conflict:
+                        be_name = getattr(image.bootenv, "be_name_clone", None)
+                        name, line = alias_lines[alias_conflict][0]
+                        errdict = {
+                            "new": self.attrs["name"],
+                            "old": name,
+                            "alias": alias_conflict,
+                            "line": line,
+                            "be": be_name,
+                            "imgroot": image.get_root()
+                        }
+                        if name in driver_actions:
+                                raise RuntimeError("\
 The '%(new)s' driver shares the alias '%(alias)s' with the '%(old)s'\n\
 driver; both drivers cannot be installed simultaneously.  Please remove\n\
 the package delivering '%(old)s' or ensure that the package delivering\n\
 '%(new)s' will not be installed, and try the operation again." % errdict)
-                                        else:
-                                                comment = "# pkg(5): "
-                                                lines[-1] = comment + lines[-1]
-                                                # XXX Module printing
-                                                if be_name:
-                                                        print "\
+                        else:
+                                comment = "# pkg(5): "
+                                lines[line] = comment + lines[line]
+                                # XXX Module printing
+                                if be_name:
+                                        print "\
 The '%(new)s' driver shares the alias '%(alias)s' with the '%(old)s'\n\
 driver, but the system cannot determine how the latter was delivered.\n\
 Its entry on line %(line)d in /etc/driver_aliases has been commented\n\
@@ -195,20 +262,17 @@ as well as removing line %(line)d from /etc/driver_aliases or, before\n\
 rebooting, mounting the '%(be)s' boot environment and running\n\
 'rem_drv -b <mountpoint> %(old)s' and removing line %(line)d from\n\
 <mountpoint>/etc/driver_aliases." % \
-                                                            errdict
-                                                else:
-                                                        print "\
+                                            errdict
+                                else:
+                                        print "\
 The '%(new)s' driver shares the  alias '%(alias)s' with the '%(old)s'\n\
 driver, but the system cannot determine how the latter was delivered.\n\
 Its entry on line %(line)d in /etc/driver_aliases has been commented\n\
 out.  If this driver is no longer needed, it may be removed by invoking\n\
 'rem_drv -b %(imgroot)s %(old)s' as well as removing line %(line)d\n\
 from %(imgroot)s/etc/driver_aliases." % \
-                                                            errdict
-                except IOError:
-                        pass
+                                            errdict
 
-                if alias_conflict:
                         dap = image.get_root() + "/etc/driver_aliases"
                         datd, datp = mkstemp(suffix=".driver_aliases",
                             dir=image.get_root() + "/etc")
@@ -339,13 +403,13 @@ from %(imgroot)s/etc/driver_aliases." % \
                 rem_clone = oclone - nclone
 
                 for i in add_alias:
-                        args = add_base + ("-i", '"%s"' % i, self.attrs["name"])
+                        args = add_base + ("-i", '%s' % i, self.attrs["name"])
                         self.__call(args, "driver (%(name)s) upgrade (addition "
                             "of alias '%(alias)s')",
                             {"name": self.attrs["name"], "alias": i})
 
                 for i in rem_alias:
-                        args = rem_base + ("-i", '"%s"' % i, self.attrs["name"])
+                        args = rem_base + ("-i", '%s' % i, self.attrs["name"])
                         self.__call(args, "driver (%(name)s) upgrade (removal "
                             "of alias '%(alias)s')",
                             {"name": self.attrs["name"], "alias": i})
@@ -627,8 +691,7 @@ from %(imgroot)s/etc/driver_aliases." % \
                                 else:
                                         raise
 
-                act = cls()
-                act.attrs["name"] = name
+                act = cls(name=name)
 
                 # Grab aliases
                 try:

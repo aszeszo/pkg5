@@ -21,7 +21,7 @@
 #
 
 #
-# Copyright (c) 2009, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2009, 2011, Oracle and/or its affiliates. All rights reserved.
 #
 
 import getopt
@@ -37,14 +37,24 @@ import pkg.actions as actions
 import pkg.client.api as api
 import pkg.client.api_errors as api_errors
 import pkg.client.progress as progress
+import pkg.manifest as manifest
 import pkg.misc as misc
 import pkg.publish.dependencies as dependencies
 from pkg.misc import msg, emsg, PipeError
 
-CLIENT_API_VERSION = 46
+CLIENT_API_VERSION = 70
 PKG_CLIENT_NAME = "pkgdepend"
 
 DEFAULT_SUFFIX = ".res"
+
+def format_update_error(e):
+        # This message is displayed to the user whenever an
+        # ImageFormatUpdateNeeded exception is encountered.
+        emsg("\n")
+        emsg(str(e))
+        emsg(_("To continue, the target image must be upgraded "
+            "before it can be used.  See pkg(1) update-format for more "
+            "information."))
 
 def error(text, cmd=None):
         """Emit an error message prefixed by the command name """
@@ -102,7 +112,7 @@ def generate(args):
         show_missing = False
         show_usage = False
         isa_paths = []
-        kernel_paths = []
+        run_paths = []
         platform_paths = []
         dyn_tok_conv = {}
         proto_dirs = []
@@ -126,7 +136,7 @@ def generate(args):
                 elif opt == "-I":
                         remove_internal_deps = False
                 elif opt == "-k":
-                        kernel_paths.append(arg)
+                        run_paths.append(arg)
                 elif opt == "-m":
                         echo_manf = True
                 elif opt == "-M":
@@ -137,9 +147,6 @@ def generate(args):
                 usage(retcode=0)
         if len(pargs) > 2 or len(pargs) < 1:
                 usage(_("Generate only accepts one or two arguments."))
-
-        if not kernel_paths:
-                kernel_paths = ["/kernel", "/usr/kernel"]
 
         if "$ORIGIN" in dyn_tok_conv:
                 usage(_("ORIGIN may not be specified using -D. It will be "
@@ -164,12 +171,14 @@ def generate(args):
 
         try:
                 ds, es, ms, pkg_attrs = dependencies.list_implicit_deps(manf,
-                    proto_dirs, dyn_tok_conv, kernel_paths,
-                    remove_internal_deps)
+                    proto_dirs, dyn_tok_conv, run_paths, remove_internal_deps)
         except (actions.MalformedActionError, actions.UnknownActionError), e:
                 error(_("Could not parse manifest %(manifest)s because of the "
                     "following line:\n%(line)s") % { 'manifest': manf ,
                     'line': e.actionstr})
+                return 1
+        except api_errors.ApiException, e:
+                error(e)
                 return 1
 
         if echo_manf:
@@ -204,9 +213,9 @@ def resolve(args, img_dir):
         verbose = False
         use_system_to_resolve = True
         try:
-            opts, pargs = getopt.getopt(args, "d:mos:Sv")
+                opts, pargs = getopt.getopt(args, "d:mos:Sv")
         except getopt.GetoptError, e:
-            usage(_("illegal global option -- %s") % e.opt)
+                usage(_("illegal global option -- %s") % e.opt)
         for opt, arg in opts:
                 if opt == "-d":
                         out_dir = arg
@@ -227,9 +236,9 @@ def resolve(args, img_dir):
         manifest_paths = [os.path.abspath(fp) for fp in pargs]
 
         for manifest in manifest_paths:
-            if not os.path.isfile(manifest):
-                usage(_("The manifest file %s could not be found.") % manifest,
-                    retcode=2)
+                if not os.path.isfile(manifest):
+                        usage(_("The manifest file %s could not be found.") %
+                            manifest, retcode=2)
 
         if out_dir:
                 out_dir = os.path.abspath(out_dir)
@@ -237,24 +246,27 @@ def resolve(args, img_dir):
                         usage(_("The output directory %s is not a directory.") %
                             out_dir, retcode=2)
 
-        if img_dir is None:
+        provided_image_dir = True
+        pkg_image_used = False
+        if img_dir == None:
+                orig_cwd = None
                 try:
-                        img_dir = os.environ["PKG_IMAGE"]
-                except KeyError:
-                        try:
-                                img_dir = os.getcwd()
-                        except OSError, e:
-                                try:
-                                        img_dir = os.environ["PWD"]
-                                        if not img_dir or img_dir[0] != "/":
-                                                img_dir = None
-                                except KeyError:
-                                        img_dir = None
+                        orig_cwd = os.getcwd()
+                except OSError:
+                        # May be unreadable by user or have other problem.
+                        pass
 
-        if img_dir is None:
+                img_dir, provided_image_dir = api.get_default_image_root(
+                    orig_cwd=orig_cwd)
+                if os.environ.get("PKG_IMAGE"):
+                        # It's assumed that this has been checked by the above
+                        # function call and hasn't been removed from the
+                        # environment.
+                        pkg_image_used = True
+
+        if not img_dir:
                 error(_("Could not find image.  Use the -R option or set "
-                    "$PKG_IMAGE to point\nto an image, or change the working "
-                    "directory to one inside the image."))
+                    "$PKG_IMAGE to the\nlocation of an image."))
                 return 1
 
         # Becuase building an ImageInterface permanently changes the cwd for
@@ -262,18 +274,40 @@ def resolve(args, img_dir):
         # the manifests.
         try:
                 api_inst = api.ImageInterface(img_dir, CLIENT_API_VERSION,
-                    progress.QuietProgressTracker(), None, PKG_CLIENT_NAME)
+                    progress.QuietProgressTracker(), None, PKG_CLIENT_NAME,
+                    exact_match=provided_image_dir)
         except api_errors.ImageNotFoundException, e:
-                error(_("'%s' is not an install image") % e.user_dir)
+                if e.user_specified:
+                        if pkg_image_used:
+                                error(_("No image rooted at '%s' "
+                                    "(set by $PKG_IMAGE)") % e.user_dir)
+                        else:
+                                error(_("No image rooted at '%s'") % e.user_dir)
+                else:
+                        error(_("No image found."))
+                return 1
+        except api_errors.PermissionsException, e:
+                error(e)
+                return 1
+        except api_errors.ImageFormatUpdateNeeded, e:
+                # This should be a very rare error case.
+                format_update_error(e)
                 return 1
 
         try:
-            pkg_deps, errs = dependencies.resolve_deps(manifest_paths, api_inst,
-                prune_attrs=not verbose, use_system=use_system_to_resolve)
+                pkg_deps, errs = dependencies.resolve_deps(manifest_paths,
+                    api_inst, prune_attrs=not verbose,
+                    use_system=use_system_to_resolve)
         except (actions.MalformedActionError, actions.UnknownActionError), e:
-            error(_("Could not parse one or more manifests because of the " +
-                "following line:\n%s") % e.actionstr)
-            return 1
+                error(_("Could not parse one or more manifests because of "
+                    "the following line:\n%s") % e.actionstr)
+                return 1
+        except dependencies.DependencyError, e:
+                error(e)
+                return 1
+        except api_errors.ApiException, e:
+                error(e)
+                return 1
 
         ret_code = 0
 
@@ -293,7 +327,7 @@ def resolve(args, img_dir):
                 emsg(e)
         return ret_code
 
-def resolve_echo_line(l):
+def __resolve_echo_line(l):
         """Given a line from a manifest, determines whether that line should
         be repeated in the output file if echo manifest has been set."""
 
@@ -304,8 +338,35 @@ def resolve_echo_line(l):
         except actions.ActionError:
                 return True
         else:
-                return not act.name == "depend" or \
-                    act.attrs["type"] != "require"
+                return not act.name == "depend"
+
+def __echo_manifest(pth, out_func, strip_newline=False):
+        try:
+                with open(pth, "rb") as fh:
+                        text = ""
+                        act = ""
+                        for l in fh:
+                                text += l
+                                act += l.rstrip()
+                                if act.endswith("\\"):
+                                        act = act.rstrip("\\")
+                                        continue
+                                if __resolve_echo_line(act):
+                                        if strip_newline:
+                                                text = text.rstrip()
+                                        elif text[-1] != "\n":
+                                                text += "\n"
+                                        out_func(text)
+                                text = ""
+                                act = ""
+                        if text != "" and __resolve_echo_line(act):
+                                if text[-1] != "\n":
+                                        text += "\n"
+                                out_func(text)
+        except EnvironmentError:
+                ret_code = 1
+                emsg(_("Could not open %s to echo manifest") %
+                    manifest_path)
 
 def pkgdeps_to_screen(pkg_deps, manifest_paths, echo_manifest):
         """Write the resolved package dependencies to stdout.
@@ -320,22 +381,16 @@ def pkgdeps_to_screen(pkg_deps, manifest_paths, echo_manifest):
         manifest will be written out or not."""
 
         ret_code = 0
+        first = True
         for p in manifest_paths:
-                msg(p)
+                if not first:
+                        msg("\n\n")
+                first = False
+                msg("# %s" % p)
                 if echo_manifest:
-                        try:
-                                fh = open(p, "rb")
-                                for l in fh:
-                                        if resolve_echo_line(l):
-                                                msg(l.rstrip())
-                                fh.close()
-                        except EnvironmentError:
-                                emsg(_("Could not open %s to echo manifest") %
-                                    p)
-                                ret_code = 1
+                        __echo_manifest(p, msg, strip_newline=True)
                 for d in pkg_deps[p]:
                         msg(d)
-                msg(_("\n\n"))
         return ret_code
 
 def write_res(deps, out_file, echo_manifest, manifest_path):
@@ -361,16 +416,7 @@ def write_res(deps, out_file, echo_manifest, manifest_path):
                     out_file)
                 return ret_code
         if echo_manifest:
-                try:
-                        fh = open(manifest_path, "rb")
-                except EnvironmentError:
-                        ret_code = 1
-                        emsg(_("Could not open %s to echo manifest") %
-                            manifest_path)
-                for l in fh:
-                        if resolve_echo_line(l):
-                                out_fh.write(l)
-                fh.close()
+                __echo_manifest(manifest_path, out_fh.write)
         for d in deps:
                 out_fh.write("%s\n" % d)
         out_fh.close()
@@ -515,11 +561,6 @@ if __name__ == "__main__":
                 raise _e
         except:
                 traceback.print_exc()
-                error(
-                    _("\n\nThis is an internal error.  Please let the "
-                    "developers know about this\nproblem by filing a bug at "
-                    "http://defect.opensolaris.org and including the\nabove "
-                    "traceback and this message.  The version of pkg(5) is "
-                    "'%s'.") % pkg.VERSION)
+                error(misc.get_traceback_message())
                 __ret = 99
         sys.exit(__ret)

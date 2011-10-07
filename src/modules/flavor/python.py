@@ -21,7 +21,7 @@
 #
 
 #
-# Copyright (c) 2009, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2009, 2011, Oracle and/or its affiliates. All rights reserved.
 #
 
 import os
@@ -68,6 +68,25 @@ class PythonMismatchedVersion(base.DependencyAnalysisError):
                     "file can be found at %(lp)s") % self.__dict__
 
 
+class PythonSyntaxError(base.DependencyAnalysisError):
+        """Exception that is raised when a python file to be analyzed contains a
+        syntax error."""
+
+        def __init__(self, s_err, installed_path, local_file):
+                self.ip = installed_path
+                self.lp = local_file
+                self.line = s_err.lineno
+                self.col = s_err.offset
+                self.txt = str(s_err)
+
+        def __str__(self):
+                return _("The file to be installed at %(ip)s appears to be a "
+                    "python file but contains a syntax error that prevents "
+                    "it from being analyzed.  The text of the file can be found"
+                    "at %(lp)s.  The error happened on line %(line)s at offset "
+                    "%(col)s. The problem was:\n%(txt)s") % self.__dict__
+
+
 class PythonSubprocessError(base.DependencyAnalysisError):
         """This exception is raised when the subprocess created to analyze the
         module using a different version of python exits with an error code."""
@@ -94,6 +113,7 @@ class PythonSubprocessBadLine(base.DependencyAnalysisError):
                 return _("The command %(cmd)s produced the following lines "
                     "which cannot be understood:\n%(lines)s") % self.__dict__
 
+
 class PythonUnspecifiedVersion(base.PublishingDependency):
         """This exception is used when an executable file starts with
         #!/usr/bin/python and is not installed into a location from which its
@@ -111,6 +131,7 @@ class PythonUnspecifiedVersion(base.PublishingDependency):
                     "with is unknown.  The text of the file is here: %(lp)s.") \
                     % self.__dict__
 
+
 class PythonDependency(base.PublishingDependency):
         """Class representing the dependency created by importing a module
         in python."""
@@ -124,10 +145,11 @@ class PythonDependency(base.PublishingDependency):
                     self.base_names, self.run_paths, self.pkg_vars)
 
 
-py_bin_re = re.compile(r"^\#\!\s*/usr/bin/python(?P<major>\d+)\.(?P<minor>\d+)")
+py_bin_re = re.compile(
+    r"^\#\!\s*/usr/bin/([^/]+/)?python(?P<major>\d+)\.(?P<minor>\d+)")
 py_lib_re = re.compile(r"^usr/lib/python(?P<major>\d+)\.(?P<minor>\d+)/")
 
-def process_python_dependencies(action, pkg_vars, script_path):
+def process_python_dependencies(action, pkg_vars, script_path, run_paths):
         """Analyze the file delivered by the action for any python dependencies.
 
         The 'action' parameter contain the action which delivers the file.
@@ -137,6 +159,9 @@ def process_python_dependencies(action, pkg_vars, script_path):
 
         The 'script_path' parameter is None of the file is not executable, or
         is the path for the binary which is used to execute the file.
+
+        The 'run_paths' parameter is a list of paths that should be searched
+        for modules.
         """
 
         # There are three conditions which determine whether python dependency
@@ -224,19 +249,29 @@ def process_python_dependencies(action, pkg_vars, script_path):
         # of python running, use the default analyzer and don't fork and exec.
         if cur_major == analysis_major and cur_minor == analysis_minor:
                 mf = modulefinder.DepthLimitedModuleFinder(
-                    action.attrs[PD_PROTO_DIR])
-                loaded_modules = mf.run_script(local_file)
+                    os.path.dirname(action.attrs["path"]), run_paths=run_paths)
+                try:
+                        loaded_modules = mf.run_script(local_file)
 
-                for names, dirs in set([
-                    (tuple(m.get_file_names()), tuple(m.dirs))
-                    for m in loaded_modules
-                ]):
-                        deps.append(PythonDependency(action, names, dirs,
-                            pkg_vars, action.attrs[PD_PROTO_DIR]))
-                missing, maybe = mf.any_missing_maybe()
-                for name in missing:
-                        errs.append(PythonModuleMissingPath(name,
-                            action.attrs[PD_LOCAL_PATH]))
+                        for names, dirs in set([
+                            (tuple(m.get_file_names()), tuple(m.dirs))
+                            for m in loaded_modules
+                        ]):
+                                # Add the directory the python file will be
+                                # installed in to the paths used to find modules
+                                # for import.  This allows relative imports to
+                                # work correctly.
+                                deps.append(PythonDependency(action, names,
+                                    dirs, pkg_vars, action.attrs[PD_PROTO_DIR]))
+                        missing, maybe = mf.any_missing_maybe()
+                        for name in missing:
+                                errs.append(PythonModuleMissingPath(name,
+                                    action.attrs[PD_LOCAL_PATH]))
+                except SyntaxError, e:
+                        errs.append(PythonSyntaxError(e, action.attrs["path"],
+                            local_file))
+                except Exception, e:
+                        errs.append(e)
                 return deps, errs, {}
 
         # If the version implied by the directory hierarchy does not match the
@@ -246,7 +281,10 @@ def process_python_dependencies(action, pkg_vars, script_path):
         exec_file = os.path.join(root_dir,
             "depthlimitedmf%s%s.py" % (analysis_major, analysis_minor))
         cmd = ["python%s.%s" % (analysis_major, analysis_minor), exec_file,
-            action.attrs[PD_PROTO_DIR], local_file]
+            os.path.dirname(action.attrs["path"]), local_file]
+
+        if run_paths:
+                cmd.extend(run_paths)
         try:
                 sp = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE)

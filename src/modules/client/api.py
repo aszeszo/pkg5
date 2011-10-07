@@ -21,7 +21,7 @@
 #
 
 #
-# Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2008, 2011, Oracle and/or its affiliates. All rights reserved.
 #
 
 """This module provides the supported, documented interface for clients to
@@ -36,36 +36,49 @@ error handling.
 
 import collections
 import copy
+import datetime
 import errno
 import fnmatch
+import glob
+import operator
 import os
 import shutil
 import sys
+import tempfile
+import time
 import threading
 import urllib
 
-import pkg.client.actuator as actuator
 import pkg.client.api_errors as apx
 import pkg.client.bootenv as bootenv
 import pkg.client.history as history
 import pkg.client.image as image
+import pkg.client.imageconfig as imgcfg
+import pkg.client.imageplan as ip
 import pkg.client.imagetypes as imgtypes
 import pkg.client.indexer as indexer
 import pkg.client.publisher as publisher
 import pkg.client.query_parser as query_p
 import pkg.fmri as fmri
+import pkg.mediator as med
 import pkg.misc as misc
 import pkg.nrlock
 import pkg.p5i as p5i
+import pkg.p5s as p5s
+import pkg.portable as portable
 import pkg.search_errors as search_errors
 import pkg.version
 
 from pkg.api_common import (PackageInfo, LicenseInfo, PackageCategory,
     _get_pkg_cat_data)
-from pkg.client.imageplan import EXECUTED_OK
 from pkg.client import global_settings
+from pkg.client.debugvalues import DebugValues
 
-CURRENT_API_VERSION = 46
+from pkg.client.pkgdefs import *
+from pkg.smf import NonzeroExitException
+
+CURRENT_API_VERSION = 70
+COMPATIBLE_API_VERSIONS = frozenset([66, 67, 68, 69, CURRENT_API_VERSION])
 CURRENT_P5I_VERSION = 1
 
 # Image type constants.
@@ -74,18 +87,137 @@ IMG_TYPE_ENTIRE = imgtypes.IMG_ENTIRE # Full image ('/').
 IMG_TYPE_PARTIAL = imgtypes.IMG_PARTIAL  # Not yet implemented.
 IMG_TYPE_USER = imgtypes.IMG_USER # Not '/'; some other location.
 
+# History result constants.
+RESULT_CANCELED = history.RESULT_CANCELED
+RESULT_NOTHING_TO_DO = history.RESULT_NOTHING_TO_DO
+RESULT_SUCCEEDED = history.RESULT_SUCCEEDED
+RESULT_FAILED_BAD_REQUEST = history.RESULT_FAILED_BAD_REQUEST
+RESULT_FAILED_CONFIGURATION = history.RESULT_FAILED_CONFIGURATION
+RESULT_FAILED_CONSTRAINED = history.RESULT_FAILED_CONSTRAINED
+RESULT_FAILED_LOCKED = history.RESULT_FAILED_LOCKED
+RESULT_FAILED_SEARCH = history.RESULT_FAILED_SEARCH
+RESULT_FAILED_STORAGE = history.RESULT_FAILED_STORAGE
+RESULT_FAILED_TRANSPORT = history.RESULT_FAILED_TRANSPORT
+RESULT_FAILED_ACTUATOR = history.RESULT_FAILED_ACTUATOR
+RESULT_FAILED_OUTOFMEMORY = history.RESULT_FAILED_OUTOFMEMORY
+RESULT_CONFLICTING_ACTIONS = history.RESULT_CONFLICTING_ACTIONS
+RESULT_FAILED_UNKNOWN = history.RESULT_FAILED_UNKNOWN
+
+# Globals.
 logger = global_settings.logger
+
+class _LockedGenerator(object):
+        """This is a private class and should not be used by API consumers.
+
+        This decorator class wraps API generator functions, managing the
+        activity and cancelation locks.  Due to implementation differences
+        in the decorator protocol, the decorator must be used with
+        parenthesis in order for this to function correctly.  Always
+        decorate functions @_LockedGenerator()."""
+
+        def __init__(self, *d_args, **d_kwargs):
+                object.__init__(self)
+
+        def __call__(self, f):
+                def wrapper(*fargs, **f_kwargs):
+                        instance, fargs = fargs[0], fargs[1:]
+                        instance._acquire_activity_lock()
+                        instance._enable_cancel()
+
+                        clean_exit = True
+                        canceled = False
+                        try:
+                                for v in f(instance, *fargs, **f_kwargs):
+                                        yield v
+                        except GeneratorExit:
+                                return
+                        except apx.CanceledException:
+                                canceled = True
+                                raise
+                        except Exception:
+                                clean_exit = False
+                                raise
+                        finally:
+                                if canceled:
+                                        instance._cancel_done()
+                                elif clean_exit:
+                                        try:
+                                                instance._disable_cancel()
+                                        except apx.CanceledException:
+                                                instance._cancel_done()
+                                                instance._activity_lock.release()
+                                                raise
+                                else:
+                                        instance._cancel_cleanup_exception()
+                                instance._activity_lock.release()
+
+                return wrapper
+
+
+class _LockedCancelable(object):
+        """This is a private class and should not be used by API consumers.
+
+        This decorator class wraps non-generator cancelable API functions,
+        managing the activity and cancelation locks.  Due to implementation
+        differences in the decorator protocol, the decorator must be used with
+        parenthesis in order for this to function correctly.  Always
+        decorate functions @_LockedCancelable()."""
+
+        def __init__(self, *d_args, **d_kwargs):
+                object.__init__(self)
+
+        def __call__(self, f):
+                def wrapper(*fargs, **f_kwargs):
+                        instance, fargs = fargs[0], fargs[1:]
+                        instance._acquire_activity_lock()
+                        instance._enable_cancel()
+
+                        clean_exit = True
+                        canceled = False
+                        try:
+                                return f(instance, *fargs, **f_kwargs)
+                        except apx.CanceledException:
+                                canceled = True
+                                raise
+                        except Exception:
+                                clean_exit = False
+                                raise
+                        finally:
+                                instance._img.cleanup_downloads()
+                                try:
+                                        if int(os.environ.get("PKG_DUMP_STATS",
+                                            0)) > 0:
+                                                instance._img.transport.stats.dump()
+                                except ValueError:
+                                        # Don't generate stats if an invalid
+                                        # value is supplied.
+                                        pass
+
+                                if canceled:
+                                        instance._cancel_done()
+                                elif clean_exit:
+                                        try:
+                                                instance._disable_cancel()
+                                        except apx.CanceledException:
+                                                instance._cancel_done()
+                                                instance._activity_lock.release()
+                                                raise
+                                else:
+                                        instance._cancel_cleanup_exception()
+                                instance._activity_lock.release()
+
+                return wrapper
+
 
 class ImageInterface(object):
         """This class presents an interface to images that clients may use.
         There is a specific order of methods which must be used to install
-        or uninstall packages, or update an image. First, plan_install,
-        plan_uninstall, plan_update_all or plan_change_variant must be
-        called.  After that method completes successfully, describe may be
-        called, and prepare must be called. Finally, execute_plan may be
-        called to implement the previous created plan. The other methods
+        or uninstall packages, or update an image.  First, a gen_plan_* method
+        must be called.  After that method completes successfully, describe may
+        be called, and prepare must be called.  Finally, execute_plan may be
+        called to implement the previous created plan.  The other methods
         do not have an ordering imposed upon them, and may be used as
-        needed. Cancel may only be invoked while a cancelable method is
+        needed.  Cancel may only be invoked while a cancelable method is
         running."""
 
         # Constants used to reference specific values that info can return.
@@ -104,15 +236,53 @@ class ImageInterface(object):
         MATCH_GLOB = 2
 
         # Private constants used for tracking which type of plan was made.
-        __INSTALL = 1
-        __UNINSTALL = 2
-        __UPDATE = 3
+        __INSTALL     = "install"
+        __MEDIATORS   = "mediators"
+        __REVERT      = "revert"
+        __SYNC        = "sync"
+        __UNINSTALL   = "uninstall"
+        __UPDATE      = "update"
+        __VARCET      = "varcet"
+        __plan_values = frozenset([
+            __INSTALL,
+            __MEDIATORS,
+            __REVERT,
+            __SYNC,
+            __UNINSTALL,
+            __UPDATE,
+            __VARCET,
+        ])
+
+        __api_op_2_plan = {
+            API_OP_ATTACH:         __SYNC,
+            API_OP_SET_MEDIATOR:   __MEDIATORS,
+            API_OP_CHANGE_FACET:   __VARCET,
+            API_OP_CHANGE_VARIANT: __VARCET,
+            API_OP_DETACH:         __UNINSTALL,
+            API_OP_INSTALL:        __INSTALL,
+            API_OP_REVERT:         __REVERT,
+            API_OP_SYNC:           __SYNC,
+            API_OP_UNINSTALL:      __UNINSTALL,
+            API_OP_UPDATE:         __UPDATE,
+        }
+
+        __stage_2_ip_mode = {
+            API_STAGE_DEFAULT:  ip.IP_MODE_DEFAULT,
+            API_STAGE_PUBCHECK: ip.IP_MODE_SAVE,
+            API_STAGE_PLAN:     ip.IP_MODE_SAVE,
+            API_STAGE_PREPARE:  ip.IP_MODE_LOAD,
+            API_STAGE_EXECUTE:  ip.IP_MODE_LOAD,
+        }
+
 
         def __init__(self, img_path, version_id, progresstracker,
-            cancel_state_callable, pkg_client_name):
+            cancel_state_callable, pkg_client_name, exact_match=True,
+            cmdpath=None, runid=-1):
                 """Constructs an ImageInterface object.
 
-                'img_path' is the absolute path to an existing image.
+                'img_path' is the absolute path to an existing image or to a
+                path from which to start looking for an image.  To control this
+                behaviour use the 'exact_match' parameter.
 
                 'version_id' indicates the version of the api the client is
                 expecting to use.
@@ -125,13 +295,40 @@ class ImageInterface(object):
                 changes.
 
                 'pkg_client_name' is a string containing the name of the client,
-                such as "pkg" or "packagemanager"."""
+                such as "pkg" or "packagemanager".
 
-                compatible_versions = set([CURRENT_API_VERSION])
+                'exact_match' is a boolean indicating whether the API should
+                attempt to find a usable image starting from the specified
+                directory, going up to the filesystem root until it finds one.
+                If set to True, an image must exist at the location indicated
+                by 'img_path'.
+                """
 
-                if version_id not in compatible_versions:
+                if version_id not in COMPATIBLE_API_VERSIONS:
                         raise apx.VersionException(CURRENT_API_VERSION,
                             version_id)
+
+                if sys.path[0].startswith("/dev/fd/"):
+                        #
+                        # Normally when the kernel forks off an interpreted
+                        # program, it executes the interpreter with the first
+                        # argument being the path to the interpreted program
+                        # we're executing.  But in the case of suid scripts
+                        # this presents a security problem because that path
+                        # could be updated after exec but before the
+                        # interpreter opens reads the program.  To avoid this
+                        # race, for suid script the kernel replaces the name
+                        # of the interpreted program with /dev/fd/###, and
+                        # opens the interpreted program such that it can be
+                        # read from the specified file descriptor device node.
+                        # So if we detect that path[0] (which should be then
+                        # interpreted program name) is a /dev/fd/ path, that
+                        # means we're being run as an suid script, which we
+                        # don't really want to support.  (Since this breaks
+                        # our subsequent code that attempt to determine the
+                        # name of the executable we are running as.)
+                        #
+                        raise apx.SuidUnsupportedError()
 
                 # The image's History object will use client_name from
                 # global_settings, but if the program forgot to set it,
@@ -139,41 +336,91 @@ class ImageInterface(object):
                 if global_settings.client_name is None:
                         global_settings.client_name = pkg_client_name
 
+                if runid < 0:
+                        runid = os.getpid()
+                self.__runid = runid
+
+                if cmdpath == None:
+                        cmdpath = misc.api_cmdpath()
+                self.cmdpath = cmdpath
+
+                # prevent brokeness in the test suite
+                if self.cmdpath and \
+                    "PKG_NO_RUNPY_CMDPATH" in os.environ and \
+                    self.cmdpath.endswith(os.sep + "run.py"):
+                        raise RuntimeError, """
+An ImageInterface object was allocated from within ipkg test suite and
+cmdpath was not explicitly overridden.  Please make sure to set
+explicitly set cmdpath when allocating an ImageInterface object, or
+override cmdpath when allocating an Image object by setting PKG_CMDPATH
+in the environment or by setting simulate_cmdpath in DebugValues."""
+
                 if isinstance(img_path, basestring):
                         # Store this for reset().
-                        self.__img_path = img_path
-                        self.__img = image.Image(img_path,
-                            progtrack=progresstracker)
+                        self._img_path = img_path
+                        self._img = image.Image(img_path,
+                            progtrack=progresstracker,
+                            user_provided_dir=exact_match,
+                            cmdpath=self.cmdpath,
+                            runid=runid)
+
+                        # Store final image path.
+                        self._img_path = self._img.get_root()
                 elif isinstance(img_path, image.Image):
                         # This is a temporary, special case for client.py
                         # until the image api is complete.
-                        self.__img = img_path
-                        self.__img_path = img_path.get_root()
+                        self._img = img_path
+                        self._img_path = img_path.get_root()
                 else:
                         # API consumer passed an unknown type for img_path.
                         raise TypeError(_("Unknown img_path type."))
 
                 self.__progresstracker = progresstracker
+                lin = None
+                if self._img.linked.ischild():
+                        lin = self._img.linked.child_name
+                self.__progresstracker.set_linked_name(lin)
+
                 self.__cancel_state_callable = cancel_state_callable
+                self.__stage = API_STAGE_DEFAULT
                 self.__plan_type = None
+                self.__api_op = None
                 self.__plan_desc = None
+                self.__planned_children = False
                 self.__prepared = False
                 self.__executed = False
+                self.__be_activate = True
+                self.__backup_be_name = None
                 self.__be_name = None
                 self.__can_be_canceled = False
                 self.__canceling = False
-                self.__activity_lock = pkg.nrlock.NRLock()
+                self._activity_lock = pkg.nrlock.NRLock()
                 self.__blocking_locks = False
-                self.__img.blocking_locks = self.__blocking_locks
+                self._img.blocking_locks = self.__blocking_locks
                 self.__cancel_lock = pkg.nrlock.NRLock()
                 self.__cancel_cv = threading.Condition(self.__cancel_lock)
+                self.__backup_be = None # create if needed
                 self.__new_be = None # create if needed
+                self.__alt_sources = {}
 
         def __set_blocking_locks(self, value):
-                self.__activity_lock.acquire()
+                self._activity_lock.acquire()
                 self.__blocking_locks = value
-                self.__img.blocking_locks = value
-                self.__activity_lock.release()
+                self._img.blocking_locks = value
+                self._activity_lock.release()
+
+        def __set_img_alt_sources(self, repos):
+                """Private helper function to change image to use alternate
+                package sources if applicable."""
+
+                # When using alternate package sources with the image, the
+                # result is a composite of the package data already known
+                # by the image and the alternate sources.
+                if repos:
+                        self._img.set_alt_pkg_sources(
+                            self.__get_alt_pkg_data(repos))
+                else:
+                        self._img.set_alt_pkg_sources(None)
 
         blocking_locks = property(lambda self: self.__blocking_locks,
             __set_blocking_locks, doc="A boolean value indicating whether "
@@ -186,45 +433,115 @@ class ImageInterface(object):
         @property
         def excludes(self):
                 """The list of excludes for the image."""
-                return self.__img.list_excludes()
+                return self._img.list_excludes()
 
         @property
         def img(self):
                 """Private; public access to this property will be removed at
                 a later date.  Do not use."""
-                return self.__img
+                return self._img
 
         @property
         def img_type(self):
                 """Returns the IMG_TYPE constant for the image's type."""
-                if not self.__img:
+                if not self._img:
                         return None
-                return self.__img.image_type(self.__img.root)
+                return self._img.image_type(self._img.root)
+
+        @property
+        def is_liveroot(self):
+                """A boolean indicating whether the image to be modified is
+                for the live system root."""
+                return self._img.is_liveroot()
 
         @property
         def is_zone(self):
                 """A boolean value indicating whether the image is a zone."""
-                return self.__img.is_zone()
+                return self._img.is_zone()
 
         @property
         def last_modified(self):
                 """A datetime object representing when the image's metadata was
                 last updated."""
 
-                return self.__img.get_last_modified()
+                return self._img.get_last_modified()
+
+        def __set_progresstracker(self, value):
+                self._activity_lock.acquire()
+                self.__progresstracker = value
+                self._activity_lock.release()
+
+        progresstracker = property(lambda self: self.__progresstracker,
+            __set_progresstracker, doc="The current ProgressTracker object.  "
+            "This value should only be set when no other API calls are in "
+            "progress.")
+
+        @property
+        def mediators(self):
+                """A dictionary of the mediators and their configured version
+                and implementation of the form:
+
+                   {
+                       mediator-name: {
+                           "version": mediator-version-string,
+                           "version-source": (site|vendor|system|local),
+                           "implementation": mediator-implementation-string,
+                           "implementation-source": (site|vendor|system|local),
+                       }
+                   }
+
+                  'version' is an optional string that specifies the version
+                   (expressed as a dot-separated sequence of non-negative
+                   integers) of the mediator for use.
+
+                   'version-source' is a string describing the source of the
+                   selected version configuration.  It indicates how the
+                   version component of the mediation was selected.
+
+                   'implementation' is an optional string that specifies the
+                   implementation of the mediator for use in addition to or
+                   instead of 'version'.
+
+                   'implementation-source' is a string describing the source of
+                   the selected implementation configuration.  It indicates how
+                   the implementation component of the mediation was selected.
+                 """
+
+                ret = {}
+                for m, mvalues in self._img.cfg.mediators.iteritems():
+                        ret[m] = copy.copy(mvalues)
+                        if "version" in ret[m]:
+                                # Don't expose internal Version object to
+                                # external consumers.
+                                ret[m]["version"] = \
+                                    ret[m]["version"].get_short_version()
+                        if "implementation-version" in ret[m]:
+                                # Don't expose internal Version object to
+                                # external consumers.
+                                ret[m]["implementation-version"] = \
+                                    ret[m]["implementation-version"].get_short_version()
+                return ret
 
         @property
         def root(self):
                 """The absolute pathname of the filesystem root of the image.
                 This property is read-only."""
-                if not self.__img:
+                if not self._img:
                         return None
-                return self.__img.root
+                return self._img.root
 
         @staticmethod
         def check_be_name(be_name):
                 bootenv.BootEnv.check_be_name(be_name)
                 return True
+
+        def set_stage(self, stage):
+                """Tell the api which stage of execution we're in.  This is
+                used when executing in child images during recursive linked
+                operations."""
+
+                assert stage in api_stage_values
+                self.__stage = stage
 
         def __cert_verify(self, log_op_end=None):
                 """Verify validity of certificates.  Any apx.ExpiringCertificate
@@ -244,7 +561,7 @@ class ImageInterface(object):
                 assert apx.ExpiringCertificate not in log_op_end
 
                 try:
-                        self.__img.check_cert_validity()
+                        self._img.check_cert_validity()
                 except apx.ExpiringCertificate, e:
                         logger.error(e)
                 except:
@@ -254,147 +571,717 @@ class ImageInterface(object):
                         raise
 
         def __refresh_publishers(self):
-                """Refresh publisher metadata."""
+                """Refresh publisher metadata; this should only be used by
+                functions in this module for implicit refresh cases."""
 
                 #
                 # Verify validity of certificates before possibly
                 # attempting network operations.
                 #
                 self.__cert_verify()
-                self.__img.refresh_publishers(immediate=True,
-                    progtrack=self.__progresstracker)
+                try:
+                        self._img.refresh_publishers(immediate=True,
+                            progtrack=self.__progresstracker)
+                except apx.ImageFormatUpdateNeeded:
+                        # If image format update is needed to perform refresh,
+                        # continue on and allow failure to happen later since
+                        # an implicit refresh failing for this reason isn't
+                        # important.  (This allows planning installs and updates
+                        # before the format of an image is updated.  Yes, this
+                        # means that if the refresh was needed to do that, then
+                        # this isn't useful, but this is as good as it gets.)
+                        logger.warning(_("Skipping publisher metadata refresh;"
+                            "image rooted at %s must have its format updated "
+                            "before a refresh can occur.") % self._img.root)
 
-        def __acquire_activity_lock(self):
+        def _acquire_activity_lock(self):
                 """Private helper method to aqcuire activity lock."""
 
-                rc = self.__activity_lock.acquire(
+                rc = self._activity_lock.acquire(
                     blocking=self.__blocking_locks)
                 if not rc:
                         raise apx.ImageLockedError()
 
-        def __plan_common_start(self, operation, noexecute, new_be, be_name):
-                """Start planning an operation:  
+        def __plan_common_start(self, operation, noexecute, backup_be,
+            backup_be_name, new_be, be_name, be_activate):
+                """Start planning an operation:
                     Acquire locks.
                     Log the start of the operation.
                     Check be_name."""
 
-                self.__acquire_activity_lock()
+                self._acquire_activity_lock()
                 try:
-                        self.__enable_cancel()
+                        self._enable_cancel()
                         if self.__plan_type is not None:
                                 raise apx.PlanExistsException(
                                     self.__plan_type)
-                        self.__img.lock(allow_unprivileged=noexecute)
+                        self._img.lock(allow_unprivileged=noexecute)
                 except:
-                        self.__cancel_cleanup_exception()
-                        self.__activity_lock.release()
+                        self._cancel_cleanup_exception()
+                        self._activity_lock.release()
                         raise
 
-                assert self.__activity_lock._is_owned()
+                assert self._activity_lock._is_owned()
                 self.log_operation_start(operation)
+                self.__backup_be = backup_be
+                self.__backup_be_name = backup_be_name
                 self.__new_be = new_be
+                self.__be_activate = be_activate
                 self.__be_name = be_name
-                if self.__be_name is not None:
-                        self.check_be_name(be_name)
-                        if not self.__img.is_liveroot():
-                                raise apx.BENameGivenOnDeadBE(self.__be_name)
+                for val in (self.__be_name, self.__backup_be_name):
+                        if val is not None:
+                                self.check_be_name(val)
+                                if not self._img.is_liveroot():
+                                        raise apx.BENameGivenOnDeadBE(val)
 
         def __plan_common_finish(self):
                 """Finish planning an operation."""
 
-                assert self.__activity_lock._is_owned()
-                self.__img.cleanup_downloads()
-                self.__img.unlock()
+                assert self._activity_lock._is_owned()
+                self._img.cleanup_downloads()
+                self._img.unlock()
                 try:
                         if int(os.environ.get("PKG_DUMP_STATS", 0)) > 0:
-                                self.__img.transport.stats.dump()
+                                self._img.transport.stats.dump()
                 except ValueError:
                         # Don't generate stats if an invalid value
                         # is supplied.
                         pass
 
-                self.__activity_lock.release()
+                self._activity_lock.release()
 
-        def __set_new_be(self):
-                """Figure out whether or not we'd create a new boot environment
-                given inputs and plan.  Toss cookies if we need a new be and 
-                can't have one."""
-                # decide whether or not to create new BE.
+        def __set_be_creation(self):
+                """Figure out whether or not we'd create a new or backup boot
+                environment given inputs and plan.  Toss cookies if we need a
+                new be and can't have one."""
 
-                if self.__img.is_liveroot():
-                        if self.__new_be is None:
-                                self.__new_be = self.__img.imageplan.reboot_needed()
-                        elif self.__new_be is False and \
-                            self.__img.imageplan.reboot_needed():
-                                raise apx.ImageUpdateOnLiveImageException()
-                else:
+                if not self._img.is_liveroot():
+                        self.__backup_be = False
                         self.__new_be = False
+                        return
 
-        def __plan_common_exception(self, log_op_end=None):
+                if self.__new_be is None:
+                        # If image policy requires a new BE or the plan requires
+                        # it, then create a new BE.
+                        self.__new_be = (self._img.cfg.get_policy_str(
+                            imgcfg.BE_POLICY) == "always-new" or
+                            self._img.imageplan.reboot_needed())
+                elif self.__new_be is False and \
+                    self._img.imageplan.reboot_needed():
+                        raise apx.ImageUpdateOnLiveImageException()
+
+                if not self.__new_be and self.__backup_be is None:
+                        # Create a backup be if allowed by policy (note that the
+                        # 'default' policy is currently an alias for
+                        # 'create-backup') ...
+                        allow_backup = self._img.cfg.get_policy_str(
+                            imgcfg.BE_POLICY) in ("default",
+                                "create-backup")
+
+                        self.__backup_be = False
+                        if allow_backup:
+                                # ...when packages are being
+                                # updated...
+                                for src, dest in self._img.imageplan.plan_desc:
+                                        if src and dest:
+                                                self.__backup_be = True
+                                                break
+                        if allow_backup and not self.__backup_be:
+                                # ...or if new packages that have
+                                # reboot-needed=true are being
+                                # installed.
+                                self.__backup_be = \
+                                    self._img.imageplan.reboot_advised()
+
+        def abort(self, result=RESULT_FAILED_UNKNOWN):
+                """Indicate that execution was unexpectedly aborted and log
+                operation failure if possible."""
+                self._img.history.abort(result)
+
+        def avoid_pkgs(self, fmri_strings, unavoid=False):
+                """Avoid/Unavoid one or more packages.  It is an error to
+                avoid an installed package, or unavoid one that would
+                be installed."""
+
+                self._acquire_activity_lock()
+                try:
+                        if not unavoid:
+                                self._img.avoid_pkgs(fmri_strings,
+                                    progtrack=self.__progresstracker,
+                                    check_cancel=self.__check_cancel)
+                        else:
+                                self._img.unavoid_pkgs(fmri_strings,
+                                    progtrack=self.__progresstracker,
+                                    check_cancel=self.__check_cancel)
+                finally:
+                        self._activity_lock.release()
+                return True
+
+        def gen_available_mediators(self):
+                """A generator function that yields tuples of the form (mediator,
+                mediations), where mediator is the name of the provided mediation
+                and mediations is a list of dictionaries of possible mediations
+                to set, provided by installed packages, of the form:
+
+                   {
+                       mediator-name: {
+                           "version": mediator-version-string,
+                           "version-source": (site|vendor|system|local),
+                           "implementation": mediator-implementation-string,
+                           "implementation-source": (site|vendor|system|local),
+                       }
+                   }
+
+                  'version' is an optional string that specifies the version
+                   (expressed as a dot-separated sequence of non-negative
+                   integers) of the mediator for use.
+
+                   'version-source' is a string describing how the version
+                   component of the mediation will be evaluated during
+                   mediation. (The priority.)
+
+                   'implementation' is an optional string that specifies the
+                   implementation of the mediator for use in addition to or
+                   instead of 'version'.
+
+                   'implementation-source' is a string describing how the
+                   implementation component of the mediation will be evaluated
+                   during mediation.  (The priority.)
+
+                The list of possible mediations returned for each mediator is
+                ordered by source in the sequence 'site', 'vendor', 'system',
+                and then by version and implementation.  It does not include
+                mediations that exist only in the image configuration.
+                """
+
+                ret = collections.defaultdict(set)
+                excludes = self._img.list_excludes()
+                for f in self._img.gen_installed_pkgs():
+                        mfst = self._img.get_manifest(f)
+                        for m, mediations in mfst.gen_mediators(
+                            excludes=excludes):
+                                ret[m].update(mediations)
+
+                for mediator in sorted(ret):
+                        for med_priority, med_ver, med_impl in sorted(
+                            ret[mediator], cmp=med.cmp_mediations):
+                                val = {}
+                                if med_ver:
+                                        # Don't expose internal Version object
+                                        # to callers.
+                                        val["version"] = \
+                                            med_ver.get_short_version()
+                                if med_impl:
+                                        val["implementation"] = med_impl
+
+                                ret_priority = med_priority
+                                if not ret_priority:
+                                        # For consistency with the configured
+                                        # case, list source as this.
+                                        ret_priority = "system"
+                                # Always set both to be consistent
+                                # with @mediators.
+                                val["version-source"] = ret_priority
+                                val["implementation-source"] = \
+                                    ret_priority
+                                yield mediator, val
+
+        def get_avoid_list(self):
+                """Return list of tuples of (pkg stem, pkgs w/ group
+                dependencies on this) """
+                return [a for a in self._img.get_avoid_dict().iteritems()]
+
+        def freeze_pkgs(self, fmri_strings, dry_run=False, comment=None,
+            unfreeze=False):
+                """Freeze/Unfreeze one or more packages."""
+
+                # Comment is only a valid parameter if a freeze is happening.
+                assert not comment or not unfreeze
+
+                self._acquire_activity_lock()
+                try:
+                        if unfreeze:
+                                return self._img.unfreeze_pkgs(fmri_strings,
+                                    progtrack=self.__progresstracker,
+                                    check_cancel=self.__check_cancel,
+                                    dry_run=dry_run)
+                        else:
+                                return self._img.freeze_pkgs(fmri_strings,
+                                    progtrack=self.__progresstracker,
+                                    check_cancel=self.__check_cancel,
+                                    dry_run=dry_run, comment=comment)
+                finally:
+                        self._activity_lock.release()
+
+        def get_frozen_list(self):
+                """Return list of tuples of (pkg fmri, reason package was
+                frozen, timestamp when package was frozen)."""
+
+                return self._img.get_frozen_list()
+
+        def __plan_common_exception(self, log_op_end_all=False):
                 """Deal with exceptions that can occur while planning an
                 operation.  Any exceptions generated here are passed
                 onto the calling context.  By default all exceptions
                 will result in a call to self.log_operation_end() before
-                they are passed onto the calling context.  Optionally,
-                the caller can specify the exceptions that should result
-                in a call to self.log_operation_end() by setting
-                log_op_end."""
-
-                if log_op_end == None:
-
-                        log_op_end = []
-
-                # we always explicity handle apx.PlanCreationException
-                assert apx.PlanCreationException not in log_op_end
+                they are passed onto the calling context."""
 
                 exc_type, exc_value, exc_traceback = sys.exc_info()
 
                 if exc_type == apx.PlanCreationException:
                         self.__set_history_PlanCreationException(exc_value)
-
                 elif exc_type == apx.CanceledException:
-                        self.__cancel_done()
-                elif not log_op_end or exc_type in log_op_end:
+                        self._cancel_done()
+                elif exc_type == apx.ConflictingActionErrors:
+                        self.log_operation_end(error=str(exc_value),
+                            result=RESULT_CONFLICTING_ACTIONS)
+                elif exc_type in [
+                    apx.IpkgOutOfDateException,
+                    fmri.IllegalFmri]:
+                        self.log_operation_end(error=exc_value)
+                elif log_op_end_all:
                         self.log_operation_end(error=exc_value)
 
                 if exc_type != apx.ImageLockedError:
                         # Must be called before reset_unlock, and only if
                         # the exception was not a locked error.
-                        self.__img.unlock()
+                        self._img.unlock()
 
                 try:
                         if int(os.environ.get("PKG_DUMP_STATS", 0)) > 0:
-                                self.__img.transport.stats.dump()
+                                self._img.transport.stats.dump()
                 except ValueError:
                         # Don't generate stats if an invalid value
                         # is supplied.
                         pass
 
+                # In the case of duplicate actions, we want to save off the plan
+                # description for display to the client (if they requested it),
+                # as once the solver's done its job, there's interesting
+                # information in the plan.  We have to save it here and restore
+                # it later because __reset_unlock() torches it.
+                if exc_type == apx.ConflictingActionErrors:
+                        plan_desc = PlanDescription(self._img, self.__backup_be,
+                            self.__backup_be_name, self.__new_be,
+                            self.__be_activate, self.__be_name)
+
                 self.__reset_unlock()
-                self.__activity_lock.release()
+
+                if exc_type == apx.ConflictingActionErrors:
+                        self.__plan_desc = plan_desc
+
+                self._activity_lock.release()
                 raise
 
+        def solaris_image(self):
+                """Returns True if the current image is a solaris image, or an
+                image which contains the pkg(5) packaging system."""
+
+                # First check to see if the special package "release/name"
+                # exists and contains metadata saying this is Solaris.
+                results = self.__get_pkg_list(self.LIST_INSTALLED,
+                    patterns=["release/name"], return_fmris=True)
+                results = [e for e in results]
+                if results:
+                        pfmri, summary, categories, states, attrs = results[0]
+                        mfst = self._img.get_manifest(pfmri)
+                        osname = mfst.get("pkg.release.osname", None)
+                        if osname == "sunos":
+                                return True
+
+                # Otherwise, see if we can find package/pkg (or SUNWipkg) and
+                # system/core-os (or SUNWcs).
+                results = self.__get_pkg_list(self.LIST_INSTALLED,
+                    patterns=["/package/pkg", "SUNWipkg", "/system/core-os",
+                        "SUNWcs"])
+                installed = set(e[0][1] for e in results)
+                if ("SUNWcs" in installed or "system/core-os" in installed) and \
+                    ("SUNWipkg" in installed or "package/pkg" in installed):
+                        return True
+
+                return False
+
+        def __ipkg_require_latest(self, noexecute):
+                """Raises an IpkgOutOfDateException if the current image
+                contains the pkg(5) packaging system and a newer version
+                of the pkg(5) packaging system is installable."""
+
+                if not self.solaris_image():
+                        return
+                try:
+                        if self._img.ipkg_is_up_to_date(
+                            self.__check_cancel, noexecute,
+                            refresh_allowed=False,
+                            progtrack=self.__progresstracker):
+                                return
+                except apx.ImageNotFoundException:
+                        # Can't do anything in this
+                        # case; so proceed.
+                        return
+
+                raise apx.IpkgOutOfDateException()
+
+        def __plan_op(self, _op, _accept=False, _ad_kwargs=None,
+            _backup_be=None, _backup_be_name=None, _be_activate=True,
+            _be_name=None, _ipkg_require_latest=False, _li_ignore=None,
+            _li_md_only=False, _li_parent_sync=True, _new_be=False,
+            _noexecute=False, _refresh_catalogs=True, _repos=None,
+            _update_index=True, **kwargs):
+                """Contructs a plan to change the package or linked image
+                state of an image.
+
+                We can raise PermissionsException, PlanCreationException,
+                InventoryException, or LinkedImageException.
+
+                Arguments prefixed with '_' are primarily used within this
+                function.  All other arguments must be specified via keyword
+                assignment and will be passed directly on to the image
+                interfaces being invoked."
+
+                '_op' is the API operation we will perform.
+
+                '_ad_kwargs' is only used dyring attach or detach and it
+                is a dictionary of arguments that will be passed to the
+                linked image attach/detach interfaces.
+
+                '_ipkg_require_latest' enables a check to verify that the
+                latest installable version of the pkg(5) packaging system is
+                installed before we proceed with the requested operation.
+
+                For all other '_' prefixed parameters, please refer to the
+                'gen_plan_*' functions which invoke this function for an
+                explanation of their usage and effects.
+
+                This function first yields the plan description for the global
+                zone, then either a series of dictionaries representing the
+                parsable output from operating on the child images or a series
+                of None values."""
+
+                # sanity checks
+                assert _op in api_op_values
+                assert _ad_kwargs == None or \
+                    _op in [API_OP_ATTACH, API_OP_DETACH]
+                assert _ad_kwargs != None or \
+                    _op not in [API_OP_ATTACH, API_OP_DETACH]
+                assert not _li_md_only or \
+                    _op in [API_OP_ATTACH, API_OP_DETACH, API_OP_SYNC]
+                assert not _li_md_only or _li_parent_sync
+
+                # make some perf optimizations
+                if _li_md_only:
+                        _refresh_catalogs = _update_index = False
+                if self.__stage not in [API_STAGE_DEFAULT, API_STAGE_PUBCHECK]:
+                        _li_parent_sync = False
+                if self.__stage not in [API_STAGE_DEFAULT, API_STAGE_PLAN]:
+                        _refresh_catalogs = False
+                        _ipkg_require_latest = False
+
+                # if we have any children we don't support operations using
+                # temporary repositories.
+                if _repos and self._img.linked.list_related(_li_ignore):
+                        raise apx.PlanCreationException(no_tmp_origins=True)
+
+                # All the image interface functions that we inovke have some
+                # common arguments.  Set those up now.
+                args_common = {}
+                args_common["op"] = _op
+                args_common["progtrack"] = self.__progresstracker
+                args_common["check_cancel"] = self.__check_cancel
+                args_common["noexecute"] = _noexecute
+                args_common["ip_mode"] = self.__stage_2_ip_mode[self.__stage]
+
+
+                # make sure there is no overlap between the common arguments
+                # supplied to all api interfaces and the arguments that the
+                # api arguments that caller passed to this function.
+                assert (set(args_common) & set(kwargs)) == set(), \
+                    "%s & %s != set()" % (str(set(args_common)),
+                    str(set(kwargs)))
+                kwargs.update(args_common)
+
+                # Lock the current image.
+                self.__plan_common_start(_op, _noexecute, _backup_be,
+                    _backup_be_name, _new_be, _be_name, _be_activate)
+
+                try:
+                        # reset any child recursion state we might have
+                        self._img.linked.reset_recurse()
+
+                        # prepare to recurse into child images
+                        self._img.linked.init_recurse(_op, _li_ignore,
+                            _accept, _refresh_catalogs,
+                            _update_index, kwargs)
+
+                        if _op == API_OP_ATTACH:
+                                self._img.linked.attach_parent(**_ad_kwargs)
+                        elif _op == API_OP_DETACH:
+                                self._img.linked.detach_parent(**_ad_kwargs)
+
+                        if _li_parent_sync:
+                                # try to refresh linked image
+                                # constraints from the parent image.
+                                self._img.linked.syncmd_from_parent(_op)
+
+                        if self.__stage in [API_STAGE_DEFAULT,
+                            API_STAGE_PUBCHECK]:
+
+                                # do a linked image publisher check
+                                self._img.linked.check_pubs(_op)
+                                self._img.linked.do_recurse(API_STAGE_PUBCHECK)
+
+                                if self.__stage == API_STAGE_PUBCHECK:
+                                        # If this was just a publisher check
+                                        # then return immediately.
+                                        return
+
+                        if _refresh_catalogs:
+                                self.__refresh_publishers()
+
+                        if _ipkg_require_latest:
+                                # If this is an image update then make
+                                # sure the latest version of the ipkg
+                                # software is installed.
+                                self.__ipkg_require_latest(_noexecute)
+
+                        self.__set_img_alt_sources(_repos)
+
+                        if _li_md_only:
+                                self._img.make_noop_plan(**args_common)
+                        elif _op in [API_OP_ATTACH, API_OP_DETACH, API_OP_SYNC]:
+                                self._img.make_sync_plan(**kwargs)
+                        elif _op in [API_OP_CHANGE_FACET,
+                            API_OP_CHANGE_VARIANT]:
+                                self._img.make_change_varcets_plan(**kwargs)
+                        elif _op == API_OP_INSTALL:
+                                self._img.make_install_plan(**kwargs)
+                        elif _op == API_OP_REVERT:
+                                self._img.make_revert_plan(**kwargs)
+                        elif _op == API_OP_SET_MEDIATOR:
+                                self._img.make_set_mediators_plan(**kwargs)
+                        elif _op == API_OP_UNINSTALL:
+                                self._img.make_uninstall_plan(**kwargs)
+                        elif _op == API_OP_UPDATE:
+                                self._img.make_update_plan(**kwargs)
+                        else:
+                                raise RuntimeError("Unknown api op: %s" % _op)
+
+                        self.__api_op = _op
+                        self.__accept = _accept
+                        if not _noexecute:
+                                self.__plan_type = self.__api_op_2_plan[_op]
+
+                        if self._img.imageplan.nothingtodo():
+                                # no package changes mean no index changes
+                                _update_index = False
+
+                        self._disable_cancel()
+                        self.__set_be_creation()
+                        self.__plan_desc = PlanDescription(self._img,
+                            self.__backup_be, self.__backup_be_name,
+                            self.__new_be, self.__be_activate, self.__be_name)
+
+                        # Yield to our caller so they can display our plan
+                        # before we recurse into child images.  Drop the
+                        # activity lock before yielding because otherwise the
+                        # caller can't do things like set the displayed
+                        # license state for pkg plans).
+                        self._activity_lock.release()
+                        yield self.__plan_desc
+                        self._activity_lock.acquire()
+
+                        # plan operation in child images.  This currently yields
+                        # either a dictionary representing the parsable output
+                        # from the child image operation, or None.  Eventually
+                        # these will yield plan descriptions objects instead.
+                        if self.__stage in [API_STAGE_DEFAULT, API_STAGE_PLAN]:
+                                plans = self._img.linked.do_recurse(
+                                    API_STAGE_PLAN, ip=self._img.imageplan)
+                                for rv, p_dict in plans:
+                                        yield p_dict
+                        self.__planned_children = True
+
+                except:
+                        if _op in [
+                            API_OP_UPDATE,
+                            API_OP_INSTALL,
+                            API_OP_REVERT,
+                            API_OP_SYNC]:
+                                self.__plan_common_exception(
+                                    log_op_end_all=True)
+                        else:
+                                self.__plan_common_exception()
+                        # NOTREACHED
+
+                stuff_to_do = not self.planned_nothingtodo()
+
+                if not stuff_to_do or _noexecute:
+                        self.log_operation_end(
+                            result=RESULT_NOTHING_TO_DO)
+
+                self._img.imageplan.update_index = _update_index
+                self.__plan_common_finish()
+
+        def planned_nothingtodo(self, li_ignore_all=False):
+                """Once an operation has been planned check if there is
+                something todo.
+
+                Callers should pass all arguments by name assignment and
+                not by positional order.
+
+                'li_ignore_all' indicates if we should only report on work
+                todo in the parent image.  (i.e., if an operation was planned
+                and that operation only involves changes to children, and
+                li_ignore_all is true, then we'll report that there's nothing
+                todo."""
+
+                if self.__stage == API_STAGE_PUBCHECK:
+                        # if this was just a publisher check then report
+                        # that there is something todo so we continue with
+                        # the operation.
+                        return False
+                if not self._img.imageplan:
+                        # if theres no plan there nothing to do
+                        return True
+                if not self._img.imageplan.nothingtodo():
+                        return False
+                if not self._img.linked.nothingtodo():
+                        return False
+                if not li_ignore_all:
+                        assert self.__planned_children
+                        if not self._img.linked.recurse_nothingtodo():
+                                return False
+                return True
+
+        def plan_update(self, pkg_list, refresh_catalogs=True,
+            reject_list=misc.EmptyI, noexecute=False, update_index=True,
+            be_name=None, new_be=False, repos=None, be_activate=True):
+                """DEPRECATED.  use gen_plan_update()."""
+                for pd in self.gen_plan_update(
+                    pkgs_update=pkg_list, refresh_catalogs=refresh_catalogs,
+                    reject_list=reject_list, noexecute=noexecute,
+                    update_index=update_index, be_name=be_name, new_be=new_be,
+                    repos=repos, be_activate=be_activate):
+                        continue
+                return not self.planned_nothingtodo()
+
+        def plan_update_all(self, refresh_catalogs=True,
+            reject_list=misc.EmptyI, noexecute=False, force=False,
+            update_index=True, be_name=None, new_be=True, repos=None,
+            be_activate=True):
+                """DEPRECATED.  use gen_plan_update()."""
+                for pd in self.gen_plan_update(
+                    refresh_catalogs=refresh_catalogs, reject_list=reject_list,
+                    noexecute=noexecute, force=force,
+                    update_index=update_index, be_name=be_name, new_be=new_be,
+                    repos=repos, be_activate=be_activate):
+                        continue
+                return (not self.planned_nothingtodo(), self.solaris_image())
+
+        def gen_plan_update(self, pkgs_update=None, accept=False,
+            backup_be=None, backup_be_name=None, be_activate=True,
+            be_name=None, force=False, li_ignore=None, li_parent_sync=True,
+            new_be=True, noexecute=False, refresh_catalogs=True,
+            reject_list=misc.EmptyI, repos=None, update_index=True):
+                """This is a generator function that yields a PlanDescription
+                object.  If parsable_version is set, it also yields dictionaries
+                containing plan information for child images.
+
+                If pkgs_update is not set, constructs a plan to update all
+                packages on the system to the latest known versions.  Once an
+                operation has been planned, it may be executed by first
+                calling prepare(), and then execute_plan().  After execution
+                of a plan, or to abandon a plan, reset() should be called.
+
+                Callers should pass all arguments by name assignment and
+                not by positional order.
+
+                If 'pkgs_update' is set, constructs a plan to update the
+                packages provided in pkgs_update.
+
+                Once an operation has been planned, it may be executed by
+                first calling prepare(), and then execute_plan().
+
+                'force' indicates whether update should skip the package
+                system up to date check.
+
+                For all other parameters, refer to the 'gen_plan_install'
+                function for an explanation of their usage and effects."""
+
+                if pkgs_update or force:
+                        ipkg_require_latest = False
+                else:
+                        ipkg_require_latest = True
+
+                op = API_OP_UPDATE
+                return self.__plan_op(op, _accept=accept,
+                    _backup_be=backup_be, _backup_be_name=backup_be_name,
+                    _be_activate=be_activate, _be_name=be_name,
+                    _ipkg_require_latest=ipkg_require_latest,
+                    _li_ignore=li_ignore, _li_parent_sync=li_parent_sync,
+                    _new_be=new_be, _noexecute=noexecute,
+                    _refresh_catalogs=refresh_catalogs, _repos=repos,
+                    _update_index=update_index, pkgs_update=pkgs_update,
+                    reject_list=reject_list)
+
         def plan_install(self, pkg_list, refresh_catalogs=True,
-            noexecute=False, update_index=True, be_name=None, new_be=False):
-                """Constructs a plan to install the packages provided in
-                pkg_list.  Once an operation has been planned, it may be
+            noexecute=False, update_index=True, be_name=None,
+            reject_list=misc.EmptyI, new_be=False, repos=None,
+            be_activate=True):
+                """DEPRECATED.  use gen_plan_install()."""
+                for pd in self.gen_plan_install(
+                     pkgs_inst=pkg_list, refresh_catalogs=refresh_catalogs,
+                     noexecute=noexecute, update_index=update_index,
+                     be_name=be_name, reject_list=reject_list, new_be=new_be,
+                     repos=repos, be_activate=be_activate):
+                        continue
+                return not self.planned_nothingtodo()
+
+        def gen_plan_install(self, pkgs_inst, accept=False, backup_be=None,
+            backup_be_name=None, be_activate=True, be_name=None, li_ignore=None,
+            li_parent_sync=True, new_be=False, noexecute=False,
+            refresh_catalogs=True, reject_list=misc.EmptyI, repos=None,
+            update_index=True):
+                """This is a generator function that yields a PlanDescription
+                object.  If parsable_version is set, it also yields dictionaries
+                containing plan information for child images.
+
+                Constructs a plan to install the packages provided in
+                pkgs_inst.  Once an operation has been planned, it may be
                 executed by first calling prepare(), and then execute_plan().
+                After execution of a plan, or to abandon a plan, reset()
+                should be called.
 
-                'pkg_list' is a list of packages to install.
+                Callers should pass all arguments by name assignment and
+                not by positional order.
 
-                'refresh_catalogs' controls whether the catalogs will
-                automatically be refreshed.
+                'pkgs_inst' is a list of packages to install.
 
-                'noexecute' determines whether the resulting plan can be
-                executed and whether history will be recorded after
-                planning is finished.
+                'backup_be' indicates whether a backup boot environment should
+                be created before the operation is executed.  If True, a backup
+                boot environment will be created.  If False, a backup boot
+                environment will not be created. If None and a new boot
+                environment is not created, and packages are being updated or
+                are being installed and tagged with reboot-needed, a backup
+                boot environment will be created.
 
-                'update_index' determines whether client search indexes
-                will be updated after operation completion during plan
-                execution.
+                'backup_be_name' is a string to use as the name of any backup 
+                boot environment created during the operation.
 
                 'be_name' is a string to use as the name of any new boot
                 environment created during the operation.
+
+                'li_ignore' is either None or a list.  If it's None (the
+                default), the planning operation will attempt to keep all
+                linked children in sync.  If it's an empty list the planning
+                operation will ignore all children.  If this is a list of
+                linked image children names, those children will be ignored
+                during the planning operation.  If a child is ignored during
+                the planning phase it will also be skipped during the
+                preparation and execution phases.
+
+                'li_parent_sync' if the current image is a child image, this
+                flag controls whether the linked image parent metadata will be
+                automatically refreshed.
 
                 'new_be' indicates whether a new boot environment should be
                 created during the operation.  If True, a new boot environment
@@ -402,291 +1289,717 @@ class ImageInterface(object):
                 needed, an ImageUpdateOnLiveImageException will be raised.
                 If None, a new boot environment will be created only if needed.
 
-                This function returns a boolean indicating whether there is
-                anything to do."""
+                'noexecute' determines whether the resulting plan can be
+                executed and whether history will be recorded after
+                planning is finished.
 
-                self.__plan_common_start("install", noexecute, new_be, be_name)
-                try:
-                        if refresh_catalogs:
-                                self.__refresh_publishers()
+                'refresh_catalogs' controls whether the catalogs will
+                automatically be refreshed.
 
-                        self.__img.make_install_plan(pkg_list,
-                            self.__progresstracker,
-                            self.__check_cancelation, noexecute)
+                'reject_list' is a list of patterns not to be permitted
+                in solution; installed packages matching these patterns
+                are removed.
 
-                        assert self.__img.imageplan
+                'repos' is a list of URI strings or RepositoryURI objects that
+                represent the locations of additional sources of package data to
+                use during the planned operation.  All API functions called
+                while a plan is still active will use this package data.
 
-                        self.__disable_cancel()
+                'be_activate' is an optional boolean indicating whether any
+                new boot environment created for the operation should be set
+                as the active one on next boot if the operation is successful.
 
-                        if not noexecute:
-                                self.__plan_type = self.__INSTALL
+                'update_index' determines whether client search indexes
+                will be updated after operation completion during plan
+                execution."""
 
-                        self.__set_new_be()
+                # certain parameters must be specified
+                assert pkgs_inst and type(pkgs_inst) == list
 
-                        self.__plan_desc = PlanDescription(self.__img, self.__new_be)
-                        if self.__img.imageplan.nothingtodo() or noexecute:
-                                self.log_operation_end(
-                                    result=history.RESULT_NOTHING_TO_DO)
+                op = API_OP_INSTALL
+                return self.__plan_op(op, _accept=accept,
+                    _backup_be=backup_be, _backup_be_name=backup_be_name,
+                    _be_activate=be_activate, _be_name=be_name,
+                    _li_ignore=li_ignore, _li_parent_sync=li_parent_sync,
+                    _new_be=new_be, _noexecute=noexecute,
+                    _refresh_catalogs=refresh_catalogs, _repos=repos,
+                    _update_index=update_index, pkgs_inst=pkgs_inst,
+                    reject_list=reject_list)
 
-                        self.__img.imageplan.update_index = update_index
-                except:
-                        self.__plan_common_exception(log_op_end=[
-                            apx.CanceledException, fmri.IllegalFmri,
-                            Exception])
-                        # NOTREACHED
+        def gen_plan_sync(self, accept=False, backup_be=None,
+            backup_be_name=None, be_activate=True, be_name=None,
+            li_ignore=None, li_md_only=False, li_parent_sync=True,
+            li_pkg_updates=True, new_be=False, noexecute=False,
+            refresh_catalogs=True,
+            reject_list=misc.EmptyI, repos=None, update_index=True):
+                """This is a generator function that yields a PlanDescription
+                object.  If parsable_version is set, it also yields dictionaries
+                containing plan information for child images.
 
-                self.__plan_common_finish()
-                res = not self.__img.imageplan.nothingtodo()
-                return res
+                Constructs a plan to sync the current image with its
+                linked image constraints.  Once an operation has been planned,
+                it may be executed by first calling prepare(), and then
+                execute_plan().  After execution of a plan, or to abandon a
+                plan, reset() should be called.
 
-        def plan_uninstall(self, pkg_list, recursive_removal, noexecute=False,
-            update_index=True, be_name=None, new_be=False):
-                """Constructs a plan to remove the packages provided in
-                pkg_list.  Once an operation has been planned, it may be
-                executed by first calling prepare(), and then execute_plan().
+                Callers should pass all arguments by name assignment and
+                not by positional order.
 
-                'pkg_list' is a list of packages to install.
+                'li_md_only' don't actually modify any packages in the current
+                images, only sync the linked image metadata from the parent
+                image.  If this options is True, 'li_parent_sync' must also be
+                True.
 
-                'recursive_removal' controls whether recursive removal is
-                allowed.
+                'li_pkg_updates' when planning a sync operation, allow updates
+                to packages other than the constraints package.  If this
+                option is False, planning a sync will fail if any packages
+                (other than the constraints package) need updating to bring
+                the image in sync with its parent.
 
-                For all other parameters, refer to the 'plan_install' function
-                for an explanation of their usage and effects.
+                For all other parameters, refer to the 'gen_plan_install'
+                function for an explanation of their usage and effects."""
 
-                This function returns a boolean which indicates whether there
-                is anything to do."""
+                # verify that the current image is a linked image by trying to
+                # access its name.
+                self._img.linked.child_name
 
-                self.__plan_common_start("uninstall", noexecute, new_be,
-                    be_name)
+                op = API_OP_SYNC
+                return self.__plan_op(op, _accept=accept,
+                    _backup_be=backup_be, _backup_be_name=backup_be_name,
+                    _be_activate=be_activate, _be_name=be_name,
+                    _li_ignore=li_ignore, _li_md_only=li_md_only,
+                    _li_parent_sync=li_parent_sync, _new_be=new_be,
+                    _noexecute=noexecute, _refresh_catalogs=refresh_catalogs,
+                    _repos=repos, _update_index=update_index,
+                    li_pkg_updates=li_pkg_updates, reject_list=reject_list)
 
-                try:
-                        self.__img.make_uninstall_plan(pkg_list,
-                            recursive_removal, self.__progresstracker,
-                            self.__check_cancelation, noexecute)
+        def gen_plan_attach(self, lin, li_path, accept=False,
+            allow_relink=False, backup_be=None, backup_be_name=None,
+            be_activate=True, be_name=None, force=False, li_ignore=None,
+            li_md_only=False, li_pkg_updates=True, li_props=None, new_be=False,
+            noexecute=False, refresh_catalogs=True,
+            reject_list=misc.EmptyI, repos=None, update_index=True):
+                """This is a generator function that yields a PlanDescription
+                object.  If parsable_version is set, it also yields dictionaries
+                containing plan information for child images.
 
-                        assert self.__img.imageplan
-
-                        self.__disable_cancel()
-
-                        if not noexecute:
-                                self.__plan_type = self.__UNINSTALL
-
-                        self.__set_new_be()
-
-                        self.__plan_desc = PlanDescription(self.__img,
-                            self.__new_be)
-                        if noexecute:
-                                self.log_operation_end(
-                                    result=history.RESULT_NOTHING_TO_DO)
-                        self.__img.imageplan.update_index = update_index
-                except:
-                        self.__plan_common_exception()
-                        # NOTREACHED
-
-                self.__plan_common_finish()
-                res = not self.__img.imageplan.nothingtodo()
-                return res
-
-        def plan_update(self, pkg_list, refresh_catalogs=True,
-            noexecute=False, update_index=True, be_name=None, new_be=False):
-                """Constructs a plan to update the packages provided in
-                pkg_list.  Once an operation has been planned, it may be
-                executed by first calling prepare(), and then execute_plan().
-
-                'pkg_list' is a list of packages to update.
-
-                For all other parameters, refer to the 'plan_install' function
-                for an explanation of their usage and effects.
-
-                This function returns a boolean which indicates whether there
-                is anything to do."""
-
-                self.__plan_common_start("update", noexecute, new_be,
-                    be_name)
-                try:
-                        if refresh_catalogs:
-                                self.__refresh_publishers()
-
-                        self.__img.make_update_plan(self.__progresstracker,
-                            self.__check_cancelation, noexecute,
-                            pkg_list=pkg_list)
-
-                        assert self.__img.imageplan
-
-                        self.__disable_cancel()
-
-                        if not noexecute:
-                                self.__plan_type = self.__UPDATE
-
-                        self.__set_new_be()
-
-                        self.__plan_desc = PlanDescription(self.__img,
-                            self.__new_be)
-                        if self.__img.imageplan.nothingtodo() or noexecute:
-                                self.log_operation_end(
-                                    result=history.RESULT_NOTHING_TO_DO)
-
-                        self.__img.imageplan.update_index = update_index
-                except:
-                        self.__plan_common_exception(log_op_end=[
-                            apx.CanceledException, fmri.IllegalFmri,
-                            Exception])
-                        # NOTREACHED
-
-                self.__plan_common_finish()
-                res = not self.__img.imageplan.nothingtodo()
-                return res
-
-        def __is_pkg5_native_packaging(self):
-                """Helper routine that returns True if this object represents an
-                image where pkg(5) is the native packaging system and needs to
-                be upgraded before the image can be."""
-
-                # First check to see if the special package "release/name"
-                # exists and contains metadata saying this is Solaris.
-                results = self.get_pkg_list(self.LIST_INSTALLED,
-                    patterns=["release/name"], return_fmris=True)
-                results = [e for e in results]
-                if results:
-                        pfmri, summary, categories, states = \
-                            results[0]
-                        mfst = self.__img.get_manifest(pfmri)
-                        osname = mfst.get("pkg.release.osname", None)
-                        if osname == "sunos":
-                                return True
-
-                # Otherwise, see if we can find package/pkg (or SUNWipkg) and
-                # SUNWcs.
-                results = self.get_pkg_list(self.LIST_INSTALLED,
-                    patterns=["pkg:/package/pkg", "SUNWipkg", "SUNWcs"])
-                installed = set(e[0][1] for e in results)
-                if "SUNWcs" in installed and ("SUNWipkg" in installed or
-                    "package/pkg" in installed):
-                        return True
-
-                return False
-
-        def plan_update_all(self, refresh_catalogs=True,
-            noexecute=False, force=False, update_index=True,
-            be_name=None, new_be=True):
-                """Constructs a plan to update all packages on the system
-                to the latest known versions.  Once an operation has been
+                Attach a parent image and sync the packages in the current
+                image with the new parent.  Once an operation has been
                 planned, it may be executed by first calling prepare(), and
-                then execute_plan().
+                then execute_plan().  After execution of a plan, or to abandon
+                a plan, reset() should be called.
 
-                'force' indicates whether update should skip the package
-                system up to date check.
+                Callers should pass all arguments by name assignment and
+                not by positional order.
 
-                For all other parameters, refer to the 'plan_install' function
-                for an explanation of their usage and effects.
+                'lin' a LinkedImageName object that is a name for the current
+                image.
 
-                This function returns a tuple of booleans of the form
-                (stuff_to_do, solaris_image)."""
+                'li_path' a path to the parent image.
 
-                self.__plan_common_start("update", noexecute, new_be, be_name)
-                try:
-                        if refresh_catalogs:
-                                self.__refresh_publishers()
+                'allow_relink' allows re-linking of an image that is already a
+                linked image child.  If this option is True we'll overwrite
+                all existing linked image metadata.
 
-                        # If the target image is an opensolaris image, we
-                        # activate some special behavior.
-                        opensolaris_image = self.__is_pkg5_native_packaging()
+                'li_props' optional linked image properties to apply to the
+                child image.
 
-                        if opensolaris_image and not force:
-                                try:
-                                        if not self.__img.ipkg_is_up_to_date(
-                                            self.__check_cancelation,
-                                            noexecute,
-                                            refresh_allowed=refresh_catalogs,
-                                            progtrack=self.__progresstracker):
-                                                raise apx.IpkgOutOfDateException()
-                                except apx.ImageNotFoundException:
-                                        # Can't do anything in this
-                                        # case; so proceed.
-                                        pass
+                For all other parameters, refer to the 'gen_plan_install' and
+                'gen_plan_sync' functions for an explanation of their usage
+                and effects."""
 
-                        self.__img.make_update_plan(self.__progresstracker,
-                            self.__check_cancelation, noexecute)
+                if li_props == None:
+                        li_props = dict()
 
-                        assert self.__img.imageplan
+                op = API_OP_ATTACH
+                ad_kwargs = {
+                    "allow_relink": allow_relink,
+                    "force": force,
+                    "lin": lin,
+                    "path": li_path,
+                    "props": li_props,
+                }
+                return self.__plan_op(op, _accept=accept,
+                    _backup_be=backup_be, _backup_be_name=backup_be_name,
+                    _be_activate=be_activate, _be_name=be_name,
+                    _li_ignore=li_ignore, _li_md_only=li_md_only,
+                    _new_be=new_be, _noexecute=noexecute,
+                    _refresh_catalogs=refresh_catalogs, _repos=repos,
+                    _update_index=update_index, _ad_kwargs=ad_kwargs,
+                    li_pkg_updates=li_pkg_updates, reject_list=reject_list)
 
-                        self.__disable_cancel()
+        def gen_plan_detach(self, accept=False, backup_be=None,
+            backup_be_name=None, be_activate=True, be_name=None, force=False,
+            li_ignore=None, new_be=False, noexecute=False):
+                """This is a generator function that yields a PlanDescription
+                object.  If parsable_version is set, it also yields dictionaries
+                containing plan information for child images.
 
-                        if not noexecute:
-                                self.__plan_type = self.__UPDATE
-                        self.__set_new_be()
+                Detach from a parent image and remove any constraints
+                package from this image.  Once an operation has been planned,
+                it may be executed by first calling prepare(), and then
+                execute_plan().  After execution of a plan, or to abandon a
+                plan, reset() should be called.
 
-                        self.__plan_desc = PlanDescription(self.__img,
-                            self.__new_be)
+                Callers should pass all arguments by name assignment and
+                not by positional order.
 
-                        if self.__img.imageplan.nothingtodo() or noexecute:
-                                self.log_operation_end(
-                                    result=history.RESULT_NOTHING_TO_DO)
-                        self.__img.imageplan.update_index = update_index
+                For all other parameters, refer to the 'gen_plan_install' and
+                'gen_plan_sync' functions for an explanation of their usage
+                and effects."""
 
-                except:
-                        self.__plan_common_exception(
-                            log_op_end=[apx.IpkgOutOfDateException])
-                        # NOTREACHED
+                op = API_OP_DETACH
+                ad_kwargs = {
+                    "force": force
+                }
+                return self.__plan_op(op, _accept=accept, _ad_kwargs=ad_kwargs,
+                    _backup_be=backup_be, _backup_be_name=backup_be_name,
+                    _be_activate=be_activate, _be_name=be_name,
+                    _li_ignore=li_ignore, _new_be=new_be,
+                    _noexecute=noexecute, _refresh_catalogs=False,
+                    _update_index=False, li_pkg_updates=False)
 
-                self.__plan_common_finish()
-                res = not self.__img.imageplan.nothingtodo()
-                return res, opensolaris_image
+        def plan_uninstall(self, pkg_list, noexecute=False, update_index=True,
+            be_name=None, new_be=False, be_activate=True):
+                """DEPRECATED.  use gen_plan_uninstall()."""
+                for pd in self.gen_plan_uninstall(pkgs_to_uninstall=pkg_list,
+                    noexecute=noexecute, update_index=update_index,
+                    be_name=be_name, new_be=new_be, be_activate=be_activate):
+                        continue
+                return not self.planned_nothingtodo()
+
+        def gen_plan_uninstall(self, pkgs_to_uninstall, accept=False,
+            backup_be=None, backup_be_name=None, be_activate=True,
+            be_name=None, li_ignore=None, new_be=False, noexecute=False,
+            update_index=True):
+                """This is a generator function that yields a PlanDescription
+                object.  If parsable_version is set, it also yields dictionaries
+                containing plan information for child images.
+
+                Constructs a plan to remove the packages provided in
+                pkgs_to_uninstall.  Once an operation has been planned, it may
+                be executed by first calling prepare(), and then
+                execute_plan().  After execution of a plan, or to abandon a
+                plan, reset() should be called.
+
+                Callers should pass all arguments by name assignment and
+                not by positional order.
+
+                'pkgs_to_uninstall' is a list of packages to uninstall.
+
+                For all other parameters, refer to the 'gen_plan_install'
+                function for an explanation of their usage and effects."""
+
+                # certain parameters must be specified
+                assert pkgs_to_uninstall and type(pkgs_to_uninstall) == list
+
+                op = API_OP_UNINSTALL
+                return self.__plan_op(op, _accept=accept,
+                    _backup_be=backup_be, _backup_be_name=backup_be_name,
+                    _be_activate=be_activate, _be_name=be_name,
+                    _li_ignore=li_ignore, _li_parent_sync=False,
+                    _new_be=new_be, _noexecute=noexecute,
+                    _refresh_catalogs=False, _update_index=update_index,
+                    pkgs_to_uninstall=pkgs_to_uninstall)
+
+        def gen_plan_set_mediators(self, mediators, backup_be=None,
+            backup_be_name=None, be_activate=True, be_name=None, li_ignore=None,
+            li_parent_sync=True, new_be=None, noexecute=False,
+            update_index=True):
+                """This is a generator function that yields a PlanDescription
+                object.  If parsable_version is set, it also yields dictionaries
+                containing plan information for child images.
+
+                Creates a plan to change the version and implementation values
+                for mediators as specified in the provided dictionary.  Once an
+                operation has been planned, it may be executed by first calling
+                prepare(), and then execute_plan().  After execution of a plan,
+                or to abandon a plan, reset() should be called.
+
+                Callers should pass all arguments by name assignment and not by
+                positional order.
+
+                'mediators' is a dict of dicts of the mediators to set version
+                and implementation for.  If the dict for a given mediator-name
+                is empty, it will be intepreted as a request to revert the
+                specified mediator to the default, "optimal" mediation.  It
+                should be of the form:
+
+                   {
+                       mediator-name: {
+                           "implementation": mediator-implementation-string,
+                           "version": mediator-version-string
+                       }
+                   }
+
+                   'implementation' is an optional string that specifies the
+                   implementation of the mediator for use in addition to or
+                   instead of 'version'.
+
+                   'version' is an optional string that specifies the version
+                   (expressed as a dot-separated sequence of non-negative
+                   integers) of the mediator for use.
+
+                For all other parameters, refer to the 'gen_plan_install'
+                function for an explanation of their usage and effects."""
+
+                assert mediators
+                return self.__plan_op(API_OP_SET_MEDIATOR, _accept=True,
+                    _backup_be=backup_be, _backup_be_name=backup_be_name,
+                    _be_activate=be_activate, _be_name=be_name,
+                    _li_ignore=li_ignore, _li_parent_sync=li_parent_sync,
+                    mediators=mediators, _new_be=new_be, _noexecute=noexecute,
+                    _refresh_catalogs=False, _update_index=update_index)
 
         def plan_change_varcets(self, variants=None, facets=None,
-            noexecute=False, be_name=None, new_be=None):
-                """Creates a plan to change the specified variants and/or facets
-                for the image.
+            noexecute=False, be_name=None, new_be=None, repos=None,
+            be_activate=True):
+                """DEPRECATED.  use gen_plan_change_varcets()."""
+                for pd in self.gen_plan_change_varcets(
+                    variants=variants, facets=facets, noexecute=noexecute,
+                    be_name=be_name, new_be=new_be, repos=repos,
+                    be_activate=be_activate):
+                        continue
+                return not self.planned_nothingtodo()
 
-                'variants' is a dict of the variants to change the values of.
+        def gen_plan_change_varcets(self, facets=None, variants=None,
+            accept=False, backup_be=None, backup_be_name=None,
+            be_activate=True, be_name=None, li_ignore=None, li_parent_sync=True,
+            new_be=None, noexecute=False, refresh_catalogs=True,
+            reject_list=misc.EmptyI, repos=None, update_index=True):
+                """This is a generator function that yields a PlanDescription
+                object.  If parsable_version is set, it also yields dictionaries
+                containing plan information for child images.
+
+                Creates a plan to change the specified variants and/or
+                facets for the image.  Once an operation has been planned, it
+                may be executed by first calling prepare(), and then
+                execute_plan().  After execution of a plan, or to abandon a
+                plan, reset() should be called.
+
+                Callers should pass all arguments by name assignment and
+                not by positional order.
 
                 'facets' is a dict of the facets to change the values of.
 
-                For all other parameters, refer to the 'plan_install' function
+                'variants' is a dict of the variants to change the values of.
+
+                For all other parameters, refer to the 'gen_plan_install'
+                function for an explanation of their usage and effects."""
+
+                # An empty facets dictionary is allowed because that's how to
+                # unset all set facets.
+                if not variants and facets is None:
+                        raise ValueError, "Nothing to do"
+
+                if variants:
+                        op = API_OP_CHANGE_VARIANT
+                else:
+                        op = API_OP_CHANGE_FACET
+
+                return self.__plan_op(op, _accept=accept, _backup_be=backup_be,
+                    _backup_be_name=backup_be_name, _be_activate=be_activate,
+                    _be_name=be_name, _li_ignore=li_ignore,
+                    _li_parent_sync=li_parent_sync, _new_be=new_be,
+                    _noexecute=noexecute, _refresh_catalogs=refresh_catalogs,
+                    _repos=repos, _update_index=update_index, variants=variants,
+                    facets=facets, reject_list=reject_list)
+
+        def plan_revert(self, args, tagged=False, noexecute=True, be_name=None,
+            new_be=None, be_activate=True):
+                """DEPRECATED.  use gen_plan_revert()."""
+                for pd in self.gen_plan_revert(
+                    args=args, tagged=tagged, noexecute=noexecute,
+                    be_name=be_name, new_be=new_be, be_activate=be_activate):
+                        continue
+                return not self.planned_nothingtodo()
+
+        def gen_plan_revert(self, args, backup_be=None, backup_be_name=None,
+            be_activate=True, be_name=None, new_be=None, noexecute=True,
+            tagged=False):
+                """This is a generator function that yields a PlanDescription
+                object.  If parsable_version is set, it also yields dictionaries
+                containing plan information for child images.
+
+                Plan to revert either files or all files tagged with
+                specified values.  Args contains either path names or tag
+                names to be reverted, tagged is True if args contains tags.
+                Once an operation has been planned, it may be executed by
+                first calling prepare(), and then execute_plan().  After
+                execution of a plan, or to abandon a plan, reset() should be
+                called.
+
+                For all other parameters, refer to the 'gen_plan_install'
+                function for an explanation of their usage and effects."""
+
+                op = API_OP_REVERT
+                return self.__plan_op(op, _be_activate=be_activate,
+                    _backup_be=backup_be, _backup_be_name=backup_be_name,
+                    _be_name=be_name, _li_ignore=[], _new_be=new_be,
+                    _noexecute=noexecute, _refresh_catalogs=False,
+                    _update_index=False, args=args, tagged=tagged)
+
+        def attach_linked_child(self, lin, li_path, li_props=None,
+            accept=False, allow_relink=False, force=False, li_md_only=False,
+            li_pkg_updates=True, noexecute=False,
+            refresh_catalogs=True, reject_list=misc.EmptyI,
+            show_licenses=False, update_index=True):
+                """Attach an image as a child to the current image (the
+                current image will become a parent image. This operation
+                results in attempting to sync the child image with the parent
+                image.
+
+                'lin' is the name of the child image
+
+                'li_path' is the path to the child image
+
+                'li_props' optional linked image properties to apply to the
+                child image.
+
+                'accept' indicates whether we should accept package licenses
+                for any packages being installed during the child image sync.
+
+                'allow_relink' indicates whether we should allow linking of a
+                child image that is already linked (the child may already
+                be a child or a parent image).
+
+                'force' indicates whether we should allow linking of a child
+                image even if the specified linked image type doesn't support
+                attaching of children.
+
+                'li_md_only' indicates whether we should only update linked
+                image metadata and not actually try to sync the child image.
+
+                'li_pkg_updates' indicates whether we should disallow pkg
+                updates during the child image sync.
+
+                'noexecute' indicates if we should actually make any changes
+                rather or just simulate the operation.
+
+                'refresh_catalogs' controls whether the catalogs will
+                automatically be refreshed.
+
+                'reject_list' is a list of patterns not to be permitted
+                in solution; installed packages matching these patterns
+                are removed.
+
+                'show_licenses' indicates whether we should display package
+                licenses for any packages being installed during the child
+                image sync.
+
+                'update_index' determines whether client search indexes will
+                be updated in the child after the sync operation completes.
+
+                This function returns a tuple of the format (rv, err) where rv
+                is a pkg.client.pkgdefs return value and if an error was
+                encountered err is an exception object which describes the
+                error."""
+
+                return self._img.linked.attach_child(lin, li_path, li_props,
+                    accept=accept, allow_relink=allow_relink, force=force,
+                    li_md_only=li_md_only, li_pkg_updates=li_pkg_updates,
+                    noexecute=noexecute,
+                    progtrack=self.__progresstracker,
+                    refresh_catalogs=refresh_catalogs, reject_list=reject_list,
+                    show_licenses=show_licenses, update_index=update_index)
+
+        def detach_linked_children(self, li_list, force=False, noexecute=False):
+                """Detach one or more children from the current image. This
+                operation results in the removal of any constraint package
+                from the child images.
+
+                'li_list' a list of linked image name objects which specified
+                which children to operate on.  If the list is empty then we
+                operate on all children.
+
+                For all other parameters, refer to the 'attach_linked_child'
+                function for an explanation of their usage and effects.
+
+                This function returns a dictionary where the keys are linked
+                image name objects and the values are the result of the
+                specified operation on the associated child image.  The result
+                is a tuple of the format (rv, err) where rv is a
+                pkg.client.pkgdefs return value and if an error was
+                encountered err is an exception object which describes the
+                error."""
+
+                return self._img.linked.detach_children(li_list,
+                    force=force, noexecute=noexecute,
+                    progtrack=self.__progresstracker)
+
+        def detach_linked_rvdict2rv(self, rvdict):
+                """Convenience function that takes a dictionary returned from
+                an operations on multiple children and merges the results into
+                a single return code."""
+
+                return self._img.linked.detach_rvdict2rv(rvdict)
+
+        def sync_linked_children(self, li_list,
+            accept=False, li_md_only=False,
+            li_pkg_updates=True, noexecute=False,
+            refresh_catalogs=True, show_licenses=False, update_index=True):
+                """Sync one or more children of the current image.
+
+                For all other parameters, refer to the 'attach_linked_child'
+                and 'detach_linked_children' functions for an explanation of
+                their usage and effects.
+
+                For a description of the return value, refer to the
+                'detach_linked_children' function."""
+
+                rvdict = self._img.linked.sync_children(li_list,
+                    accept=accept, li_md_only=li_md_only,
+                    li_pkg_updates=li_pkg_updates, noexecute=noexecute,
+                    progtrack=self.__progresstracker,
+                    refresh_catalogs=refresh_catalogs,
+                    show_licenses=show_licenses, update_index=update_index)
+                return rvdict
+
+        def sync_linked_rvdict2rv(self, rvdict):
+                """Convenience function that takes a dictionary returned from
+                an operations on multiple children and merges the results into
+                a single return code."""
+
+                return self._img.linked.sync_rvdict2rv(rvdict)
+
+        def audit_linked_children(self, li_list):
+                """Audit one or more children of the current image to see if
+                they are in sync with this image.
+
+                For all parameters, refer to the 'detach_linked_children'
+                functions for an explanation of their usage and effects.
+
+                For a description of the return value, refer to the
+                'detach_linked_children' function."""
+
+                rvdict = self._img.linked.audit_children(li_list)
+                return rvdict
+
+        def audit_linked_rvdict2rv(self, rvdict):
+                """Convenience function that takes a dictionary returned from
+                an operations on multiple children and merges the results into
+                a single return code."""
+
+                return self._img.linked.audit_rvdict2rv(rvdict)
+
+        def audit_linked(self, li_parent_sync=True):
+                """If the current image is a child image, this function
+                audits the current image to see if it's in sync with it's
+                parent.
+
+                For a description of the return value, refer to the
+                'detach_linked_children' function."""
+
+                lin = self._img.linked.child_name
+                rvdict = {}
+                ret = self._img.linked.audit_self(
+                    li_parent_sync=li_parent_sync)
+                rvdict[lin] = ret
+                return rvdict
+
+        def ischild(self):
+                """Indicates whether the current image is a child image."""
+                return self._img.linked.ischild()
+
+        @staticmethod
+        def __utc_format(time_str, utc_now):
+                """Given a local time value string, formatted with
+                "%Y-%m-%dT%H:%M:%S, return a UTC representation of that value,
+                formatted with %Y%m%dT%H%M%SZ.  This raises a ValueError if the
+                time was incorrectly formatted.  If the time_str is "now", it
+                returns the value of utc_now"""
+
+                if time_str == "now":
+                        return utc_now
+
+                try:
+                        local_dt = datetime.datetime.strptime(time_str,
+                            "%Y-%m-%dT%H:%M:%S")
+                        secs = time.mktime(local_dt.timetuple())
+                        utc_dt = datetime.datetime.utcfromtimestamp(secs)
+                        return utc_dt.strftime("%Y%m%dT%H%M%SZ")
+                except ValueError, e:
+                        raise apx.HistoryRequestException(e)
+
+        def __get_history_paths(self, time_val, utc_now):
+                """Given a local timestamp, either as a discrete value, or a
+                range of values, formatted as '<timestamp>-<timestamp>', and a
+                path to find history xml files, return an array of paths that
+                match that timestamp.  utc_now is the current time expressed in
+                UTC"""
+
+                files = []
+                if len(time_val) > 20 or time_val.startswith("now-"):
+                        if time_val.startswith("now-"):
+                                start = utc_now
+                                finish = self.__utc_format(time_val[4:],
+                                    utc_now)
+                        else:
+                                # our ranges are 19 chars of timestamp, a '-',
+                                # and another timestamp
+                                start = self.__utc_format(time_val[:19],
+                                    utc_now)
+                                finish = self.__utc_format(time_val[20:],
+                                    utc_now)
+                        if start > finish:
+                                raise apx.HistoryRequestException(_("Start "
+                                    "time must be older than finish time: "
+                                    "%s") % time_val)
+                        files = self.__get_history_range(start, finish)
+                else:
+                        # there can be multiple event files per timestamp
+                        prefix = self.__utc_format(time_val, utc_now)
+                        files = glob.glob(os.path.join(self._img.history.path,
+                            "%s*" % prefix))
+                if not files:
+                        raise apx.HistoryRequestException(_("No history "
+                            "entries found for %s") % time_val)
+                return files
+
+        def __get_history_range(self, start, finish):
+                """Given a start and finish date, formatted as UTC date strings
+                as per __utc_format(), return a list of history filenames that
+                fall within that date range.  A range of two equal dates is 
+                equivalent of just retrieving history for that single date
+                string."""
+
+                entries = []
+                all_entries = sorted(os.listdir(self._img.history.path))
+
+                for entry in all_entries:
+                        # our timestamps are always 16 character datestamps
+                        basename = os.path.basename(entry)[:16]
+                        if basename >= start:
+                                if basename > finish:
+                                        # we can stop looking now.
+                                        break
+                                entries.append(entry)
+                return entries
+
+        def gen_history(self, limit=None, times=misc.EmptyI):
+                """A generator function that returns History objects up to the
+                limit specified matching the times specified.
+
+                'limit' is an optional integer value specifying the maximum
+                number of entries to return.
+
+                'times' is a list of timestamp or timestamp range strings to
+                restrict the returned entries to."""
+
+                # Make entries a set to cope with multiple overlapping ranges or
+                # times.
+                entries = set()
+
+                utc_now = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+                for time_val in times:
+                        # Ranges are 19 chars of timestamp, a '-', and
+                        # another timestamp.
+                        if len(time_val) > 20 or time_val.startswith("now-"):
+                                if time_val.startswith("now-"):
+                                        start = utc_now
+                                        finish = self.__utc_format(time_val[4:],
+                                            utc_now)
+                                else:
+                                        start = self.__utc_format(time_val[:19],
+                                            utc_now)
+                                        finish = self.__utc_format(
+                                            time_val[20:], utc_now)
+                                if start > finish:
+                                        raise apx.HistoryRequestException(
+                                            _("Start time must be older than "
+                                            "finish time: %s") % time_val)
+                                files = self.__get_history_range(start, finish)
+                        else:
+                                # There can be multiple entries per timestamp.
+                                prefix = self.__utc_format(time_val, utc_now)
+                                files = glob.glob(os.path.join(
+                                    self._img.history.path, "%s*" % prefix))
+
+                        try:
+                                files = self.__get_history_paths(time_val,
+                                    utc_now)
+                                entries.update(files)
+                        except ValueError:
+                                raise apx.HistoryRequestException(_("Invalid "
+                                    "time format '%s'.  Please use "
+                                    "%%Y-%%m-%%dT%%H:%%M:%%S or\n"
+                                    "%%Y-%%m-%%dT%%H:%%M:%%S-"
+                                    "%%Y-%%m-%%dT%%H:%%M:%%S") % time_val)
+
+                if not times:
+                        try:
+                                entries = os.listdir(self._img.history.path)
+                        except EnvironmentError, e:
+                                if e.errno == errno.ENOENT:
+                                        # No history to list.
+                                        return
+                                raise apx._convert_error(e)
+
+                entries = sorted(entries)
+                if limit:
+                        limit *= -1
+                        entries = entries[limit:]
+                for entry in entries:
+                        # Yield each history entry object as it is loaded.
+                        try:
+                                yield history.History(
+                                    root_dir=self._img.history.root_dir,
+                                    filename=entry)
+                        except apx.HistoryLoadException, e:
+                                if e.parse_failure:
+                                        # Ignore corrupt entries.
+                                        continue
+                                raise
+
+        def get_linked_name(self):
+                """If the current image is a child image, this function
+                returns a linked image name object which represents the name
+                of the current image."""
+                return self._img.linked.child_name
+
+        def get_linked_props(self, lin=None):
+                """Return a dictionary which represents the linked image
+                properties associated with a linked image.
+
+                'lin' is the name of the child image.  If lin is None then
+                the current image is assumed to be a linked image and it's
+                properties are returned."""
+
+                return self._img.linked.child_props(lin=lin)
+
+        def list_linked(self, li_ignore=None):
+                """Returns a list of linked images associated with the
+                current image.  This includes both child and parent images.
+
+                For all parameters, refer to the 'gen_plan_install' function
                 for an explanation of their usage and effects.
 
-                This function returns a boolean which indicates whether there
-                is anything to do.
-                """
+                The returned value is a list of tuples where each tuple
+                contains (<li name>, <relationship>, <li path>)."""
 
-                self.__plan_common_start("change-variant", noexecute, new_be,
-                    be_name)
-                if not variants and not facets:
-                        raise ValueError, "Nothing to do"
-                try:
-                        self.__refresh_publishers()
+                return self._img.linked.list_related(li_ignore=li_ignore)
 
-                        self.__img.image_change_varcets(variants,
-                            facets, self.__progresstracker,
-                            self.__check_cancelation, noexecute)
+        def parse_linked_name(self, li_name, allow_unknown=False):
+                """Given a string representing a linked image child name,
+                returns linked image name object representing the same name.
 
-                        assert self.__img.imageplan
-                        self.__set_new_be()
+                'allow_unknown' indicates whether the name must represent
+                actual children or simply be syntactically correct."""
 
-                        self.__disable_cancel()
+                return self._img.linked.parse_name(li_name, allow_unknown)
 
-                        if not noexecute:
-                                self.__plan_type = self.__UPDATE
+        def parse_linked_name_list(self, li_name_list, allow_unknown=False):
+                """Given a list of strings representing linked image child
+                names, returns a list of linked image name objects
+                representing the same names.
 
-                        self.__plan_desc = PlanDescription(self.__img, self.__new_be)
+                For all other parameters, refer to the 'parse_linked_name'
+                function for an explanation of their usage and effects."""
 
-                        if self.__img.imageplan.nothingtodo() or noexecute:
-                                self.log_operation_end(
-                                    result=history.RESULT_NOTHING_TO_DO)
-
-                        #
-                        # We always rebuild the search index after a
-                        # variant change
-                        #
-                        self.__img.imageplan.update_index = True
-
-                except:
-                        self.__plan_common_exception()
-                        # NOTREACHED
-
-                self.__plan_common_finish()
-                res = not self.__img.imageplan.nothingtodo()
-                return res
+                return [
+                    self.parse_linked_name(li_name, allow_unknown)
+                    for li_name in li_name_list
+                ]
 
         def describe(self):
                 """Returns None if no plan is ready yet, otherwise returns
@@ -696,48 +2009,54 @@ class ImageInterface(object):
 
         def prepare(self):
                 """Takes care of things which must be done before the plan can
-                be executed. This includes downloading the packages to disk and
+                be executed.  This includes downloading the packages to disk and
                 preparing the indexes to be updated during execution.  Should
-                only be called once a plan_X method has been called."""
+                only be called once a gen_plan_*() method has been called.  If
+                a plan is abandoned after calling this method, reset() should
+                be called."""
 
-                self.__acquire_activity_lock()
+                self._acquire_activity_lock()
                 try:
-                        self.__img.lock()
+                        self._img.lock()
                 except:
-                        self.__activity_lock.release()
+                        self._activity_lock.release()
                         raise
 
                 try:
-                        if not self.__img.imageplan:
+                        if not self._img.imageplan:
+                                raise apx.PlanMissingException()
+
+                        if not self.__planned_children:
+                                # if we never planned children images then we
+                                # didn't finish planning.
                                 raise apx.PlanMissingException()
 
                         if self.__prepared:
                                 raise apx.AlreadyPreparedException()
-                        assert self.__plan_type == self.__INSTALL or \
-                            self.__plan_type == self.__UNINSTALL or \
-                            self.__plan_type == self.__UPDATE
+                        assert self.__plan_type in self.__plan_values, \
+                            "self.__plan_type = %s" % self.__plan_type
 
-                        self.__enable_cancel()
+                        self._enable_cancel()
 
                         try:
-                                self.__img.imageplan.preexecute()
+                                self._img.imageplan.preexecute()
                         except search_errors.ProblematicPermissionsIndexException, e:
                                 raise apx.ProblematicPermissionsIndexException(e)
                         except:
                                 raise
 
-                        self.__disable_cancel()
+                        self._disable_cancel()
                         self.__prepared = True
                 except apx.CanceledException, e:
-                        self.__cancel_done()
-                        if self.__img.history.operation_name:
+                        self._cancel_done()
+                        if self._img.history.operation_name:
                                 # If an operation is in progress, log
                                 # the error and mark its end.
                                 self.log_operation_end(error=e)
                         raise
                 except Exception, e:
-                        self.__cancel_cleanup_exception()
-                        if self.__img.history.operation_name:
+                        self._cancel_cleanup_exception()
+                        if self._img.history.operation_name:
                                 # If an operation is in progress, log
                                 # the error and mark its end.
                                 self.log_operation_end(error=e)
@@ -745,8 +2064,8 @@ class ImageInterface(object):
                 except:
                         # Handle exceptions that are not subclasses of
                         # Exception.
-                        self.__cancel_cleanup_exception()
-                        if self.__img.history.operation_name:
+                        self._cancel_cleanup_exception()
+                        if self._img.history.operation_name:
                                 # If an operation is in progress, log
                                 # the error and mark its end.
                                 exc_type, exc_value, exc_traceback = \
@@ -754,32 +2073,35 @@ class ImageInterface(object):
                                 self.log_operation_end(error=exc_type)
                         raise
                 finally:
-                        self.__img.cleanup_downloads()
-                        self.__img.unlock()
+                        self._img.cleanup_downloads()
+                        self._img.unlock()
                         try:
                                 if int(os.environ.get("PKG_DUMP_STATS", 0)) > 0:
-                                        self.__img.transport.stats.dump()
+                                        self._img.transport.stats.dump()
                         except ValueError:
                                 # Don't generate stats if an invalid value
                                 # is supplied.
                                 pass
-                        self.__activity_lock.release()
+                        self._activity_lock.release()
+
+                if self.__stage in [API_STAGE_DEFAULT, API_STAGE_PREPARE]:
+                        self._img.linked.do_recurse(API_STAGE_PREPARE)
 
         def execute_plan(self):
                 """Executes the plan. This is uncancelable once it begins.
                 Should only be called after the prepare method has been
-                called."""
+                called.  After plan execution, reset() should be called."""
 
-                self.__acquire_activity_lock()
+                self._acquire_activity_lock()
                 try:
-                        self.__disable_cancel()
-                        self.__img.lock()
+                        self._disable_cancel()
+                        self._img.lock()
                 except:
-                        self.__activity_lock.release()
+                        self._activity_lock.release()
                         raise
 
                 try:
-                        if not self.__img.imageplan:
+                        if not self._img.imageplan:
                                 raise apx.PlanMissingException()
 
                         if not self.__prepared:
@@ -788,26 +2110,44 @@ class ImageInterface(object):
                         if self.__executed:
                                 raise apx.AlreadyExecutedException()
 
-                        assert self.__plan_type == self.__INSTALL or \
-                            self.__plan_type == self.__UNINSTALL or \
-                            self.__plan_type == self.__UPDATE
+                        assert self.__plan_type in self.__plan_values, \
+                            "self.__plan_type = %s" % self.__plan_type
 
                         try:
-                                be = bootenv.BootEnv(self.__img)
+                                be = bootenv.BootEnv(self._img)
                         except RuntimeError:
-                                be = bootenv.BootEnvNull(self.__img)
-                        self.__img.bootenv = be
+                                be = bootenv.BootEnvNull(self._img)
+                        self._img.bootenv = be
 
                         if self.__new_be == False and \
-                            self.__img.imageplan.reboot_needed() and \
-                            self.__img.is_liveroot():
+                            self._img.imageplan.reboot_needed() and \
+                            self._img.is_liveroot():
                                 e = apx.RebootNeededOnLiveImageException()
                                 self.log_operation_end(error=e)
                                 raise e
 
+                        # Before proceeding, create a backup boot environment if
+                        # requested.
+                        if self.__backup_be == True:
+                                try:
+                                        be.create_backup_be(
+                                            be_name=self.__backup_be_name)
+                                except Exception, e:
+                                        self.log_operation_end(error=e)
+                                        raise
+                                except:
+                                        # Handle exceptions that are not
+                                        # subclasses of Exception.
+                                        exc_type, exc_value, exc_traceback = \
+                                            sys.exc_info()
+                                        self.log_operation_end(error=exc_type)
+                                        raise
+
+                        # After (possibly) creating backup be, determine if
+                        # operation should execute on a clone of current BE.
                         if self.__new_be == True:
                                 try:
-                                        be.init_image_recovery(self.__img,
+                                        be.init_image_recovery(self._img,
                                             self.__be_name)
                                 except Exception, e:
                                         self.log_operation_end(error=e)
@@ -820,12 +2160,26 @@ class ImageInterface(object):
                                         self.log_operation_end(error=exc_type)
                                         raise
                                 # check if things gained underneath us
-                                if self.__img.is_liveroot():
+                                if self._img.is_liveroot():
                                         e = apx.UnableToCopyBE()
                                         self.log_operation_end(error=e)
                                         raise e
+
+                        raise_later = None
+
+                        # we're about to execute a plan so change our current
+                        # working directory to / so that we won't fail if we
+                        # try to remove our current working directory
+                        os.chdir(os.sep)
+
                         try:
-                                self.__img.imageplan.execute()
+                                try:
+                                        self._img.imageplan.execute()
+                                except apx.WrapIndexingException, e:
+                                        raise_later = e
+
+                                if not self._img.linked.nothingtodo():
+                                        self._img.linked.syncmd()
                         except RuntimeError, e:
                                 if self.__new_be == True:
                                         be.restore_image()
@@ -846,15 +2200,13 @@ class ImageInterface(object):
                                 error = apx.CorruptedIndexException(e)
                                 self.log_operation_end(error=error)
                                 raise error
-                        except actuator.NonzeroExitException, e:
+                        except NonzeroExitException, e:
                                 # Won't happen during update
                                 be.restore_install_uninstall()
                                 error = apx.ActuatorException(e)
                                 self.log_operation_end(error=error)
                                 raise error
-                        except apx.WrapIndexingException, e:
-                                self.__finished_execution(be)
-                                raise
+
                         except Exception, e:
                                 if self.__new_be == True:
                                         be.restore_image()
@@ -877,38 +2229,46 @@ class ImageInterface(object):
                                 self.log_operation_end(error=exc_type)
                                 raise
 
+                        if self.__stage in \
+                            [API_STAGE_DEFAULT, API_STAGE_EXECUTE]:
+                                self._img.linked.do_recurse(API_STAGE_EXECUTE)
+
                         self.__finished_execution(be)
+                        if raise_later:
+                                raise raise_later
+
                 finally:
-                        self.__img.cleanup_downloads()
-                        self.__img.unlock()
-                        self.__activity_lock.release()
+                        self._img.cleanup_downloads()
+                        if self._img.locked:
+                                self._img.unlock()
+                        self._activity_lock.release()
 
         def __finished_execution(self, be):
-                if self.__img.imageplan.state != EXECUTED_OK:
+                if self._img.imageplan.state != ip.EXECUTED_OK:
                         if self.__new_be == True:
                                 be.restore_image()
                         else:
                                 be.restore_install_uninstall()
 
                         error = apx.ImageplanStateException(
-                            self.__img.imageplan.state)
+                            self._img.imageplan.state)
                         # Must be done after bootenv restore.
                         self.log_operation_end(error=error)
                         raise error
 
-                if self.__img.imageplan.boot_archive_needed() or \
+                if self._img.imageplan.boot_archive_needed() or \
                     self.__new_be:
                         be.update_boot_archive()
 
                 if self.__new_be == True:
-                        be.activate_image()
+                        be.activate_image(set_active=self.__be_activate)
                 else:
                         be.activate_install_uninstall()
-                self.__img.cleanup_cached_content()
+                self._img.cleanup_cached_content()
                 # If the end of the operation wasn't already logged
                 # by one of the previous operations, then log it as
                 # ending now.
-                if self.__img.history.operation_name:
+                if self._img.history.operation_name:
                         self.log_operation_end()
                 self.__executed = True
 
@@ -929,25 +2289,25 @@ class ImageInterface(object):
                         False   sets displayed status to False
                         True    sets displayed status to True"""
 
-                self.__acquire_activity_lock()
+                self._acquire_activity_lock()
                 try:
                         try:
-                                self.__disable_cancel()
+                                self._disable_cancel()
                         except apx.CanceledException:
-                                self.__cancel_done()
+                                self._cancel_done()
                                 raise
 
-                        if not self.__img.imageplan:
+                        if not self._img.imageplan:
                                 raise apx.PlanMissingException()
 
-                        for pp in self.__img.imageplan.pkg_plans:
+                        for pp in self._img.imageplan.pkg_plans:
                                 if pp.destination_fmri == pfmri:
                                         pp.set_license_status(plicense,
                                             accepted=accepted,
                                             displayed=displayed)
                                         break
                 finally:
-                        self.__activity_lock.release()
+                        self._activity_lock.release()
 
         def refresh(self, full_refresh=False, pubs=None, immediate=False):
                 """Refreshes the metadata (e.g. catalog) for one or more
@@ -971,49 +2331,51 @@ class ImageInterface(object):
                 Currently returns an image object, allowing existing code to
                 work while the rest of the API is put into place."""
 
-                self.__acquire_activity_lock()
+                self._acquire_activity_lock()
                 try:
-                        self.__disable_cancel()
-                        self.__img.lock()
+                        self._disable_cancel()
+                        self._img.lock()
                         try:
                                 self.__refresh(full_refresh=full_refresh,
                                     pubs=pubs, immediate=immediate)
-                                return self.__img
+                                return self._img
                         finally:
-                                self.__img.unlock()
-                                self.__img.cleanup_downloads()
+                                self._img.unlock()
+                                self._img.cleanup_downloads()
                 except apx.CanceledException:
-                        self.__cancel_done()
+                        self._cancel_done()
                         raise
                 finally:
                         try:
                                 if int(os.environ.get("PKG_DUMP_STATS", 0)) > 0:
-                                        self.__img.transport.stats.dump()
+                                        self._img.transport.stats.dump()
                         except ValueError:
                                 # Don't generate stats if an invalid value
                                 # is supplied.
                                 pass
-                        self.__activity_lock.release()
+                        self._activity_lock.release()
 
         def __refresh(self, full_refresh=False, pubs=None, immediate=False):
                 """Private refresh method; caller responsible for locking and
                 cleanup."""
 
-                self.__img.refresh_publishers(full_refresh=full_refresh,
+                self._img.refresh_publishers(full_refresh=full_refresh,
                     immediate=immediate, pubs=pubs,
                     progtrack=self.__progresstracker)
 
-        def __licenses(self, pfmri, mfst):
+        def __licenses(self, pfmri, mfst, alt_pub=None):
                 """Private function. Returns the license info from the
                 manifest mfst."""
                 license_lst = []
                 for lic in mfst.gen_actions_by_type("license"):
                         license_lst.append(LicenseInfo(pfmri, lic,
-                            img=self.__img))
+                            img=self._img, alt_pub=alt_pub))
                 return license_lst
 
-        def get_pkg_categories(self, installed=False, pubs=misc.EmptyI):
-                """Returns an order list of tuples of the form (scheme,
+        @_LockedCancelable()
+        def get_pkg_categories(self, installed=False, pubs=misc.EmptyI,
+            repos=None):
+                """Returns an ordered list of tuples of the form (scheme,
                 category) containing the names of all categories in use by
                 the last version of each unique package in the catalog on a
                 per-publisher basis.
@@ -1025,27 +2387,42 @@ class ImageInterface(object):
                 instead.
 
                 'pubs' is an optional list of publisher prefixes to restrict
-                the results to."""
+                the results to.
+
+                'repos' is a list of URI strings or RepositoryURI objects that
+                represent the locations of package repositories to list packages
+                for.
+                """
 
                 if installed:
-                        img_cat = self.__img.get_catalog(
-                            self.__img.IMG_CATALOG_INSTALLED)
                         excludes = misc.EmptyI
                 else:
-                        img_cat = self.__img.get_catalog(
-                            self.__img.IMG_CATALOG_KNOWN)
-                        excludes = self.__img.list_excludes()
-                return sorted(img_cat.categories(excludes=excludes, pubs=pubs))
+                        excludes = self._img.list_excludes()
 
-        def __map_installed_newest(self, brelease, pubs):
+                if repos:
+                        ignored, ignored, known_cat, inst_cat = \
+                            self.__get_alt_pkg_data(repos)
+                        if installed:
+                                pkg_cat = inst_cat
+                        else:
+                                pkg_cat = known_cat
+                elif installed:
+                        pkg_cat = self._img.get_catalog(
+                            self._img.IMG_CATALOG_INSTALLED)
+                else:
+                        pkg_cat = self._img.get_catalog(
+                            self._img.IMG_CATALOG_KNOWN)
+                return sorted(pkg_cat.categories(excludes=excludes, pubs=pubs))
+
+        def __map_installed_newest(self, brelease, pubs, known_cat=None):
                 """Private function.  Maps incorporations and publisher
                 relationships for installed packages and returns them
                 as a tuple of (pub_ranks, inc_stems, inc_vers, inst_stems,
                 ren_stems, ren_inst_stems).
                 """
 
-                img_cat = self.__img.get_catalog(
-                    self.__img.IMG_CATALOG_INSTALLED)
+                img_cat = self._img.get_catalog(
+                    self._img.IMG_CATALOG_INSTALLED)
                 cat_info = frozenset([img_cat.DEPENDENCY])
 
                 inst_stems = {}
@@ -1055,9 +2432,9 @@ class ImageInterface(object):
                 inc_stems = {}
                 inc_vers = {}
 
-                pub_ranks = self.__img.get_publisher_ranks()
+                pub_ranks = self._img.get_publisher_ranks()
 
-                # The incorporation list should include all installed, 
+                # The incorporation list should include all installed,
                 # incorporated packages from all publishers.
                 for t in img_cat.entry_actions(cat_info):
                         (pub, stem, ver), entry, actions = t
@@ -1148,11 +2525,13 @@ class ImageInterface(object):
                         # Package should not be checked.
                         return False
 
-                img_cat = self.__img.get_catalog(self.__img.IMG_CATALOG_KNOWN)
+                if not known_cat:
+                        known_cat = self._img.get_catalog(
+                            self._img.IMG_CATALOG_KNOWN)
 
                 # Find terminal rename entry for all known packages not
                 # rejected by check_stem().
-                for t, entry, actions in img_cat.entry_actions(cat_info,
+                for t, entry, actions in known_cat.entry_actions(cat_info,
                     cb=check_stem, last=True):
                         pkgr = False
                         targets = set()
@@ -1197,16 +2576,363 @@ class ImageInterface(object):
                 for p in sorted(pub_ranks, cmp=pub_order):
                         if pubs and p not in pubs:
                                 continue
-                        for stem in img_cat.names(pubs=[p]):
+                        for stem in known_cat.names(pubs=[p]):
                                 if stem in inc_vers:
                                         inc_stems.setdefault(stem, p)
 
                 return (pub_ranks, inc_stems, inc_vers, inst_stems, ren_stems,
                     ren_inst_stems)
 
-        def get_pkg_list(self, pkg_list, cats=None, patterns=misc.EmptyI,
-            pubs=misc.EmptyI, raise_unmatched=False, return_fmris=False,
-            variants=False):
+        def __get_temp_repo_pubs(self, repos):
+                """Private helper function to retrieve publisher information
+                from list of temporary repositories.  Caller is responsible
+                for locking."""
+
+                ret_pubs = []
+                for repo_uri in repos:
+                        if isinstance(repo_uri, basestring):
+                                repo = publisher.RepositoryURI(repo_uri)
+                        else:
+                                # Already a RepositoryURI.
+                                repo = repo_uri
+
+                        pubs = None
+                        try:
+                                pubs = self._img.transport.get_publisherdata(
+                                    repo, ccancel=self.__check_cancel)
+                        except apx.UnsupportedRepositoryOperation:
+                                raise apx.RepoPubConfigUnavailable(
+                                    location=str(repo))
+
+                        if not pubs:
+                                # Empty repository configuration.
+                                raise apx.RepoPubConfigUnavailable(
+                                    location=str(repo))
+
+                        for p in pubs:
+                                psrepo = p.repository
+                                if not psrepo:
+                                        # Repository configuration info wasn't
+                                        # provided, so assume origin is
+                                        # repo_uri.
+                                        p.repository = publisher.Repository(
+                                            origins=[repo_uri])
+                                elif not psrepo.origins:
+                                        # Repository configuration was provided,
+                                        # but without an origin.  Assume the
+                                        # repo_uri is the origin.
+                                        psrepo.add_origin(repo_uri)
+                                elif repo not in psrepo.origins:
+                                        # If the repo_uri used is not
+                                        # in the list of sources, then
+                                        # add it as the first origin.
+                                        psrepo.origins.insert(0, repo)
+                        ret_pubs.extend(pubs)
+
+                return sorted(ret_pubs)
+
+        def __get_alt_pkg_data(self, repos):
+                """Private helper function to retrieve composite known and
+                installed catalog and package repository map for temporary
+                set of package repositories.  Returns (pkg_pub_map, alt_pubs,
+                known_cat, inst_cat)."""
+
+                repos = set(repos)
+                eid = ",".join(sorted(map(str, repos)))
+                try:
+                        return self.__alt_sources[eid]
+                except KeyError:
+                        # Need to cache new set of alternate sources.
+                        pass
+
+                img_inst_cat = self._img.get_catalog(
+                    self._img.IMG_CATALOG_INSTALLED)
+                op_time = datetime.datetime.utcnow()
+                pubs = self.__get_temp_repo_pubs(repos)
+                progtrack = self.__progresstracker
+
+                # Create temporary directories.
+                tmpdir = tempfile.mkdtemp()
+
+                pkg_repos = {}
+                pkg_pub_map = {}
+                try:
+                        progtrack.refresh_start(len(pubs))
+                        pub_cats = []
+                        for pub in pubs:
+                                # Assign a temporary meta root to each
+                                # publisher.
+                                meta_root = os.path.join(tmpdir, str(id(pub)))
+                                misc.makedirs(meta_root)
+                                pub.meta_root = meta_root
+                                pub.transport = self._img.transport
+                                repo = pub.repository
+                                pkg_repos[id(repo)] = repo
+
+                                # Retrieve each publisher's catalog.
+                                progtrack.refresh_progress(pub.prefix)
+                                pub.refresh()
+                                pub_cats.append((
+                                    pub.prefix,
+                                    repo,
+                                    pub.catalog
+                                ))
+
+                        progtrack.refresh_done()
+
+                        # Determine upgradability.
+                        newest = {}
+                        for pfx, repo, cat in [(None, None, img_inst_cat)] + \
+                            pub_cats:
+                                if pfx:
+                                        pkg_list = cat.fmris(last=True,
+                                            pubs=[pfx])
+                                else:
+                                        pkg_list = cat.fmris(last=True)
+
+                                for f in pkg_list:
+                                        nver, snver = newest.get(f.pkg_name,
+                                            (None, None))
+                                        if f.version > nver:
+                                                newest[f.pkg_name] = (f.version,
+                                                    str(f.version))
+
+                        # Build list of installed packages.
+                        inst_stems = {}
+                        for t, entry in img_inst_cat.tuple_entries():
+                                states = entry["metadata"]["states"]
+                                if self._img.PKG_STATE_INSTALLED not in states:
+                                        continue
+                                pub, stem, ver = t
+                                inst_stems.setdefault(pub, {})
+                                inst_stems[pub].setdefault(stem, {})
+                                inst_stems[pub][stem][ver] = False
+
+                        # Now create composite known and installed catalogs.
+                        compicat = pkg.catalog.Catalog(batch_mode=True,
+                            sign=False)
+                        compkcat = pkg.catalog.Catalog(batch_mode=True,
+                            sign=False)
+
+                        sparts = (
+                           (pfx, cat, repo, name, cat.get_part(name, must_exist=True))
+                           for pfx, repo, cat in pub_cats
+                           for name in cat.parts
+                        )
+
+                        excludes = self._img.list_excludes()
+                        proc_stems = {}
+                        for pfx, cat, repo, name, spart in sparts:
+                                # 'spart' is the source part.
+                                if spart is None:
+                                        # Client hasn't retrieved this part.
+                                        continue
+
+                                # New known part.
+                                nkpart = compkcat.get_part(name)
+                                nipart = compicat.get_part(name)
+                                base = name.startswith("catalog.base.")
+
+                                # Avoid accessor overhead since these will be
+                                # used for every entry.
+                                cat_ver = cat.version
+                                dp = cat.get_part("catalog.dependency.C",
+                                    must_exist=True)
+
+                                for t, sentry in spart.tuple_entries(pubs=[pfx]):
+                                        pub, stem, ver = t
+
+                                        pkg_pub_map.setdefault(pub, {})
+                                        pkg_pub_map[pub].setdefault(stem, {})
+                                        pkg_pub_map[pub][stem].setdefault(ver,
+                                            set())
+                                        pkg_pub_map[pub][stem][ver].add(
+                                            id(repo))
+
+                                        if pub in proc_stems and \
+                                            stem in proc_stems[pub] and \
+                                            ver in proc_stems[pub][stem]:
+                                                if id(cat) != proc_stems[pub][stem][ver]:
+                                                        # Already added from another
+                                                        # catalog.
+                                                        continue
+                                        else:
+                                                proc_stems.setdefault(pub, {})
+                                                proc_stems[pub].setdefault(stem,
+                                                    {})
+                                                proc_stems[pub][stem][ver] = \
+                                                    id(cat)
+
+                                        installed = False
+                                        if pub in inst_stems and \
+                                            stem in inst_stems[pub] and \
+                                            ver in inst_stems[pub][stem]:
+                                                installed = True
+                                                inst_stems[pub][stem][ver] = \
+                                                    True
+
+                                        # copy() is too slow here and catalog
+                                        # entries are shallow so this should be
+                                        # sufficient.
+                                        entry = dict(sentry.iteritems())
+                                        if not base:
+                                                # Nothing else to do except add
+                                                # the entry for non-base catalog
+                                                # parts.
+                                                nkpart.add(metadata=entry,
+                                                    op_time=op_time, pub=pub,
+                                                    stem=stem, ver=ver)
+                                                if installed:
+                                                        nipart.add(
+                                                            metadata=entry,
+                                                            op_time=op_time,
+                                                            pub=pub, stem=stem,
+                                                            ver=ver)
+                                                continue
+
+                                        # Only the base catalog part stores
+                                        # package state information and/or
+                                        # other metadata.
+                                        mdata = entry["metadata"] = {}
+                                        states = [self._img.PKG_STATE_KNOWN,
+                                            self._img.PKG_STATE_ALT_SOURCE]
+                                        if cat_ver == 0:
+                                                states.append(
+                                                    self._img.PKG_STATE_V0)
+                                        else:
+                                                # Assume V1 catalog source.
+                                                states.append(
+                                                    self._img.PKG_STATE_V1)
+
+                                        if installed:
+                                                states.append(
+                                                    self._img.PKG_STATE_INSTALLED)
+
+                                        nver, snver = newest.get(stem,
+                                            (None, None))
+                                        if snver is not None and ver != snver:
+                                                states.append(
+                                                    self._img.PKG_STATE_UPGRADABLE)
+
+                                        # Determine if package is obsolete or
+                                        # has been renamed and mark with
+                                        # appropriate state.
+                                        dpent = None
+                                        if dp is not None:
+                                                dpent = dp.get_entry(pub=pub,
+                                                    stem=stem, ver=ver)
+                                        if dpent is not None:
+                                                for a in dpent["actions"]:
+                                                        # Constructing action
+                                                        # objects for every
+                                                        # action would be a lot
+                                                        # slower, so a simple
+                                                        # string match is done
+                                                        # first so that only
+                                                        # interesting actions
+                                                        # get constructed.
+                                                        if not a.startswith("set"):
+                                                                continue
+                                                        if not ("pkg.obsolete" in a or \
+                                                            "pkg.renamed" in a):
+                                                                continue
+
+                                                        try:
+                                                                act = pkg.actions.fromstr(a)
+                                                        except pkg.actions.ActionError:
+                                                                # If the action can't be
+                                                                # parsed or is not yet
+                                                                # supported, continue.
+                                                                continue
+
+                                                        if act.attrs["value"].lower() != "true":
+                                                                continue
+
+                                                        if act.attrs["name"] == "pkg.obsolete":
+                                                                states.append(
+                                                                    self._img.PKG_STATE_OBSOLETE)
+                                                        elif act.attrs["name"] == "pkg.renamed":
+                                                                if not act.include_this(
+                                                                    excludes):
+                                                                        continue
+                                                                states.append(
+                                                                    self._img.PKG_STATE_RENAMED)
+
+                                        mdata["states"] = states
+
+                                        # Add base entries.
+                                        nkpart.add(metadata=entry,
+                                            op_time=op_time, pub=pub, stem=stem,
+                                            ver=ver)
+                                        if installed:
+                                                nipart.add(metadata=entry,
+                                                    op_time=op_time, pub=pub,
+                                                    stem=stem, ver=ver)
+
+                        pub_map = {}
+                        for pub in pubs:
+                                try:
+                                        opub = pub_map[pub.prefix]
+                                except KeyError:
+                                        opub = publisher.Publisher(pub.prefix,
+                                            catalog=compkcat)
+                                        pub_map[pub.prefix] = opub
+
+                        rid_map = {}
+                        for pub in pkg_pub_map:
+                                for stem in pkg_pub_map[pub]:
+                                        for ver in pkg_pub_map[pub][stem]:
+                                                rids = tuple(sorted(
+                                                    pkg_pub_map[pub][stem][ver]))
+
+                                                if not rids in rid_map:
+                                                        # Create a publisher and
+                                                        # repository for this
+                                                        # unique set of origins.
+                                                        origins = []
+                                                        map(origins.extend, [
+                                                           pkg_repos.get(rid).origins
+                                                           for rid in rids
+                                                        ])
+                                                        nrepo = publisher.Repository(
+                                                            origins=origins)
+                                                        npub = \
+                                                            copy.copy(pub_map[pub])
+                                                        npub.repository = nrepo
+                                                        rid_map[rids] = npub
+
+                                                pkg_pub_map[pub][stem][ver] = \
+                                                    rid_map[rids]
+
+                        # Now consolidate all origins for each publisher under
+                        # a single repository object for the caller.
+                        for pub in pubs:
+                                npub = pub_map[pub.prefix]
+                                nrepo = npub.repository
+                                if not nrepo:
+                                        nrepo = publisher.Repository()
+                                        npub.repository = nrepo
+                                for o in pub.repository.origins:
+                                        if not nrepo.has_origin(o):
+                                                nrepo.add_origin(o)
+
+                        for compcat in (compicat, compkcat):
+                                compcat.batch_mode = False
+                                compcat.finalize()
+                                compcat.read_only = True
+
+                        # Cache these for future callers.
+                        self.__alt_sources[eid] = (pkg_pub_map,
+                            sorted(pub_map.values()), compkcat, compicat)
+                        return self.__alt_sources[eid]
+                finally:
+                        shutil.rmtree(tmpdir, ignore_errors=True)
+                        self._img.cleanup_downloads()
+
+        @_LockedGenerator()
+        def get_pkg_list(self, pkg_list, cats=None, collect_attrs=False,
+            patterns=misc.EmptyI, pubs=misc.EmptyI, raise_unmatched=False,
+            ranked=False, repos=None, return_fmris=False, variants=False):
                 """A generator function that produces tuples of the form:
 
                     (
@@ -1217,7 +2943,8 @@ class ImageInterface(object):
                         ),
                         summary,    - (string) the package summary
                         categories, - (list) string tuples of (scheme, category)
-                        states      - (list) PackageInfo states
+                        states,     - (list) PackageInfo states
+                        attributes  - (dict) package attributes
                     )
 
                 Results are always sorted by stem, publisher, and then in
@@ -1254,6 +2981,11 @@ class ImageInterface(object):
                 to any package category.  A value of None indicates that no
                 package category filtering should be applied.
 
+                'collect_attrs' is an optional boolean that indicates whether
+                all package attributes should be collected and returned in the
+                fifth element of the return tuple.  If False, that element will
+                be an empty dictionary.
+
                 'patterns' is an optional list of FMRI wildcard strings to
                 filter results by.
 
@@ -1264,6 +2996,15 @@ class ImageInterface(object):
                 whether an InventoryException should be raised if any patterns
                 (after applying all other filtering and returning all results)
                 didn't match any packages.
+
+                'ranked' is an optional boolean value that indicates whether
+                only the matching package versions from the highest-ranked
+                publisher should be returned.  This option is ignored for
+                patterns that explicitly specify the publisher to match.
+
+                'repos' is a list of URI strings or RepositoryURI objects that
+                represent the locations of package repositories to list packages
+                for.
 
                 'return_fmris' is an optional boolean value that indicates that
                 an FMRI object should be returned in place of the (pub, stem,
@@ -1276,6 +3017,21 @@ class ImageInterface(object):
                 Please note that this function may invoke network operations
                 to retrieve the requested package information."""
 
+                return self.__get_pkg_list(pkg_list, cats=cats,
+                    collect_attrs=collect_attrs, patterns=patterns, pubs=pubs,
+                    raise_unmatched=raise_unmatched, ranked=ranked, repos=repos,
+                    return_fmris=return_fmris, variants=variants)
+
+        def __get_pkg_list(self, pkg_list, cats=None, collect_attrs=False,
+            inst_cat=None, known_cat=None, patterns=misc.EmptyI,
+            pubs=misc.EmptyI, raise_unmatched=False, ranked=False, repos=None,
+            return_fmris=False, variants=False):
+                """This is the implementation of get_pkg_list.  The other
+                function is a wrapper that uses locking.  The separation was
+                necessary because of API functions that already perform locking
+                but need to use get_pkg_list().  This is a generator
+                function."""
+
                 installed = inst_newest = newest = upgradable = False
                 if pkg_list == self.LIST_INSTALLED:
                         installed = True
@@ -1286,52 +3042,53 @@ class ImageInterface(object):
                 elif pkg_list == self.LIST_UPGRADABLE:
                         upgradable = True
 
-                brelease = self.__img.attrs["Build-Release"]
+                brelease = self._img.attrs["Build-Release"]
 
                 # Each pattern in patterns can be a partial or full FMRI, so
                 # extract the individual components for use in filtering.
                 illegals = []
                 pat_tuples = {}
                 pat_versioned = False
-                for pat in patterns:
-                        try:
-                                if "@" in pat:
-                                        # Mark that a pattern containing
-                                        # version information was found.
-                                        pat_versioned = True
+                latest_pats = set()
+                seen = set()
+                npatterns = set()
+                for pat, error, pfmri, matcher in self.parse_fmri_patterns(
+                    patterns):
+                        if error:
+                                illegals.append(error)
+                                continue
 
-                                if "*" in pat or "?" in pat:
-                                        matcher = self.MATCH_GLOB
+                        # Duplicate patterns are ignored.
+                        sfmri = str(pfmri)
+                        if sfmri in seen:
+                                # A different form of the same pattern
+                                # was specified already; ignore this
+                                # one (e.g. pkg:/network/ping,
+                                # /network/ping).
+                                continue
 
-                                        # XXX By default, matching FMRIs
-                                        # currently do not also use
-                                        # MatchingVersion.  If that changes,
-                                        # this should change too.
-                                        parts = pat.split("@", 1)
-                                        if len(parts) == 1:
-                                                npat = pkg.fmri.MatchingPkgFmri(
-                                                    pat, brelease)
-                                        else:
-                                                npat = pkg.fmri.MatchingPkgFmri(
-                                                    parts[0], brelease)
-                                                npat.version = \
-                                                    pkg.version.MatchingVersion(
-                                                    str(parts[1]), brelease)
-                                elif pat.startswith("pkg:/"):
-                                        matcher = self.MATCH_EXACT
-                                        npat = pkg.fmri.PkgFmri(pat,
-                                            brelease)
-                                else:
-                                        matcher = self.MATCH_FMRI
-                                        npat = pkg.fmri.PkgFmri(pat,
-                                            brelease)
-                                pat_tuples[pat] = (npat.tuple(), matcher)
-                        except (pkg.fmri.FmriError,
-                            pkg.version.VersionError), e:
-                                illegals.append(e)
+                        # Track used patterns.
+                        seen.add(sfmri)
+                        npatterns.add(pat)
+
+                        if "@" in pat:
+                                # Mark that a pattern contained version
+                                # information.  This is used for a listing
+                                # optimization later on.
+                                pat_versioned = True
+                        if getattr(pfmri.version, "match_latest", None):
+                                latest_pats.add(pat)
+                        pat_tuples[pat] = (pfmri.tuple(), matcher)
+
+                patterns = npatterns
+                del npatterns, seen
 
                 if illegals:
                         raise apx.InventoryException(illegal=illegals)
+
+                if repos:
+                        ignored, ignored, known_cat, inst_cat = \
+                            self.__get_alt_pkg_data(repos)
 
                 # For LIST_INSTALLED_NEWEST, installed packages need to be
                 # determined and incorporation and publisher relationships
@@ -1339,23 +3096,28 @@ class ImageInterface(object):
                 if inst_newest:
                         pub_ranks, inc_stems, inc_vers, inst_stems, ren_stems, \
                             ren_inst_stems = self.__map_installed_newest(
-                            brelease, pubs)
+                            brelease, pubs, known_cat=known_cat)
                 else:
                         pub_ranks = inc_stems = inc_vers = inst_stems = \
                             ren_stems = ren_inst_stems = misc.EmptyDict
 
                 if installed or upgradable:
-                        img_cat = self.__img.get_catalog(
-                            self.__img.IMG_CATALOG_INSTALLED)
+                        if inst_cat:
+                                pkg_cat = inst_cat
+                        else:
+                                pkg_cat = self._img.get_catalog(
+                                    self._img.IMG_CATALOG_INSTALLED)
 
                         # Don't need to perform variant filtering if only
                         # listing installed packages.
                         variants = True
+                elif known_cat:
+                        pkg_cat = known_cat
                 else:
-                        img_cat = self.__img.get_catalog(
-                            self.__img.IMG_CATALOG_KNOWN)
+                        pkg_cat = self._img.get_catalog(
+                            self._img.IMG_CATALOG_KNOWN)
 
-                cat_info = frozenset([img_cat.DEPENDENCY, img_cat.SUMMARY])
+                cat_info = frozenset([pkg_cat.DEPENDENCY, pkg_cat.SUMMARY])
 
                 # Keep track of when the newest version has been found for
                 # each incorporated stem.
@@ -1367,8 +3129,8 @@ class ImageInterface(object):
 
                 def check_state(t, entry):
                         states = entry["metadata"]["states"]
-                        pkgi = self.__img.PKG_STATE_INSTALLED in states
-                        pkgu = self.__img.PKG_STATE_UPGRADABLE in states
+                        pkgi = self._img.PKG_STATE_INSTALLED in states
+                        pkgu = self._img.PKG_STATE_UPGRADABLE in states
                         pub, stem, ver = t
 
                         if upgradable:
@@ -1442,19 +3204,43 @@ class ImageInterface(object):
                         # Filtering needs to be applied.
                         filter_cb = check_state
 
-                arch = self.__img.get_arch()
-                excludes = self.__img.list_excludes()
-                is_zone = self.__img.is_zone()
+                excludes = self._img.list_excludes()
+                img_variants = self._img.get_variants()
 
                 matched_pats = set()
                 pkg_matching_pats = None
 
                 # Retrieve only the newest package versions for LIST_NEWEST if
-                # none of the patterns have version information.  (This cuts
-                # down on the number of entries that have to be filtered.)
-                use_last = newest and not pat_versioned
+                # none of the patterns have version information and variants are
+                # included.  (This cuts down on the number of entries that have
+                # to be filtered.)
+                use_last = newest and not pat_versioned and variants
 
-                for t, entry, actions in img_cat.entry_actions(cat_info,
+                if ranked:
+                        # If caller requested results to be ranked by publisher,
+                        # then the list of publishers to return must be passed
+                        # to entry_actions() in rank order.
+                        pub_ranks = self._img.get_publisher_ranks()
+                        if not pubs:
+                                # It's important that the list of possible
+                                # publishers is gleaned from the catalog
+                                # directly and not image configuration so
+                                # that temporary sources (archives, etc.)
+                                # work as expected.
+                                pubs = pkg_cat.publishers()
+                        for p in pubs:
+                                pub_ranks.setdefault(p, (99, (p, False, False)))
+
+                        def pub_order(a, b):
+                                res = cmp(pub_ranks[a], pub_ranks[b])
+                                if res != 0:
+                                        return res
+                                return cmp(a, b)
+
+                        pubs = sorted(pubs, cmp=pub_order)
+
+                ranked_stems = {}
+                for t, entry, actions in pkg_cat.entry_actions(cat_info,
                     cb=filter_cb, excludes=excludes, last=use_last,
                     ordered=True, pubs=pubs):
                         pub, stem, ver = t
@@ -1463,13 +3249,20 @@ class ImageInterface(object):
                         omit_package = None
 
                         pkg_stem = "!".join((pub, stem))
-                        if newest and pat_versioned and pkg_stem in nlist:
-                                # A newer version has already been listed and
-                                # because a pattern with a version was specified
+                        if newest and pkg_stem in nlist:
+                                # A newer version has already been listed, so
                                 # any additional entries need to be marked for
                                 # omission before continuing.
                                 omit_package = True
-                                omit_ver = True
+                        elif ranked and not patterns and \
+                            ranked_stems.get(stem, pub) != pub:
+                                # A different version from a higher-ranked
+                                # publisher has been returned already, so skip
+                                # this one.  This can only be done safely at
+                                # this point if no patterns have been specified,
+                                # since publisher-specific patterns override
+                                # ranking behaviour.
+                                omit_package = True
                         else:
                                 nlist[pkg_stem] += 1
 
@@ -1484,6 +3277,16 @@ class ImageInterface(object):
                                         if pat_pub is not None and \
                                             pub != pat_pub:
                                                 # Publisher doesn't match.
+                                                if omit_package is None:
+                                                        omit_package = True
+                                                continue
+                                        elif ranked and not pat_pub and \
+                                            ranked_stems.get(stem, pub) != pub:
+                                                # A different version from a
+                                                # higher-ranked publisher has
+                                                # been returned already, so skip
+                                                # this one since no publisher
+                                                # was specified for the pattern.
                                                 if omit_package is None:
                                                         omit_package = True
                                                 continue
@@ -1528,6 +3331,16 @@ class ImageInterface(object):
                                                         omit_ver = True
                                                         continue
 
+                                        if pat in latest_pats and \
+                                            nlist[pkg_stem] > 1:
+                                                # Package allowed by pattern,
+                                                # but isn't the "latest"
+                                                # version.
+                                                if omit_package is None:
+                                                        omit_package = True
+                                                omit_ver = True
+                                                continue
+
                                         # If this entry matched at least one
                                         # pattern, then ensure it is returned.
                                         omit_package = False
@@ -1567,8 +3380,11 @@ class ImageInterface(object):
                         summ = None
                         targets = set()
 
+                        omit_var = False
                         states = entry["metadata"]["states"]
-                        pkgi = self.__img.PKG_STATE_INSTALLED in states
+                        pkgi = self._img.PKG_STATE_INSTALLED in states
+                        ddm = lambda: collections.defaultdict(list)
+                        attrs = collections.defaultdict(ddm)
                         try:
                                 for a in actions:
                                         if a.name == "depend" and \
@@ -1580,6 +3396,18 @@ class ImageInterface(object):
 
                                         atname = a.attrs["name"]
                                         atvalue = a.attrs["value"]
+                                        if collect_attrs:
+                                                atvlist = a.attrlist("value")
+
+                                                # XXX Need to describe this data
+                                                # structure sanely somewhere.
+                                                mods = tuple(
+                                                    (k, tuple(sorted(a.attrlist(k))))
+                                                    for k in sorted(a.attrs.iterkeys())
+                                                    if k not in ("name", "value")
+                                                )
+                                                attrs[atname][mods].extend(atvlist)
+
                                         if atname == "pkg.summary":
                                                 summ = atvalue
                                                 continue
@@ -1589,6 +3417,10 @@ class ImageInterface(object):
                                                         # Historical summary
                                                         # field.
                                                         summ = atvalue
+                                                        collect_attrs and \
+                                                            attrs["pkg.summary"] \
+                                                            [mods]. \
+                                                            extend(atvlist)
                                                 continue
 
                                         if atname == "info.classification":
@@ -1608,29 +3440,24 @@ class ImageInterface(object):
                                                         pkgr = True
                                                 continue
 
-                                        if variants:
-                                                # No variant filtering.
+                                        if variants or \
+                                            not atname.startswith("variant."):
+                                                # No variant filtering required.
                                                 continue
 
+                                        # For all variants explicitly set in the
+                                        # image, elide packages that are not for
+                                        # a matching variant value.
                                         is_list = type(atvalue) == list
-                                        if atname == "variant.arch":
-                                                if (is_list and
-                                                    arch not in atvalue) or \
-                                                   (not is_list and
-                                                   arch != atvalue):
-                                                        # Package is not for the
-                                                        # image's architecture.
+                                        for vn, vv in img_variants.iteritems():
+                                                if vn == atname and \
+                                                    ((is_list and
+                                                    vv not in atvalue) or \
+                                                    (not is_list and
+                                                    vv != atvalue)):
                                                         omit_package = True
-                                                        continue
-
-                                        if atname == "variant.opensolaris.zone":
-                                                if (is_zone and is_list and
-                                                    "nonglobal" not in atvalue) or \
-                                                   (is_zone and not is_list and
-                                                    atvalue != "nonglobal"):
-                                                        # Package is for zones
-                                                        # only.
-                                                        omit_package = True
+                                                        omit_var = True
+                                                        break
                         except apx.InvalidPackageErrors:
                                 # Ignore errors for packages that have invalid
                                 # or unsupported metadata.  This is necessary so
@@ -1657,7 +3484,16 @@ class ImageInterface(object):
                                                 tgt = ren_stems.get(tgt, None)
 
                         if omit_package:
-                                # Package didn't match critera; skip it.
+                                # Package didn't match criteria; skip it.
+                                if (filter_cb is not None or newest) and \
+                                    omit_var and nlist[pkg_stem] == 1:
+                                        # If omitting because of variant, and
+                                        # no other versions have been returned
+                                        # yet for this stem, then discard
+                                        # tracking entry so that other
+                                        # versions will be listed.
+                                        del nlist[pkg_stem]
+                                        slist.discard(stem)
                                 continue
 
                         if cats is not None:
@@ -1681,13 +3517,18 @@ class ImageInterface(object):
                                 # applied are the patterns that the package
                                 # matched considered "matching".
                                 matched_pats.update(pkg_matching_pats)
+                        if ranked:
+                                # Only after all other filtering has been
+                                # applied is the stem considered to have been
+                                # a "ranked" match.
+                                ranked_stems.setdefault(stem, pub)
 
                         if return_fmris:
                                 pfmri = fmri.PkgFmri("%s@%s" % (stem, ver),
                                     build_release=brelease, publisher=pub)
-                                yield (pfmri, summ, pcats, states)
+                                yield (pfmri, summ, pcats, states, attrs)
                         else:
-                                yield (t, summ, pcats, states)
+                                yield (t, summ, pcats, states, attrs)
 
                 if raise_unmatched:
                         # Caller has requested that non-matching patterns or
@@ -1697,28 +3538,25 @@ class ImageInterface(object):
                         if raise_unmatched and notfound:
                                 raise apx.InventoryException(notfound=notfound)
 
-        def info(self, fmri_strings, local, info_needed):
+        @_LockedCancelable()
+        def info(self, fmri_strings, local, info_needed, ranked=False,
+            repos=None):
                 """Gathers information about fmris.  fmri_strings is a list
                 of fmri_names for which information is desired.  local
                 determines whether to retrieve the information locally
                 (if possible).  It returns a dictionary of lists.  The keys
                 for the dictionary are the constants specified in the class
                 definition.  The values are lists of PackageInfo objects or
-                strings."""
+                strings.
 
-                # Currently, this is mostly a wapper for activity locking.
-                self.__acquire_activity_lock()
-                try:
-                        i = self._info_op(fmri_strings, local, info_needed)
-                finally:
-                        self.__img.cleanup_downloads()
-                        self.__activity_lock.release()
+                'ranked' is an optional boolean value that indicates whether
+                only the matching package versions from the highest-ranked
+                publisher should be returned.  This option is ignored for
+                patterns that explicitly specify the publisher to match.
 
-                return i
-
-        def _info_op(self, fmri_strings, local, info_needed):
-                """Performs the actual info operation.  The external
-                interface to the API's consumers is defined in info()."""
+                'repos' is a list of URI strings or RepositoryURI objects that
+                represent the locations of packages to return information for.
+                """
 
                 bad_opts = info_needed - PackageInfo.ALL_OPTIONS
                 if bad_opts:
@@ -1726,25 +3564,40 @@ class ImageInterface(object):
 
                 self.log_operation_start("info")
 
-                if local is True:
-                        img_cat = self.__img.get_catalog(
-                            self.__img.IMG_CATALOG_INSTALLED)
-                        if not fmri_strings and img_cat.package_count == 0:
-                                self.log_operation_end(
-                                    result=history.RESULT_NOTHING_TO_DO)
-                                raise apx.NoPackagesInstalledException()
+                # Common logic for image and temp repos case.
+                if local:
                         ilist = self.LIST_INSTALLED
                 else:
                         # Verify validity of certificates before attempting
                         # network operations.
-                        self.__cert_verify(
-                            log_op_end=[apx.CertificateError])
-
-                        img_cat = self.__img.get_catalog(
-                            self.__img.IMG_CATALOG_KNOWN)
+                        self.__cert_verify(log_op_end=[apx.CertificateError])
                         ilist = self.LIST_NEWEST
 
-                excludes = self.__img.list_excludes()
+                # The pkg_pub_map is only populated when temp repos are
+                # specified and maps packages to the repositories that
+                # contain them for manifest retrieval.
+                pkg_pub_map = None
+                known_cat = None
+                inst_cat = None
+                if repos:
+                        pkg_pub_map, ignored, known_cat, inst_cat = \
+                            self.__get_alt_pkg_data(repos)
+                        if local:
+                                pkg_cat = inst_cat
+                        else:
+                                pkg_cat = known_cat
+                elif local:
+                        pkg_cat = self._img.get_catalog(
+                            self._img.IMG_CATALOG_INSTALLED)
+                        if not fmri_strings and pkg_cat.package_count == 0:
+                                self.log_operation_end(
+                                    result=RESULT_NOTHING_TO_DO)
+                                raise apx.NoPackagesInstalledException()
+                else:
+                        pkg_cat = self._img.get_catalog(
+                            self._img.IMG_CATALOG_KNOWN)
+
+                excludes = self._img.list_excludes()
 
                 # Set of options that can use catalog data.
                 cat_opts = frozenset([PackageInfo.DESCRIPTION,
@@ -1754,6 +3607,8 @@ class ImageInterface(object):
                 act_opts = PackageInfo.ACTION_OPTIONS - \
                     frozenset([PackageInfo.DEPENDENCIES])
 
+                collect_attrs = PackageInfo.ALL_ATTRIBUTES in info_needed
+
                 pis = []
                 rval = {
                     self.INFO_FOUND: pis,
@@ -1762,20 +3617,29 @@ class ImageInterface(object):
                 }
 
                 try:
-                        for pfmri, summary, cats, states in self.get_pkg_list(
-                            ilist, patterns=fmri_strings, raise_unmatched=True,
-                            return_fmris=True, variants=True):
-                                pub = name = version = release = \
-                                    build_release = branch = \
+                        for pfmri, summary, cats, states, attrs in self.__get_pkg_list(
+                            ilist, collect_attrs=collect_attrs,
+                            inst_cat=inst_cat, known_cat=known_cat,
+                            patterns=fmri_strings, raise_unmatched=True,
+                            ranked=ranked, return_fmris=True, variants=True):
+                                release = build_release = branch = \
                                     packaging_date = None
+
+                                pub, name, version = pfmri.tuple()
+                                alt_pub = None
+                                if pkg_pub_map:
+                                        alt_pub = \
+                                            pkg_pub_map[pub][name][str(version)]
+
                                 if PackageInfo.IDENTITY in info_needed:
-                                        pub, name, version = pfmri.tuple()
                                         release = version.release
                                         build_release = version.build_release
                                         branch = version.branch
                                         packaging_date = \
                                             version.get_timestamp().strftime(
                                             "%c")
+                                else:
+                                        pub = name = version = None
 
                                 links = hardlinks = files = dirs = \
                                     size = licenses = cat_info = \
@@ -1794,7 +3658,7 @@ class ImageInterface(object):
                                         try:
                                                 ignored, description, ignored, \
                                                     dependencies = \
-                                                    _get_pkg_cat_data(img_cat,
+                                                    _get_pkg_cat_data(pkg_cat,
                                                         ret_cat_data,
                                                         excludes=excludes,
                                                         pfmri=pfmri)
@@ -1810,12 +3674,12 @@ class ImageInterface(object):
 
                                 mfst = None
                                 if not unsupported and \
-                                    (frozenset([PackageInfo.SIZE, 
+                                    (frozenset([PackageInfo.SIZE,
                                     PackageInfo.LICENSES]) | act_opts) & \
                                     info_needed:
                                         try:
-                                                mfst = self.__img.get_manifest(
-                                                    pfmri)
+                                                mfst = self._img.get_manifest(
+                                                    pfmri, alt_pub=alt_pub)
                                         except apx.InvalidPackageErrors:
                                                 # If the information can't be
                                                 # retrieved because the manifest
@@ -1826,7 +3690,7 @@ class ImageInterface(object):
                                 if mfst is not None:
                                         if PackageInfo.LICENSES in info_needed:
                                                 licenses = self.__licenses(pfmri,
-                                                    mfst)
+                                                    mfst, alt_pub=alt_pub)
 
                                         if PackageInfo.SIZE in info_needed:
                                                 size = mfst.get_size(
@@ -1879,14 +3743,14 @@ class ImageInterface(object):
                                     states=states, publisher=pub, version=release,
                                     build_release=build_release, branch=branch,
                                     packaging_date=packaging_date, size=size,
-                                    pfmri=str(pfmri), licenses=licenses, 
+                                    pfmri=pfmri, licenses=licenses,
                                     links=links, hardlinks=hardlinks, files=files,
                                     dirs=dirs, dependencies=dependencies,
-                                    description=description))
+                                    description=description, attrs=attrs))
                 except apx.InventoryException, e:
                         if e.illegal:
                                 self.log_operation_end(
-                                    result=history.RESULT_FAILED_BAD_REQUEST)
+                                    result=RESULT_FAILED_BAD_REQUEST)
                         rval[self.INFO_MISSING] = e.notfound
                         rval[self.INFO_ILLEGALS] = e.illegal
                 else:
@@ -1894,14 +3758,14 @@ class ImageInterface(object):
                                 self.log_operation_end()
                         else:
                                 self.log_operation_end(
-                                    result=history.RESULT_NOTHING_TO_DO)
+                                    result=RESULT_NOTHING_TO_DO)
                 return rval
 
         def can_be_canceled(self):
                 """Returns true if the API is in a cancelable state."""
                 return self.__can_be_canceled
 
-        def __disable_cancel(self):
+        def _disable_cancel(self):
                 """Sets_can_be_canceled to False in a way that prevents missed
                 wakeups.  This may raise CanceledException, if a
                 cancellation is pending."""
@@ -1909,13 +3773,13 @@ class ImageInterface(object):
                 self.__cancel_lock.acquire()
                 if self.__canceling:
                         self.__cancel_lock.release()
-                        self.__img.transport.reset()
+                        self._img.transport.reset()
                         raise apx.CanceledException()
                 else:
                         self.__set_can_be_canceled(False)
                 self.__cancel_lock.release()
 
-        def __enable_cancel(self):
+        def _enable_cancel(self):
                 """Sets can_be_canceled to True while grabbing the cancel
                 locks.  The caller must still hold the activity lock while
                 calling this function."""
@@ -1937,7 +3801,7 @@ class ImageInterface(object):
                 if status == True:
                         # Callers must hold activity lock for operations
                         # that they will make cancelable.
-                        assert self.__activity_lock._is_owned()
+                        assert self._activity_lock._is_owned()
                         # In any situation where the caller holds the activity
                         # lock and wants to set cancelable to true, a cancel
                         # should not already be in progress.  This is because
@@ -1955,43 +3819,57 @@ class ImageInterface(object):
                 this does not necessarily return the disk to its initial state
                 since the indexes or download cache may have been changed by
                 the prepare method."""
-                self.__acquire_activity_lock()
+                self._acquire_activity_lock()
                 self.__reset_unlock()
-                self.__activity_lock.release()
+                self._activity_lock.release()
 
         def __reset_unlock(self):
                 """Private method. Provides a way to reset without taking the
                 activity lock. Should only be called by a thread which already
                 holds the activity lock."""
 
-                assert self.__activity_lock._is_owned()
+                assert self._activity_lock._is_owned()
 
                 # This needs to be done first so that find_root can use it.
                 self.__progresstracker.reset()
 
-                self.__img.cleanup_downloads()
-                self.__img.transport.shutdown()
+                # Ensure alternate sources are always cleared in an
+                # exception scenario.
+                self.__set_img_alt_sources(None)
+                self.__alt_sources = {}
+
+                self._img.cleanup_downloads()
+                self._img.transport.shutdown()
                 # Recreate the image object using the path the api
                 # object was created with instead of the current path.
-                self.__img = image.Image(self.__img_path,
-                    progtrack=self.__progresstracker)
-                self.__img.blocking_locks = self.__blocking_locks
+                self._img = image.Image(self._img_path,
+                    progtrack=self.__progresstracker,
+                    user_provided_dir=True,
+                    cmdpath=self.cmdpath,
+                    runid=self.__runid)
+                self._img.blocking_locks = self.__blocking_locks
+
+                lin = None
+                if self._img.linked.ischild():
+                        lin = self._img.linked.child_name
+                self.__progresstracker.set_linked_name(lin)
 
                 self.__plan_desc = None
+                self.__planned_children = False
                 self.__plan_type = None
                 self.__prepared = False
                 self.__executed = False
                 self.__be_name = None
 
-                self.__cancel_cleanup_exception()
+                self._cancel_cleanup_exception()
 
-        def __check_cancelation(self):
+        def __check_cancel(self):
                 """Private method. Provides a callback method for internal
                 code to use to determine whether the current action has been
                 canceled."""
                 return self.__canceling
 
-        def __cancel_cleanup_exception(self):
+        def _cancel_cleanup_exception(self):
                 """A private method that is called from exception handlers.
                 This is not needed if the method calls reset unlock,
                 which will call this method too.  This catches the case
@@ -2007,7 +3885,7 @@ class ImageInterface(object):
                 self.__cancel_cv.notify_all()
                 self.__cancel_lock.release()
 
-        def __cancel_done(self):
+        def _cancel_done(self):
                 """A private method that wakes any threads that have been
                 sleeping, waiting for a cancellation to finish."""
 
@@ -2042,14 +3920,19 @@ class ImageInterface(object):
                 self.__cancel_lock.release()
                 return True
 
+        def clear_history(self):
+                """Discard history information about in-progress operations."""
+                self._img.history.clear()
+
         def __set_history_PlanCreationException(self, e):
                 if e.unmatched_fmris or e.multiple_matches or \
                     e.missing_matches or e.illegal:
                         self.log_operation_end(error=e,
-                            result=history.RESULT_FAILED_BAD_REQUEST)
+                            result=RESULT_FAILED_BAD_REQUEST)
                 else:
                         self.log_operation_end(error=e)
 
+        @_LockedGenerator()
         def local_search(self, query_lst):
                 """local_search takes a list of Query objects and performs
                 each query against the installed packages of the image."""
@@ -2062,7 +3945,7 @@ class ImageInterface(object):
                         try:
                                 query = qp.parse(q.text)
                                 query_rr = qp.parse(q.text)
-                                if query_rr.remove_root(self.__img.root):
+                                if query_rr.remove_root(self._img.root):
                                         query.add_or(query_rr)
                                 if q.return_type == \
                                     query_p.Query.RETURN_PACKAGES:
@@ -2071,21 +3954,21 @@ class ImageInterface(object):
                                 raise apx.BooleanQueryException(e)
                         except query_p.ParseError, e:
                                 raise apx.ParseError(e)
-                        self.__img.update_index_dir()
-                        assert self.__img.index_dir
+                        self._img.update_index_dir()
+                        assert self._img.index_dir
                         try:
                                 query.set_info(num_to_return=q.num_to_return,
                                     start_point=q.start_point,
-                                    index_dir=self.__img.index_dir,
+                                    index_dir=self._img.index_dir,
                                     get_manifest_path=\
-                                        self.__img.get_manifest_path,
+                                        self._img.get_manifest_path,
                                     gen_installed_pkg_names=\
-                                        self.__img.gen_installed_pkg_names,
+                                        self._img.gen_installed_pkg_names,
                                     case_sensitive=q.case_sensitive)
                                 res = query.search(
-                                    self.__img.gen_installed_pkgs,
-                                    self.__img.get_manifest_path,
-                                    self.__img.list_excludes())
+                                    self._img.gen_installed_pkgs,
+                                    self._img.get_manifest_path,
+                                    self._img.list_excludes())
                         except search_errors.InconsistentIndexException, e:
                                 raise apx.InconsistentIndexException(e)
                         # i is being inserted to track which query the results
@@ -2141,6 +4024,7 @@ class ImageInterface(object):
                 else:
                         raise apx.ServerReturnError(line)
 
+        @_LockedGenerator()
         def remote_search(self, query_str_and_args_lst, servers=None,
             prune_versions=True):
                 """This function takes a list of Query objects, and optionally
@@ -2159,49 +4043,12 @@ class ImageInterface(object):
                 it is possible to get deadlocks or NRLock reentrance
                 exceptions."""
 
-                clean_exit = True
-                canceled = False
-
-                self.__acquire_activity_lock()
-                self.__enable_cancel()
-                try:
-                        for r in self._remote_search(query_str_and_args_lst,
-                            servers, prune_versions):
-                                yield r
-                except GeneratorExit:
-                        return
-                except apx.CanceledException:
-                        canceled = True
-                        raise
-                except Exception:
-                        clean_exit = False
-                        raise
-                finally:
-                        if canceled:
-                                self.__cancel_done()
-                        elif clean_exit:
-                                try:
-                                        self.__disable_cancel()
-                                except apx.CanceledException:
-                                        self.__cancel_done()
-                                        self.__activity_lock.release()
-                                        raise
-                        else:
-                                self.__cancel_cleanup_exception()
-                        self.__activity_lock.release()
-
-        def _remote_search(self, query_str_and_args_lst, servers=None,
-            prune_versions=True):
-                """This is the implementation of remote_search.  The other
-                function is a wrapper that handles locking and exception
-                handling.  This is a generator function."""
-
                 failed = []
                 invalid = []
                 unsupported = []
 
                 if not servers:
-                        servers = self.__img.gen_publishers()
+                        servers = self._img.gen_publishers()
 
                 new_qs = []
                 l = query_p.QueryLexer()
@@ -2211,7 +4058,7 @@ class ImageInterface(object):
                         try:
                                 query = qp.parse(q.text)
                                 query_rr = qp.parse(q.text)
-                                if query_rr.remove_root(self.__img.root):
+                                if query_rr.remove_root(self._img.root):
                                         query.add_or(query_rr)
                                 if q.return_type == \
                                     query_p.Query.RETURN_PACKAGES:
@@ -2228,28 +4075,39 @@ class ImageInterface(object):
 
                 incorp_info, inst_stems = self.get_incorp_info()
 
-                for pub in servers:
+                slist = []
+                for entry in servers:
                         descriptive_name = None
-
-                        if self.__canceling:
-                                raise apx.CanceledException()
-
-                        if isinstance(pub, dict):
-                                origin = pub["origin"]
+                        if isinstance(entry, dict):
+                                origin = entry["origin"]
                                 try:
-                                        pub = self.__img.get_publisher(
+                                        pub = self._img.get_publisher(
                                             origin=origin)
                                 except apx.UnknownPublisher:
                                         pub = publisher.RepositoryURI(origin)
                                         descriptive_name = origin
+                                slist.append((pub, None, descriptive_name))
+                                continue
 
-                        if not descriptive_name:
-                                descriptive_name = pub.prefix
+                        # Must be a publisher object.
+                        osets = entry.get_origin_sets()
+                        if not osets:
+                                unsupported.append((entry.prefix,
+                                    apx.NoPublisherRepositories(
+                                    entry.prefix)))
+                                continue
+                        for repo in osets:
+                                slist.append((entry, repo, entry.prefix))
+
+                for pub, alt_repo, descriptive_name in slist:
+                        if self.__canceling:
+                                raise apx.CanceledException()
 
                         try:
-                                res = self.__img.transport.do_search(pub,
+                                res = self._img.transport.do_search(pub,
                                     query_str_and_args_lst,
-                                    ccancel=self.__check_cancelation)
+                                    ccancel=self.__check_cancel,
+                                    alt_repo=alt_repo)
                         except apx.CanceledException:
                                 raise
                         except apx.NegativeSearchResult:
@@ -2314,10 +4172,10 @@ class ImageInterface(object):
                 # This maps fmris to the version at which they're incorporated.
                 inc_vers = {}
                 inst_stems = {}
-                brelease = self.__img.attrs["Build-Release"]
+                brelease = self._img.attrs["Build-Release"]
 
-                img_cat = self.__img.get_catalog(
-                    self.__img.IMG_CATALOG_INSTALLED)
+                img_cat = self._img.get_catalog(
+                    self._img.IMG_CATALOG_INSTALLED)
                 cat_info = frozenset([img_cat.DEPENDENCY])
 
                 # The incorporation list should include all installed,
@@ -2371,16 +4229,16 @@ class ImageInterface(object):
                 performing the incremental update which is usually used.
                 This is useful for times when the index for the client has
                 been corrupted."""
-                self.__img.update_index_dir()
+                self._img.update_index_dir()
                 self.log_operation_start("rebuild-index")
-                if not os.path.isdir(self.__img.index_dir):
-                        self.__img.mkdirs()
+                if not os.path.isdir(self._img.index_dir):
+                        self._img.mkdirs()
                 try:
-                        ind = indexer.Indexer(self.__img, self.__img.get_manifest,
-                            self.__img.get_manifest_path,
-                            self.__progresstracker, self.__img.list_excludes())
+                        ind = indexer.Indexer(self._img, self._img.get_manifest,
+                            self._img.get_manifest_path,
+                            self.__progresstracker, self._img.list_excludes())
                         ind.rebuild_index_from_scratch(
-                            self.__img.gen_installed_pkgs())
+                            self._img.gen_installed_pkgs())
                 except search_errors.ProblematicPermissionsIndexException, e:
                         error = apx.ProblematicPermissionsIndexException(e)
                         self.log_operation_end(error=error)
@@ -2388,14 +4246,25 @@ class ImageInterface(object):
                 else:
                         self.log_operation_end()
 
-        def get_manifest(self, pfmri, all_variants=True):
+        def get_manifest(self, pfmri, all_variants=True, repos=None):
                 """Returns the Manifest object for the given package FMRI.
 
                 'all_variants' is an optional boolean value indicating whther
                 the manifest should include metadata for all variants.
+
+                'repos' is a list of URI strings or RepositoryURI objects that
+                represent the locations of additional sources of package data to
+                use during the planned operation.
                 """
 
-                return self.__img.get_manifest(pfmri, all_variants=all_variants)
+                alt_pub = None
+                if repos:
+                        pkg_pub_map, ignored, known_cat, inst_cat = \
+                            self.__get_alt_pkg_data(repos)
+                        alt_pub = pkg_pub_map.get(pfmri.publisher, {}).get(
+                            pfmri.pkg_name, {}).get(str(pfmri.version), None)
+                return self._img.get_manifest(pfmri, all_variants=all_variants,
+                    alt_pub=alt_pub)
 
         @staticmethod
         def validate_response(res, v):
@@ -2411,40 +4280,25 @@ class ImageInterface(object):
 
         def add_publisher(self, pub, refresh_allowed=True,
             approved_cas=misc.EmptyI, revoked_cas=misc.EmptyI,
+            search_after=None, search_before=None, search_first=None,
             unset_cas=misc.EmptyI):
                 """Add the provided publisher object to the image
                 configuration."""
                 try:
-                        self.__img.add_publisher(pub,
+                        self._img.add_publisher(pub,
                             refresh_allowed=refresh_allowed,
                             progtrack=self.__progresstracker,
                             approved_cas=approved_cas, revoked_cas=revoked_cas,
+                            search_after=search_after,
+                            search_before=search_before,
+                            search_first=search_first,
                             unset_cas=unset_cas)
                 finally:
-                        self.__img.cleanup_downloads()
+                        self._img.cleanup_downloads()
 
-        def get_pub_search_order(self):
-                """Return current search order of publishers; includes
-                disabled publishers"""
-                return self.__img.cfg.get_property("property",
-                    "publisher-search-order")
-
-        def set_pub_search_after(self, being_moved_prefix, staying_put_prefix):
-                """Change the publisher search order so that being_moved is
-                searched after staying_put"""
-                self.__img.pub_search_after(being_moved_prefix,
-                    staying_put_prefix)
-
-        def set_pub_search_before(self, being_moved_prefix, staying_put_prefix):
-                """Change the publisher search order so that being_moved is
-                searched before staying_put"""
-                self.__img.pub_search_before(being_moved_prefix,
-                    staying_put_prefix)
-
-        def get_preferred_publisher(self):
-                """Returns the preferred publisher object for the image."""
-                return self.get_publisher(
-                    prefix=self.__img.get_preferred_publisher())
+        def get_highest_ranked_publisher(self):
+                """Returns the highest ranked publisher object for the image."""
+                return self._img.get_highest_ranked_publisher()
 
         def get_publisher(self, prefix=None, alias=None, duplicate=False):
                 """Retrieves a publisher object matching the provided prefix
@@ -2454,7 +4308,7 @@ class ImageInterface(object):
                 a copy of the publisher object should be returned instead
                 of the original.
                 """
-                pub = self.__img.get_publisher(prefix=prefix, alias=alias)
+                pub = self._img.get_publisher(prefix=prefix, alias=alias)
                 if duplicate:
                         # Never return the original so that changes to the
                         # retrieved object are not reflected until
@@ -2462,6 +4316,7 @@ class ImageInterface(object):
                         return copy.copy(pub)
                 return pub
 
+        @_LockedCancelable()
         def get_publisherdata(self, pub=None, repo=None):
                 """Attempts to retrieve publisher configuration information from
                 the specified publisher's repository or the provided repository.
@@ -2484,22 +4339,8 @@ class ImageInterface(object):
                 # made in the client API for clarity.
                 pub = max(pub, repo)
 
-                self.__activity_lock.acquire()
-                try:
-                        self.__enable_cancel()
-                        data = self.__img.transport.get_publisherdata(pub,
-                            ccancel=self.__check_cancelation)
-                        self.__disable_cancel()
-                        return data
-                except apx.CanceledException:
-                        self.__cancel_done()
-                        raise
-                except:
-                        self.__cancel_cleanup_exception()
-                        raise
-                finally:
-                        self.__img.cleanup_downloads()
-                        self.__activity_lock.release()
+                return self._img.transport.get_publisherdata(pub,
+                    ccancel=self.__check_cancel)
 
         def get_publishers(self, duplicate=False):
                 """Returns a list of the publisher objects for the current
@@ -2509,17 +4350,11 @@ class ImageInterface(object):
                 copies of the publisher objects should be returned instead
                 of the originals.
                 """
+
+                res = self._img.get_sorted_publishers()
                 if duplicate:
-                        # Return a copy so that changes to the retrieved objects
-                        # are not reflected until update_publisher is called.
-                        pubs = [
-                            copy.copy(p)
-                            for p in self.__img.get_publishers().values()
-                        ]
-                else:
-                        pubs = self.__img.get_publishers().values()
-                return misc.get_sorted_publishers(pubs,
-                    preferred=self.__img.get_preferred_publisher())
+                        return [copy.copy(p) for p in res]
+                return res
 
         def get_publisher_last_update_time(self, prefix=None, alias=None):
                 """Returns a datetime object representing the last time the
@@ -2534,39 +4369,36 @@ class ImageInterface(object):
                         return None
 
                 dt = None
-                self.__acquire_activity_lock()
+                self._acquire_activity_lock()
                 try:
-                        self.__enable_cancel()
+                        self._enable_cancel()
                         try:
                                 dt = pub.catalog.last_modified
                         except:
                                 self.__reset_unlock()
                                 raise
                         try:
-                                self.__disable_cancel()
+                                self._disable_cancel()
                         except apx.CanceledException:
-                                self.__cancel_done()
+                                self._cancel_done()
                                 raise
                 finally:
-                        self.__activity_lock.release()
+                        self._activity_lock.release()
                 return dt
 
         def has_publisher(self, prefix=None, alias=None):
                 """Returns a boolean value indicating whether a publisher using
                 the given prefix or alias exists."""
-                return self.__img.has_publisher(prefix=prefix, alias=alias)
+                return self._img.has_publisher(prefix=prefix, alias=alias)
 
         def remove_publisher(self, prefix=None, alias=None):
                 """Removes a publisher object matching the provided prefix
                 (name) or alias."""
-                self.__img.remove_publisher(prefix=prefix, alias=alias,
+                self._img.remove_publisher(prefix=prefix, alias=alias,
                     progtrack=self.__progresstracker)
 
-        def set_preferred_publisher(self, prefix=None, alias=None):
-                """Sets the preferred publisher for the image."""
-                self.__img.set_preferred_publisher(prefix=prefix, alias=alias)
-
-        def update_publisher(self, pub, refresh_allowed=True):
+        def update_publisher(self, pub, refresh_allowed=True, search_after=None,
+            search_before=None, search_first=None):
                 """Replaces an existing publisher object with the provided one
                 using the _source_object_id identifier set during copy.
 
@@ -2576,27 +4408,36 @@ class ImageInterface(object):
                 repository, mirror, or origin.  If False, no attempt will be
                 made to retrieve publisher metadata."""
 
-                self.__acquire_activity_lock()
+                self._acquire_activity_lock()
                 try:
-                        self.__disable_cancel()
-                        with self.__img.locked_op("update-publisher"):
+                        self._disable_cancel()
+                        with self._img.locked_op("update-publisher"):
                                 return self.__update_publisher(pub,
-                                    refresh_allowed=refresh_allowed)
+                                    refresh_allowed=refresh_allowed,
+                                    search_after=search_after,
+                                    search_before=search_before,
+                                    search_first=search_first)
                 except apx.CanceledException, e:
-                        self.__cancel_done()
+                        self._cancel_done()
                         raise
                 finally:
-                        self.__img.cleanup_downloads()
-                        self.__activity_lock.release()
+                        self._img.cleanup_downloads()
+                        self._activity_lock.release()
 
-        def __update_publisher(self, pub, refresh_allowed=True):
+        def __update_publisher(self, pub, refresh_allowed=True,
+            search_after=None, search_before=None, search_first=None):
                 """Private publisher update method; caller responsible for
                 locking."""
 
-                if pub.disabled and \
-                    pub.prefix == self.__img.get_preferred_publisher():
-                        raise apx.SetPreferredPublisherDisabled(
-                            pub.prefix)
+                assert (not search_after and not search_before) or \
+                    (not search_after and not search_first) or \
+                    (not search_before and not search_first)
+
+                # Before continuing, validate SSL information.
+                try:
+                        self._img.check_cert_validity(pubs=[pub])
+                except apx.ExpiringCertificate, e:
+                        logger.error(str(e))
 
                 def origins_changed(oldr, newr):
                         old_origins = set([
@@ -2622,13 +4463,8 @@ class ImageInterface(object):
                                 # retrieve the catalog.
                                 return True
 
-                        if len(newo.repositories) != len(oldo.repositories):
-                                # If there are an unequal number of repositories
-                                # then some have been added or removed.
-                                return True
-
-                        oldr = oldo.selected_repository
-                        newr = newo.selected_repository
+                        oldr = oldo.repository
+                        newr = newo.repository
                         if newr._source_object_id != id(oldr):
                                 # Selected repository has changed.
                                 return True
@@ -2637,7 +4473,9 @@ class ImageInterface(object):
                 refresh_catalog = False
                 disable = False
                 orig_pub = None
-                publishers = self.__img.get_publishers()
+
+                # Configuration must be manipulated directly.
+                publishers = self._img.cfg.publishers
 
                 # First, attempt to match the updated publisher object to an
                 # existing one using the object id that was stored during
@@ -2686,9 +4524,9 @@ class ImageInterface(object):
 
                                 # Prepare the new publisher object.
                                 pub.meta_root = \
-                                    self.__img._get_publisher_meta_root(
+                                    self._img._get_publisher_meta_root(
                                     pub.prefix)
-                                pub.transport = self.__img.transport
+                                pub.transport = self._img.transport
 
                                 # Finally, add the new publisher object.
                                 publishers[pub.prefix] = pub
@@ -2698,25 +4536,25 @@ class ImageInterface(object):
                         new_id, old_pub = orig_pub
                         for new_pfx, new_pub in publishers.iteritems():
                                 if id(new_pub) == new_id:
-                                        del publishers[new_pfx]
                                         publishers[old_pub.prefix] = old_pub
                                         break
 
-                repo = pub.selected_repository
-                if not repo.origins:
-                        raise apx.PublisherOriginRequired(pub.prefix)
+                repo = pub.repository
 
-                validate = origins_changed(orig_pub[-1].selected_repository,
-                    pub.selected_repository)
+                validate = origins_changed(orig_pub[-1].repository,
+                    pub.repository)
 
                 try:
-                        if disable:
+                        if disable or (not repo.origins and
+                            orig_pub[-1].repository.origins):
                                 # Remove the publisher's metadata (such as
                                 # catalogs, etc.).  This only needs to be done
-                                # in the event that a publisher is disabled; in
-                                # any other case (the origin changing, etc.),
-                                # refresh() will do the right thing.
-                                self.__img.remove_publisher_metadata(pub)
+                                # in the event that a publisher is disabled or
+                                # has transitioned from having origins to not
+                                # having any at all; in any other case (the
+                                # origins changing, etc.), refresh() will do the
+                                # right thing.
+                                self._img.remove_publisher_metadata(pub)
                         elif not pub.disabled and not refresh_catalog:
                                 refresh_catalog = pub.needs_refresh
 
@@ -2726,7 +4564,7 @@ class ImageInterface(object):
                                 # revalidated.
 
                                 if validate:
-                                        self.__img.transport.valid_publisher_test(
+                                        self._img.transport.valid_publisher_test(
                                             pub)
 
                                 # Validate all new origins against publisher
@@ -2758,8 +4596,16 @@ class ImageInterface(object):
                         cleanup()
                         raise
 
+                if search_first:
+                        self._img.set_highest_ranked_publisher(
+                            prefix=pub.prefix)
+                elif search_before:
+                        self._img.pub_search_before(pub.prefix, search_before)
+                elif search_after:
+                        self._img.pub_search_after(pub.prefix, search_after)
+
                 # Successful; so save configuration.
-                self.__img.save_config()
+                self._img.save_config()
 
         def log_operation_end(self, error=None, result=None):
                 """Marks the end of an operation to be recorded in image
@@ -2771,17 +4617,30 @@ class ImageInterface(object):
                 be based on the class of 'error' and 'error' will be recorded
                 for the current operation.  If 'result' and 'error' is not
                 provided, success is assumed."""
-                self.__img.history.log_operation_end(error=error, result=result)
+                self._img.history.log_operation_end(error=error, result=result)
 
         def log_operation_error(self, error):
                 """Adds an error to the list of errors to be recorded in image
                 history for the current opreation."""
-                self.__img.history.log_operation_error(error)
+                self._img.history.log_operation_error(error)
 
         def log_operation_start(self, name):
                 """Marks the start of an operation to be recorded in image
                 history."""
-                self.__img.history.log_operation_start(name)
+                be_name, be_uuid = bootenv.BootEnv.get_be_name(self._img.root)
+                self._img.history.log_operation_start(name,
+                    be_name=be_name, be_uuid=be_uuid)
+
+        def parse_liname(self, name, unknown_ok=False):
+                """Parse a linked image name string and return a
+                LinkedImageName object.  If "unknown_ok" is true then
+                liname must correspond to an existing linked image.  If
+                "unknown_ok" is false and liname doesn't correspond to
+                an existing linked image then liname must be a
+                syntactically valid and fully qualified linked image
+                name."""
+
+                return self._img.linked.parse_name(name, unknown_ok=unknown_ok)
 
         def parse_p5i(self, data=None, fileobj=None, location=None):
                 """Reads the pkg(5) publisher JSON formatted data at 'location'
@@ -2833,38 +4692,71 @@ class ImageInterface(object):
                                 wildcards.
                 """
 
-                brelease = self.__img.attrs["Build-Release"]
+                brelease = self._img.attrs["Build-Release"]
                 for pat in patterns:
                         error = None
                         matcher = None
                         npat = None
                         try:
-                                if "*" in pat or "?" in pat:
-                                        # XXX By default, matching FMRIs
-                                        # currently do not also use
-                                        # MatchingVersion.  If that changes,
-                                        # this should  change too.
-                                        parts = pat.split("@", 1)
-                                        if len(parts) == 1:
-                                                npat = fmri.MatchingPkgFmri(pat,
-                                                    brelease)
-                                        else:
-                                                npat = fmri.MatchingPkgFmri(
-                                                    parts[0], brelease)
-                                                npat.version = \
-                                                    pkg.version.MatchingVersion(
-                                                    str(parts[1]), brelease)
+                                parts = pat.split("@", 1)
+                                pat_stem = parts[0]
+                                pat_ver = None
+                                if len(parts) > 1:
+                                        pat_ver = parts[1]
+
+                                if "*" in pat_stem or "?" in pat_stem:
                                         matcher = self.MATCH_GLOB
-                                elif pat.startswith("pkg:/"):
-                                        npat = fmri.PkgFmri(pat, brelease)
+                                elif pat_stem.startswith("pkg:/") or \
+                                    pat_stem.startswith("/"):
                                         matcher = self.MATCH_EXACT
                                 else:
-                                        npat = pkg.fmri.PkgFmri(pat, brelease)
                                         matcher = self.MATCH_FMRI
+
+                                if matcher == self.MATCH_GLOB:
+                                        npat = fmri.MatchingPkgFmri(pat_stem,
+                                            brelease)
+                                else:
+                                        npat = fmri.PkgFmri(pat_stem, brelease)
+
+                                if not pat_ver:
+                                        # Do nothing.
+                                        pass
+                                elif "*" in pat_ver or "?" in pat_ver or \
+                                    pat_ver == "latest":
+                                        npat.version = \
+                                            pkg.version.MatchingVersion(pat_ver,
+                                                brelease)
+                                else:
+                                        npat.version = \
+                                            pkg.version.Version(pat_ver,
+                                                brelease)
+
                         except (fmri.FmriError, pkg.version.VersionError), e:
                                 # Whatever the error was, return it.
                                 error = e
                         yield (pat, error, npat, matcher)
+
+        def purge_history(self):
+                """Deletes all client history."""
+                be_name, be_uuid = bootenv.BootEnv.get_be_name(self._img.root)
+                self._img.history.purge(be_name=be_name, be_uuid=be_uuid)
+
+        def update_format(self):
+                """Attempt to update the on-disk format of the image to the
+                newest version.  Returns a boolean indicating whether any action
+                was taken."""
+
+                self._acquire_activity_lock()
+                try:
+                        self._disable_cancel()
+                        self._img.allow_ondisk_upgrade = True
+                        return self._img.update_format(
+                            progtrack=self.__progresstracker)
+                except apx.CanceledException, e:
+                        self._cancel_done()
+                        raise
+                finally:
+                        self._activity_lock.release()
 
         def write_p5i(self, fileobj, pkg_names=None, pubs=None):
                 """Writes the publisher, repository, and provided package names
@@ -2891,7 +4783,7 @@ class ImageInterface(object):
                         plist = []
                         for p in pubs:
                                 if not isinstance(p, publisher.Publisher):
-                                        plist.append(self.__img.get_publisher(
+                                        plist.append(self._img.get_publisher(
                                             prefix=p, alias=p))
                                 else:
                                         plist.append(p)
@@ -2908,6 +4800,26 @@ class ImageInterface(object):
                                         pkglist.append(p)
                         new_pkg_names[pub] = pkglist
                 p5i.write(fileobj, plist, pkg_names=new_pkg_names)
+
+        def write_syspub(self, path, prefixes, version):
+                """Write the syspub/version response to the provided path."""
+                if version != 0:
+                        raise apx.UnsupportedP5SVersion(version)
+
+                pubs = [
+                    p for p in self.get_publishers()
+                    if p.prefix in prefixes
+                ]
+                fd, fp = tempfile.mkstemp()
+                try:
+                        fh = os.fdopen(fd, "wb")
+                        p5s.write(fh, pubs, self._img.cfg)
+                        fh.close()
+                        portable.rename(fp, path)
+                except:
+                        if os.path.exists(fp):
+                                portable.remove(fp)
+                        raise
 
 
 class Query(query_p.Query):
@@ -2928,17 +4840,41 @@ class Query(query_p.Query):
 class PlanDescription(object):
         """A class which describes the changes the plan will make."""
 
-        def __init__(self, img, new_be):
+        def __init__(self, img, backup_be, backup_be_name, new_be, be_activate,
+            be_name):
                 self.__plan = img.imageplan
-                self.__img = img
+                self._img = img
+                self.__backup_be = backup_be
+                self.__backup_be_name = backup_be_name
                 self.__new_be = new_be
+                self.__be_activate = be_activate
+                self.__be_name = be_name
 
         def get_services(self):
                 """Returns a list of services affected in this plan."""
                 return self.__plan.services
 
+        def get_mediators(self):
+                """Returns a list of strings contianing mediator changes in this
+                plan"""
+                return self.__plan.mediators_to_strings()
+
+        def get_parsable_mediators(self):
+                """Returns a list of mediator changes in this plan"""
+                return self.__plan.mediators
+        
         def get_varcets(self):
-                """Returns a list of variant/facet changes in this plan"""
+                """Returns a formatted list of strings representing the
+                variant/facet changes in this plan"""
+                vs, fs = self.__plan.varcets
+                ret = []
+                ret.extend(["variant %s: %s" % a for a in vs])
+                ret.extend(["  facet %s: %s" % a for a in fs])
+                return ret
+
+        def get_parsable_varcets(self):
+                """Returns a tuple of two lists containing the facet and variant
+                changes in this plan."""
                 return self.__plan.varcets
 
         def get_changes(self):
@@ -2956,7 +4892,8 @@ class PlanDescription(object):
                 and 'dest_pi' is the new version of the package it is
                 being upgraded to."""
 
-                for pp in self.__plan.pkg_plans:
+                for pp in sorted(self.__plan.pkg_plans,
+                    key=operator.attrgetter("origin_fmri", "destination_fmri")):
                         yield (PackageInfo.build_from_fmri(pp.origin_fmri),
                             PackageInfo.build_from_fmri(pp.destination_fmri))
 
@@ -2997,20 +4934,89 @@ class PlanDescription(object):
                                 src_li = None
                                 if src:
                                         src_li = LicenseInfo(pp.origin_fmri,
-                                            src, img=self.__img)
+                                            src, img=self._img)
 
                                 dest = entry["dest"]
                                 dest_li = None
                                 if dest:
                                         dest_li = LicenseInfo(
                                             pp.destination_fmri, dest,
-                                            img=self.__img)
+                                            img=self._img)
 
                                 yield (pp.destination_fmri, src_li, dest_li,
                                     entry["accepted"], entry["displayed"])
 
                         if pfmri:
                                 break
+
+        def get_salvaged(self):
+                """Returns a list of tuples of items that were salvaged during
+                plan execution.  Each tuple is of the form (original_path,
+                salvage_path).  Where 'original_path' is the path of the item
+                before it was salvaged, and 'salvage_path' is where the item was
+                moved to.  This method only has useful information after plan
+                execution."""
+
+                if self.__plan.state not in (ip.EXECUTED_OK, ip.EXECUTED_ERROR):
+                        # Return an empty list so that the type matches with
+                        # self.__plan.salvaged.
+                        return []
+                return copy.copy(self.__plan.salvaged)
+
+        def get_solver_errors(self):
+                """Returns a list of strings for all FMRIs evaluated by the
+                solver explaining why they were rejected.  (All packages
+                found in solver's trim database.)  Only available if
+                DebugValues["plan"] was set when the plan was created.
+                """
+
+                if not DebugValues["plan"]:
+                        return []
+
+                return self.__plan.get_solver_errors()
+
+        @property
+        def activate_be(self):
+                """A boolean value indicating whether any new boot environment
+                will be set active on next boot."""
+                return self.__be_activate
+
+        @property
+        def backup_be(self):
+                """A boolean value indicating that execution of the plan will
+                result in a backup clone of the current live environment."""
+                return self.__backup_be
+
+        @property
+        def backup_be_name(self):
+                """A value containing either the name of the backup boot
+                environment to create or None."""
+                return self.__backup_be_name
+ 
+        @property
+        def be_name(self):
+                """A value containing either the name of the boot environment to
+                create or None."""
+                return self.__be_name
+
+        @property
+        def is_active_root_be(self):
+                """A boolean indicating whether the image to be modified is the
+                active BE for the system's root image."""
+
+                if not self._img.is_liveroot() or self._img.is_zone():
+                        return False
+
+                try:
+                        be_name, be_uuid = bootenv.BootEnv.get_be_name(
+                            self._img.root)
+                        return be_name == \
+                            bootenv.BootEnv.get_activated_be_name()
+                except apx.BEException:
+                        # If boot environment logic isn't supported, return
+                        # False.  This is necessary for user images and for
+                        # the test suite.
+                        return False
 
         @property
         def reboot_needed(self):
@@ -3031,12 +5037,73 @@ class PlanDescription(object):
                 will be rebuilt"""
                 return self.__plan.boot_archive_needed()
 
+        @property
+        def bytes_added(self):
+                """Estimated number of bytes added"""
+                return self.__plan.bytes_added
+
+        @property
+        def cbytes_added(self):
+                """Estimated number of download cache bytes added"""
+                return self.__plan.cbytes_added
+
+        @property
+        def bytes_avail(self):
+                """Estimated number of bytes available in image /"""
+                return self.__plan.bytes_avail
+
+        @property
+        def cbytes_avail(self):
+                """Estimated number of bytes available in download cache"""
+                return self.__plan.cbytes_avail
+
+
+def get_default_image_root(orig_cwd=None):
+        """Returns a tuple of (root, exact_match) where 'root' is the absolute
+        path of the default image root based on current environment given the
+        client working directory and platform defaults, and 'exact_match' is a
+        boolean specifying how the default should be treated by ImageInterface.
+        Note that the root returned may not actually be the valid root of an
+        image; it is merely the default location a client should use when
+        initializing an ImageInterface (e.g. '/' is not a valid image on Solaris
+        10).
+
+        The ImageInterface object will use the root provided as a starting point
+        to find an image, searching upwards through each parent directory until
+        '/' is reached based on the value of exact_match.
+
+        'orig_cwd' should be the original current working directory at the time
+        of client startup.  This value is assumed to be valid if provided,
+        although permission and access errors will be gracefully handled.
+        """
+
+        # If an image location wasn't explicitly specified, check $PKG_IMAGE in
+        # the environment.
+        root = os.environ.get("PKG_IMAGE")
+        exact_match = True
+        if not root:
+                if os.environ.get("PKG_FIND_IMAGE") or \
+                    portable.osname != "sunos":
+                        # If no image location was found in the environment,
+                        # then see if user enabled finding image or if current
+                        # platform isn't Solaris.  If so, attempt to find the
+                        # image starting with the working directory.
+                        root = orig_cwd
+                        if root:
+                                exact_match = False
+                if not root:
+                        # If no image directory has been determined based on
+                        # request or environment, default to live root.
+                        root = misc.liveroot()
+        return root, exact_match
+
 
 def image_create(pkg_client_name, version_id, root, imgtype, is_zone,
     cancel_state_callable=None, facets=misc.EmptyDict, force=False,
     mirrors=misc.EmptyI, origins=misc.EmptyI, prefix=None, refresh_allowed=True,
     repo_uri=None, ssl_cert=None, ssl_key=None, user_provided_dir=False,
-    progtrack=None, variants=misc.EmptyDict, props=misc.EmptyDict):
+    progtrack=None, variants=misc.EmptyDict, props=misc.EmptyDict,
+    cmdpath=None):
         """Creates an image at the specified location.
 
         'pkg_client_name' is a string containing the name of the client,
@@ -3116,19 +5183,20 @@ def image_create(pkg_client_name, version_id, root, imgtype, is_zone,
         the image creation process.
 
         Callers must provide one of the following when calling this function:
+         * no 'prefix' and no 'origins'
          * a 'prefix' and 'repo_uri' (origins and mirrors are optional)
          * no 'prefix' and a 'repo_uri'  (origins and mirrors are optional)
          * a 'prefix' and 'origins'
         """
 
         # Caller must provide a prefix and repository, or no prefix and a
-        # repository, or a prefix and origins.
+        # repository, or a prefix and origins, or no prefix and no origins.
         assert (prefix and repo_uri) or (not prefix and repo_uri) or (prefix and
-            origins)
+            origins or (not prefix and not origins))
 
-        # If prefix isn't provided, and refresh isn't allowed, then auto-config
+        # If prefix isn't provided and refresh isn't allowed, then auto-config
         # cannot be done.
-        assert not repo_uri or (repo_uri and refresh_allowed)
+        assert (prefix or refresh_allowed) or not repo_uri
 
         destroy_root = False
         try:
@@ -3143,10 +5211,13 @@ def image_create(pkg_client_name, version_id, root, imgtype, is_zone,
         # needed to retrieve publisher configuration information.
         img = image.Image(root, force=force, imgtype=imgtype,
             progtrack=progtrack, should_exist=False,
-            user_provided_dir=user_provided_dir)
-
+            user_provided_dir=user_provided_dir, cmdpath=cmdpath,
+            props=props)
         api_inst = ImageInterface(img, version_id,
-            progtrack, cancel_state_callable, pkg_client_name)
+            progtrack, cancel_state_callable, pkg_client_name,
+            cmdpath=cmdpath)
+
+        pubs = []
 
         try:
                 if repo_uri:
@@ -3178,14 +5249,14 @@ def image_create(pkg_client_name, version_id, root, imgtype, is_zone,
 
                         if repo_uri:
                                 for p in pubs:
-                                        psrepo = p.selected_repository
+                                        psrepo = p.repository
                                         if not psrepo:
                                                 # Repository configuration info
                                                 # was not provided, so assume
                                                 # origin is repo_uri.
-                                                p.add_repository(
+                                                p.repository = \
                                                     publisher.Repository(
-                                                    origins=[repo_uri]))
+                                                    origins=[repo_uri])
                                         elif not psrepo.origins:
                                                 # Repository configuration was
                                                 # provided, but without an
@@ -3210,7 +5281,7 @@ def image_create(pkg_client_name, version_id, root, imgtype, is_zone,
                         for m in mirrors:
                                 repo.add_mirror(m)
                         pub = publisher.Publisher(prefix,
-                            repositories=[repo])
+                            repository=repo)
                         pubs = [pub]
 
                 if prefix and prefix not in pubs:
@@ -3230,7 +5301,7 @@ def image_create(pkg_client_name, version_id, root, imgtype, is_zone,
                 # Add additional origins and mirrors that weren't found in the
                 # publisher configuration if provided.
                 for p in pubs:
-                        pr = p.selected_repository
+                        pr = p.repository
                         for o in origins:
                                 if not pr.has_origin(o):
                                         pr.add_origin(o)
@@ -3240,11 +5311,15 @@ def image_create(pkg_client_name, version_id, root, imgtype, is_zone,
 
                 # Set provided SSL Cert/Key for all configured publishers.
                 for p in pubs:
-                        repo = p.selected_repository
+                        repo = p.repository
                         for o in repo.origins:
+                                if o.scheme not in publisher.SSL_SCHEMES:
+                                        continue
                                 o.ssl_cert = ssl_cert
                                 o.ssl_key = ssl_key
                         for m in repo.mirrors:
+                                if m.scheme not in publisher.SSL_SCHEMES:
+                                        continue
                                 m.ssl_cert = ssl_cert
                                 m.ssl_key = ssl_key
 
@@ -3273,4 +5348,3 @@ def image_create(pkg_client_name, version_id, root, imgtype, is_zone,
         img.cleanup_downloads()
 
         return api_inst
-

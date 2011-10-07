@@ -21,7 +21,7 @@
 #
 
 #
-# Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2008, 2011, Oracle and/or its affiliates. All rights reserved.
 #
 
 import testutils
@@ -329,40 +329,6 @@ class TestPkgDepot(pkg5unittest.SingleDepotTestCase):
                 shutil.rmtree(dpath)
                 self.dc.set_repodir(opath)
 
-        def test_repo_file_only(self):
-                """Test that if a depot is created with only --file-root
-                supplied, it comes up in mirror mode, with only file content
-                available."""
-
-                if self.dc.is_alive():
-                        self.dc.stop()
-
-                fpath = os.path.join(self.test_root, "var/pkg/download")
-                os.makedirs(fpath, misc.PKG_DIR_MODE)
-                opath = self.dc.get_repodir()
-                self.dc.set_repodir(None)
-                self.dc.set_file_root(fpath)
-                self.dc.set_readwrite()
-                self.dc.start()
-                self.assert_(self.dc.is_alive())
-
-                durl = self.dc.get_depot_url()
-                verdata = urllib2.urlopen("%s/versions/0/" % durl)
-                verlines = verdata.readlines()
-                verdict = dict(
-                    s.split(None, 1)
-                    for s in (l.strip() for l in verlines)
-                )
-
-                self.assert_("file" in verdict)
-                self.assert_("catalog" not in verdict)
-                self.assert_("manifest" not in verdict)
-
-                self.dc.stop()
-                self.dc.set_repodir(opath)
-                self.dc.set_file_root(None)
-
-
         def test_append_reopen(self):
                 """Test that if a depot has a partially finished append
                 transaction, that it reopens it correctly."""
@@ -443,7 +409,7 @@ class TestDepotController(pkg5unittest.CliTestCase):
                 self.__dc.kill()
 
         def testStartStop(self):
-                self.__dc.set_port(12000)
+                self.__dc.set_port(self.next_free_port)
                 for i in range(0, 5):
                         self.__dc.start()
                         self.assert_(self.__dc.is_alive())
@@ -454,7 +420,7 @@ class TestDepotController(pkg5unittest.CliTestCase):
                 cfg_file = os.path.join(self.test_root, "cfg2")
                 fh = open(cfg_file, "w")
                 fh.close()
-                self.__dc.set_port(12000)
+                self.__dc.set_port(self.next_free_port)
                 self.__dc.set_cfg_file(cfg_file)
                 self.__dc.start()
 
@@ -507,17 +473,15 @@ class TestDepotController(pkg5unittest.CliTestCase):
                                         time.sleep(1)
                         self.assert_(got)
 
-                self.__dc.set_port(12000)
+                self.__dc.set_port(self.next_free_port)
                 durl = self.__dc.get_depot_url()
 
                 repo = self.__dc.get_repo()
                 pub = repo.get_publisher("test")
-                pub_repo = pub.selected_repository
+                pub_repo = pub.repository
                 if not pub_repo:
                         pub_repo = publisher.Repository()
-                        while pub.repositories:
-                                pub.repositories.pop()
-                        pub.repositories.append(pub_repo)
+                        pub.repository = pub_repo
                 pub_repo.origins = [durl]
                 repo.update_publisher(pub)
 
@@ -551,7 +515,7 @@ class TestDepotController(pkg5unittest.CliTestCase):
                 self.pkg("search -r cat")
 
         def testBadArgs(self):
-                self.__dc.set_port(12000)
+                self.__dc.set_port(self.next_free_port)
                 self.__dc.set_readonly()
                 self.__dc.set_rebuild()
                 self.__dc.set_norefresh_index()
@@ -594,7 +558,7 @@ class TestDepotController(pkg5unittest.CliTestCase):
                 # For this disabled case, /catalog/1/ should return
                 # a NOT_FOUND error.
                 self.__dc.set_disable_ops(["catalog/1"])
-                self.__dc.set_port(12000)
+                self.__dc.set_port(self.next_free_port)
                 self.__dc.start()
                 durl = self.__dc.get_depot_url()
                 try:
@@ -606,7 +570,7 @@ class TestDepotController(pkg5unittest.CliTestCase):
                 # For this disabled case, all /catalog/ operations should return
                 # a NOT_FOUND error.
                 self.__dc.set_disable_ops(["catalog"])
-                self.__dc.set_port(12000)
+                self.__dc.set_port(self.next_free_port)
                 self.__dc.start()
                 durl = self.__dc.get_depot_url()
                 for ver in (0, 1):
@@ -798,12 +762,10 @@ class TestDepotOutput(pkg5unittest.SingleDepotTestCase):
                         pub = publisher.Publisher("org.opensolaris.pending")
                         repo.add_publisher(pub)
 
-                pub_repo = pub.selected_repository
+                pub_repo = pub.repository
                 if not pub_repo:
                         pub_repo = publisher.Repository()
-                        while pub.repositories:
-                                pub.repositories.pop()
-                        pub.repositories.append(pub_repo)
+                        pub.repository = pub_repo
 
                 for attr, val in self.pub_repo_cfg.iteritems():
                         setattr(pub_repo, attr, val)
@@ -832,7 +794,7 @@ class TestDepotOutput(pkg5unittest.SingleDepotTestCase):
                         self.assertEqual(getattr(pub, prop),
                             cfgdata["publisher"][prop])
 
-                repo = pub.selected_repository
+                repo = pub.repository
                 for prop, expected in self.pub_repo_cfg.iteritems():
                         returned = getattr(repo, prop)
                         if prop.endswith("uris") or prop == "origins":
@@ -980,6 +942,21 @@ class TestDepotOutput(pkg5unittest.SingleDepotTestCase):
                     "en/advanced_search.shtml?token=*&show=a&rpp=50&"
                     "action=Advanced+Search")
                 urllib2.urlopen(surl).read()
+
+        def test_address(self):
+                """Verify that depot address can be set."""
+
+                # Check that IPv6 address can be used.
+                self.dc.set_address("::1")
+                self.dc.set_port(self.next_free_port)
+                self.dc.start()
+                self.assert_(self.dc.is_alive())
+                self.assert_(self.dc.is_alive())
+                self.assert_(self.dc.is_alive())
+
+                # Check that we can retrieve something.
+                durl = self.dc.get_depot_url()
+                verdata = urllib2.urlopen("%s/versions/0/" % durl)
 
 
 if __name__ == "__main__":

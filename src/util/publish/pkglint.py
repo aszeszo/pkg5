@@ -1,4 +1,4 @@
-#! /usr/bin/python
+#!/usr/bin/python2.6
 #
 # CDDL HEADER START
 #
@@ -21,29 +21,32 @@
 #
     
 #
-# Copyright (c) 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2010, 2011 Oracle and/or its affiliates. All rights reserved.
 #
 
 import codecs
-import inspect
 import logging
 import sys
 import gettext
+import traceback
 from optparse import OptionParser
 
 gettext.install("pkg", "/usr/share/locale")
 
 from pkg.client.api_errors import InvalidPackageErrors
+from pkg import VERSION
+from pkg.misc import PipeError
+
 import pkg.lint.engine as engine
 import pkg.lint.log as log
 import pkg.fmri as fmri
 import pkg.manifest
+import pkg.misc as misc
 
 logger = None
 
 def error(message):
         logger.error(_("Error: %s") % message)
-        sys.exit(1)
 
 def msg(message):
         logger.info(message)
@@ -58,26 +61,26 @@ def main_func():
         
         usage = \
             _("\n"
-            "        %prog [ -b <build_no> ] [ -c <cache_dir> ] [ -f <file> ]\n"
-            "        [ -l <uri> ] [ -p <regexp> ] [ -r <uri> ] [ -v ]\n"
-            "        [ <manifest> ... ]\n"
+            "        %prog [-b build_no] [-c cache_dir] [-f file]\n"
+            "            [-l uri] [-p regexp] [-r uri] [-v]\n"
+            "            [manifest ...]\n"
             "        %prog -L")
         parser = OptionParser(usage=usage)
 
-        parser.add_option("-b", dest="release", metavar="<build_no>",
+        parser.add_option("-b", dest="release", metavar="build_no",
             help=_("build to use from lint and reference repositories"))
-        parser.add_option("-c", dest="cache", metavar="<dir>",
+        parser.add_option("-c", dest="cache", metavar="dir",
             help=_("directory to use as a repository cache"))
-        parser.add_option("-f", dest="config", metavar="<file>",
+        parser.add_option("-f", dest="config", metavar="file",
             help=_("specify an alternative pkglintrc file"))
-        parser.add_option("-l", dest="lint_uris", metavar="<uri>",
+        parser.add_option("-l", dest="lint_uris", metavar="uri",
             action="append", help=_("lint repository URI"))
         parser.add_option("-L", dest="list_checks",
             action="store_true",
             help=_("list checks configured for this session and exit"))
-        parser.add_option("-p", dest="pattern", metavar="<regexp>",
+        parser.add_option("-p", dest="pattern", metavar="regexp",
             help=_("pattern to match FMRIs in lint URI"))
-        parser.add_option("-r", dest="ref_uris", metavar="<uri>",
+        parser.add_option("-r", dest="ref_uris", metavar="uri",
             action="append", help=_("reference repository URI"))
         parser.add_option("-v", dest="verbose", action="store_true",
             help=_("produce verbose output, overriding settings in pkglintrc")
@@ -92,11 +95,7 @@ def main_func():
                     _("Required -c option missing, no local manifests provided."
                     ))
 
-        if not opts.pattern:
-                pattern = "*"
-        else:
-                pattern = opts.pattern
-        
+        pattern = opts.pattern
         opts.ref_uris = _make_list(opts.ref_uris)
         opts.lint_uris = _make_list(opts.lint_uris)
 
@@ -131,7 +130,7 @@ def main_func():
                 if opts.list_checks:
                         list_checks(lint_engine.checkers,
                             lint_engine.excluded_checkers, opts.verbose)
-                        sys.exit(0)
+                        return 0
 
                 if (opts.lint_uris or opts.ref_uris) and not opts.cache:
                         parser.error(
@@ -143,6 +142,7 @@ def main_func():
                         manifests = read_manifests(args, lint_logger)
                         if None in manifests:
                                 error(_("Fatal error in manifest - exiting."))
+                                return 1
                 lint_engine.setup(ref_uris=opts.ref_uris,
                     lint_uris=opts.lint_uris,
                     lint_manifests=manifests,
@@ -158,6 +158,7 @@ def main_func():
 
         except engine.LintEngineException, err:
                 error(err)
+                return 1
 
         if lint_logger.produced_lint_msgs():
                 return 1
@@ -178,21 +179,6 @@ def list_checks(checkers, exclude, verbose=False):
                             method.im_class.__name__,
                             method.im_func.func_name)
 
-        def get_pkglint_id(method):
-                """Inspects a given checker method to find the 'pkglint_id'
-                keyword argument default and returns it."""
-
-                # the short name for this checker class, Checker.name
-                name = method.im_class.name
-
-                arg_spec = inspect.getargspec(method)
-                c = len(arg_spec.args) - 1
-                try:
-                        i = arg_spec.args.index("pkglint_id")
-                except ValueError:
-                        return "%s.?" % name
-                return "%s%s" % (name, arg_spec.defaults[c - i])
-
         def emit(name, value):
                 msg("%s %s" % (name.ljust(width), value))
 
@@ -206,21 +192,17 @@ def list_checks(checkers, exclude, verbose=False):
         exclude_items = {}
 
         for checker in checkers:
-                for m in checker.included_checks:
-                        lint_id = get_pkglint_id(m)
+                for m, lint_id in checker.included_checks:
                         include_items[lint_id] = get_method_desc(m, verbose)
 
         for checker in exclude:
-                for m in checker.excluded_checks:
-                        lint_id = get_pkglint_id(m)
+                for m, lint_id in checker.excluded_checks:
                         exclude_items[lint_id] = get_method_desc(m, verbose)
-                for m in checker.included_checks:
-                        lint_id = get_pkglint_id(m)
+                for m, lint_id in checker.included_checks:
                         exclude_items[lint_id] = get_method_desc(m, verbose)
 
         for checker in checkers:
-                for m in checker.excluded_checks:
-                        lint_id = get_pkglint_id(m)
+                for m, lint_id in checker.excluded_checks:
                         exclude_items[lint_id] = get_method_desc(m, verbose)
 
         if include_items or exclude_items:
@@ -288,14 +270,25 @@ def read_manifests(names, lint_logger):
 
                 if manifest and "pkg.fmri" in manifest:
                         try:
-                                manifest.fmri = fmri.PkgFmri(
-                                    manifest["pkg.fmri"])
-                                manifests.append(manifest)
+                                manifest.fmri = \
+                                    pkg.fmri.PkgFmri(manifest["pkg.fmri"],
+                                        "5.11")
                         except fmri.IllegalFmri, e:
                                 lint_logger.critical(
-                                    _("Error in file %(file)s: %(err)s") %
-                                    {"file": filename, "err": str(e)},
+                                    _("Error in file %(file)s: "
+                                    "%(err)s") %
+                                    {"file": filename, "err": e},
                                     "lint.manifest002")
+                        if manifest.fmri:
+                                if not manifest.fmri.version:
+                                        lint_logger.critical(
+                                            _("Error in file %s: "
+                                            "pkg.fmri does not include a "
+                                            "version string") % filename,
+                                            "lint.manifest003")
+                                else:
+                                        manifests.append(manifest)
+
                 elif manifest:
                         lint_logger.critical(
                             _("Manifest %s does not declare fmri.") % filename,
@@ -316,5 +309,16 @@ def _make_list(opt):
 
 
 if __name__ == "__main__":
-        value = main_func()
-        sys.exit(value)
+        try:
+                value = main_func()
+                sys.exit(value)
+        except (PipeError, KeyboardInterrupt):
+                # We don't want to display any messages here to prevent
+                # possible further broken pipe (EPIPE) errors.
+                __ret = 1
+        except SystemExit, _e:
+                raise _e
+        except:
+                traceback.print_exc()
+                error(misc.get_traceback_message())
+                sys.exit(99)

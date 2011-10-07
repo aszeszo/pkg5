@@ -20,7 +20,7 @@
 # CDDL HEADER END
 #
 
-# Copyright (c) 2009, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2009, 2011, Oracle and/or its affiliates. All rights reserved.
 
 import testutils
 if __name__ == "__main__":
@@ -30,8 +30,11 @@ import unittest
 
 try:
         import ldtp
+        import ldtputils
+        if not "getmin" in dir(ldtp):
+            raise ImportError
 except ImportError:
-        raise ImportError, "SUNWldtp package not installed."
+        raise ImportError, "ldtp 2.X package not installed."
 
 class TestPkgGuiStartBasics(pkg5unittest.SingleDepotTestCase):
 
@@ -43,16 +46,21 @@ class TestPkgGuiStartBasics(pkg5unittest.SingleDepotTestCase):
             add set name="description" value="Some package description"
             close """
 
+        def setUp(self):
+                pkg5unittest.SingleDepotTestCase.setUp(self)
+
+        def tearDown(self):
+                pkg5unittest.SingleDepotTestCase.tearDown(self)
+
         def testStartPackagemanager(self):
-                durl = self.dc.get_depot_url()
-                self.pkgsend_bulk(durl, self.foo10)
+                pm_str = "%s/usr/bin/packagemanager" % pkg5unittest.g_proto_area
 
-                # image_create destroys the previous image
-                # so it's not needed to call self.image_destroy()
-                self.image_create(durl)
+                self.pkgsend_bulk(self.rurl, self.foo10)
+                self.image_create(self.rurl)
 
-                ldtp.launchapp("%s/usr/bin/packagemanager" % pkg5unittest.g_proto_area)
-                ldtp.click('frmPackageManager', 'mnuQuit')
+                ldtp.launchapp(pm_str,["-R", self.get_img_path()])
+                ldtp.waittillguiexist('Package Manager', state = ldtp.state.ENABLED)
+                ldtp.selectmenuitem('Package Manager', 'mnuFile;mnuQuit')
 
 if __name__ == "__main__":
-	unittest.main()
+        unittest.main()

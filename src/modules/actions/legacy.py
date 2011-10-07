@@ -21,8 +21,7 @@
 #
 
 #
-# Copyright 2010 Sun Microsystems, Inc.  All rights reserved.
-# Use is subject to license terms.
+# Copyright (c) 2007, 2011, Oracle and/or its affiliates. All rights reserved.
 #
 
 """module describing a legacy packaging object
@@ -46,6 +45,10 @@ class LegacyAction(generic.Action):
 
         name = "legacy"
         key_attr = "pkg"
+        unique_attrs = ("category", "desc", "hotline", "name", "pkg", "vendor",
+            "version", "basedir", "pkginst", "pstamp", "sunw_prodvers")
+        refcountable = True
+        globally_identical = True
 
         def directory_references(self):
                 return [os.path.normpath(os.path.join("var/sadm/pkg",
@@ -175,3 +178,18 @@ class LegacyAction(generic.Action):
                 generic.py for a more detailed explanation."""
 
                 return [("legacy", "legacy_pkg", self.attrs["pkg"], None)]
+
+        def validate(self, fmri=None):
+                """Performs additional validation of action attributes that
+                for performance or other reasons cannot or should not be done
+                during Action object creation.  An ActionError exception (or
+                subclass of) will be raised if any attributes are not valid.
+                This is primarily intended for use during publication or during
+                error handling to provide additional diagonostics.
+
+                'fmri' is an optional package FMRI (object or string) indicating
+                what package contained this action."""
+
+                generic.Action._validate(self, fmri=fmri,
+                    single_attrs=("category", "desc", "hotline", "name",
+                    "vendor", "version"))

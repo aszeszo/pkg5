@@ -2,19 +2,18 @@
 # Copyright (c) 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009 Python
 # Software Foundation; All Rights Reserved
 #
-# Copyright 2010 Sun Microsystems, Inc.  All rights reserved.
-# Use is subject to license terms.
+# Copyright (c) 2010, 2011, Oracle and/or its affiliates. All rights reserved.
 
 
 """A standalone version of ModuleFinder which limits the depth of exploration
 for loaded modules and discovers where a module might be loaded instead of
 determining which path contains a module to be loaded.  It is designed to be run
-by python2.4 or python2.5 against 2.4 or 2.5 modules.  To communicate its
-results to the process which ran it, it prints output to stdout.  The format is
-to start a line with 'DEP ' if it contains information about a dependency, and
-'ERR ' if it contains information about a module it couldn't analyze."""
+by python2.4 against 2.4 modules.  To communicate its results to the process
+which ran it, it prints output to stdout.  The format is to start a line with
+'DEP ' if it contains information about a dependency, and 'ERR ' if it contains
+information about a module it couldn't analyze."""
 
-# This module cannot import other pkg modules because running the 2.4 or 2.5
+# This module cannot import other pkg modules because running the 2.4
 # interpreter will overwrite the pyc files for some of the other flavor modules.
 # With 2.6, the -B option can be added to the command line invocation for the
 # subprocess and the interpreter won't overwrite pyc files.
@@ -26,6 +25,11 @@ import sys
 
 from modulefinder import LOAD_CONST, IMPORT_NAME, STORE_NAME, STORE_GLOBAL, \
     STORE_OPS
+
+# A string used as a component of the pkg.depend.runpath value as a special
+# token to determine where to insert the runpath that pkgdepend generates itself
+# (duplicated from pkg.portable.__init__ for reasons above)
+PD_DEFAULT_RUNPATH = "$PKGDEPEND_RUNPATH"
 
 python_path = "PYTHONPATH"
 
@@ -46,7 +50,8 @@ class ModuleInfo(object):
 
                 self.name = name
                 self.builtin = builtin
-                self.suffixes = [".py", ".pyc", ".pyo", "/__init__.py"]
+                self.suffixes = [".py", ".pyc", ".pyo", "/__init__.py", ".so",
+                    "module.so"]
                 self.dirs = sorted(dirs)
 
         def make_package(self):
@@ -72,11 +77,30 @@ class ModuleInfo(object):
                 return "name:%s suffixes:%s dirs:%s" % (self.name,
                     " ".join(self.suffixes), len(self.dirs))
 
+class MultipleDefaultRunPaths(Exception):
+
+        def __unicode__(self):
+                # To workaround python issues 6108 and 2517, this provides a
+                # a standard wrapper for this class' exceptions so that they
+                # have a chance of being stringified correctly.
+                return str(self)
+
+        def __str__(self):
+                return _(
+                    "More than one $PKGDEPEND_RUNPATH token was set on the "
+                    "same action in this manifest.")
+
 class DepthLimitedModuleFinder(modulefinder.ModuleFinder):
 
-        def __init__(self, proto_dir, *args, **kwargs):
+        def __init__(self, install_dir, *args, **kwargs):
                 """Produce a module finder that ignores PYTHONPATH and only
-                reports the direct imports of a module."""
+                reports the direct imports of a module.
+
+                run_paths as a keyword argument specifies a list of additional
+                paths to use when searching for modules."""
+
+                # ModuleFinder.__init__ doesn't expect run_paths
+                run_paths = kwargs.pop("run_paths", [])
 
                 # Check to see whether a python path has been set.
                 if python_path in os.environ:
@@ -90,19 +114,29 @@ class DepthLimitedModuleFinder(modulefinder.ModuleFinder):
                 # Remove any paths that start with the defined python paths.
                 new_path = [
                     fp
-                    for fp in sys.path
+                    for fp in sys.path[1:]
                     if not self.startswith_path(fp, py_path)
                 ]
+                new_path.append(install_dir)
 
-                # Map the standard system paths into the proto area.
-                new_path = [
-                    os.path.join(proto_dir, fp.lstrip("/"))
-                    for fp in new_path
-                ]
+                if run_paths:
+                        # insert our default search path where the
+                        # PD_DEFAULT_RUNPATH token was found
+                        try:
+                                index = run_paths.index(PD_DEFAULT_RUNPATH)
+                                if index >= 0:
+                                        run_paths = run_paths[:index] + \
+                                            new_path + run_paths[index + 1:]
+                                if PD_DEFAULT_RUNPATH in run_paths:
+                                        raise MultipleDefaultRunPaths()
+                        except ValueError:
+                                # no PD_DEFAULT_PATH token, so we override the
+                                # whole default search path
+                                pass
+                        new_path = run_paths
 
                 modulefinder.ModuleFinder.__init__(self, path=new_path,
                     *args, **kwargs)
-                self.proto_dir = proto_dir
 
         @staticmethod
         def startswith_path(path, lst):
@@ -133,7 +167,12 @@ class DepthLimitedModuleFinder(modulefinder.ModuleFinder):
                         if self.replace_paths:
                                 co = self.replace_paths_in_code(co)
                         m.__code__ = co
-                        res.extend(self.scan_code(co, m))
+                        try:
+                                res.extend(self.scan_code(co, m))
+                        except ImportError, msg:
+                                self.msg(2, "ImportError:", str(msg), fqname,
+                                    pathname)
+                                self._add_badmodule(fqname, m)
                 self.msgout(2, "load_module ->", m)
                 return res
 
@@ -187,7 +226,7 @@ class DepthLimitedModuleFinder(modulefinder.ModuleFinder):
                 res = []
                 if name in self.badmodules:
                         self._add_badmodule(name, caller)
-                        return
+                        return []
                 try:
                         res.extend(self.import_hook(name, caller, level=level))
                 except ImportError, msg:
@@ -206,6 +245,14 @@ class DepthLimitedModuleFinder(modulefinder.ModuleFinder):
         def import_hook(self, name, caller=None, fromlist=None, level=-1):
                 """Find all the modules that importing name will import."""
 
+                # Special handling for os.path is needed because the os module
+                # manipulates sys.modules directly to provide both os and
+                # os.path.
+                if name == "os.path":
+                        self.msg(2, "bypassing os.path import - importing os "
+                            "instead", name, caller, fromlist, level)
+                        name = "os"
+
                 self.msg(3, "import_hook", name, caller, fromlist, level)
                 parent = self.determine_parent(caller)
                 q, tail = self.find_head_package(parent, name)
@@ -214,11 +261,24 @@ class DepthLimitedModuleFinder(modulefinder.ModuleFinder):
                         # doesn't live in the normal module space and it's part
                         # of python itself, which is handled by a different
                         # kind of dependency.
-                        if q.builtin:
+                        if isinstance(q, ModuleInfo) and q.builtin:
                                 return []
+                        elif isinstance(q, modulefinder.Module):
+                                name = q.__name__
+                                path = q.__path__
+                                # some Module objects don't get a path, this
+                                # isn't optimal, but it's the best we can do
+                                if not path:
+                                        if name in sys.builtin_module_names or \
+                                            name == "__future__":
+                                                return [ModuleInfo(name, [],
+                                                    builtin=True)]
+                                        else:
+                                                return [ModuleInfo(name, [])]
+                                return [ModuleInfo(name, path)]
                         else:
                                 return [q]
-                res = self.load_tail(name, q, tail)
+                res = self.load_tail(q, tail)
                 q.make_package()
                 res.append(q)
                 return res
@@ -261,36 +321,51 @@ class DepthLimitedModuleFinder(modulefinder.ModuleFinder):
                     path = self.path
                 return ModuleInfo(name, path)
 
-        def load_tail(self, name, q, tail):
+        def load_tail(self, q, tail):
                 """Determine where each component of a multilevel import would
                 be found on the file system."""
 
                 self.msgin(4, "load_tail", q, tail)
-                m = q
                 res = []
+                name = q.name
+                cur_parent = q
                 while tail:
                         i = tail.find('.')
                         if i < 0: i = len(tail)
                         head, tail = tail[:i], tail[i+1:]
                         new_name = "%s.%s" % (name, head)
-                        r = self.import_module(head, new_name, q)
+                        r = self.import_module(head, new_name, cur_parent)
                         res.append(r)
                         name = new_name
+                        cur_parent = r
+
                 # All but the last module found must be packages because they
                 # contained other packages.
                 for i in range(0, len(res) - 1):
                         res[i].make_package()
-                self.msgout(4, "load_tail ->", m)
+
+                self.msgout(4, "load_tail ->", q)
                 return res
 
 
 if __name__ == "__main__":
-        mf = DepthLimitedModuleFinder(sys.argv[1])
-        loaded_modules = mf.run_script(sys.argv[2])
-        for res in set([
-            (tuple(m.get_file_names()), tuple(m.dirs)) for m in loaded_modules
-        ]):
-                print "DEP %s" % (res,)
-        missing, maybe =  mf.any_missing_maybe()
-        for name in missing:
-                print "ERR %s" % name,
+        """Usage:
+              depthlimitedmf24.py <install_path> <script>
+                  [ run_path run_path ... ]
+        """
+        run_paths = sys.argv[3:]
+        try:
+                mf = DepthLimitedModuleFinder(sys.argv[1], run_paths=run_paths)
+                loaded_modules = mf.run_script(sys.argv[2])
+                for res in set([
+                    (tuple(m.get_file_names()), tuple(m.dirs))
+                    for m in loaded_modules
+                ]):
+                        print "DEP %s" % (res,)
+                missing, maybe =  mf.any_missing_maybe()
+                for name in missing:
+                        print "ERR %s" % name,
+        except ValueError, e:
+                print "ERR %s" % e
+        except MultipleDefaultRunPaths, e:
+                print e

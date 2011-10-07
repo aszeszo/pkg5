@@ -21,11 +21,10 @@
 #
 
 #
-# Copyright (c) 2007, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2007, 2011, Oracle and/or its affiliates. All rights reserved.
 #
 
-from collections import namedtuple
-import copy
+from collections import namedtuple, defaultdict
 import errno
 import hashlib
 import os
@@ -34,8 +33,10 @@ from itertools import groupby, chain, repeat
 
 import pkg.actions as actions
 import pkg.client.api_errors as apx
+import pkg.misc as misc
 import pkg.portable as portable
 import pkg.variant as variant
+import pkg.version as version
 
 from pkg.misc import EmptyDict, EmptyI, expanddirs, PKG_FILE_MODE, PKG_DIR_MODE
 from pkg.actions.attribute import AttributeAction
@@ -88,6 +89,7 @@ class Manifest(object):
                 self.facets = {}     # facets seen in package
                 self.attributes = {} # package-wide attributes
                 self.signatures = EmptyDict
+                self._cache = {}
 
         def __str__(self):
                 r = ""
@@ -152,13 +154,10 @@ class Manifest(object):
 
                 added = [(None, sdict[i]) for i in sset - oset]
                 removed = [(odict[i], None) for i in oset - sset]
-                # XXX for now, we force license actions to always be
-                # different to insure that existing license files for
-                # new versions are always installed
                 changed = [
                     (odict[i], sdict[i])
                     for i in oset & sset
-                    if odict[i].different(sdict[i]) or i[0] == "license"
+                    if odict[i].different(sdict[i])
                 ]
 
                 # XXX Do changed actions need to be sorted at all?  This is
@@ -176,23 +175,49 @@ class Manifest(object):
                 return ManifestDifference(added, changed, removed)
 
         @staticmethod
-        def comm(*compare_m):
+        def comm(compare_m):
                 """Like the unix utility comm, except that this function
                 takes an arbitrary number of manifests and compares them,
                 returning a tuple consisting of each manifest's actions
                 that are not the same for all manifests, followed by a
                 list of actions that are the same in each manifest."""
 
+                # Must specify at least one manifest.
+                assert compare_m
+                dups = []
+
                 # construct list of dictionaries of actions in each
-                # manifest, indexed by unique keys
-                m_dicts = [
-                    dict(
-                    ((a.name, a.attrs.get(a.key_attr, id(a))), a)
-                    for a in m.actions)
-                    for m in compare_m
-                ]
+                # manifest, indexed by unique key and variant combination
+                m_dicts = []
+                for m in compare_m:
+                        m_dict = {}
+                        for a in m.gen_actions():
+                                # The unique key for each action is based on its
+                                # type, key attribute, and unique variants set
+                                # on the action.
+                                try:
+                                        key = set(a.attrlist(a.key_attr))
+                                        key.update(
+                                            "%s=%s" % (v, a.attrs[v])
+                                            for v in a.get_varcet_keys()[0]
+                                        )
+                                        key = tuple(key)
+                                except KeyError:
+                                        # If there is no key attribute for the
+                                        # action, then fallback to the object
+                                        # id for the action as its identifier.
+                                        key = (id(a),)
+
+                                # catch duplicate actions here...
+                                if m_dict.setdefault((a.name, key), a) != a:
+                                        dups.append((m_dict[(a.name, key)], a))
+
+                        m_dicts.append(m_dict)
+
+                if dups:
+                        raise ManifestError(duplicates=dups)
+
                 # construct list of key sets in each dict
-                #
                 m_sets = [
                     set(m.keys())
                     for m in m_dicts
@@ -218,7 +243,6 @@ class Manifest(object):
                     ]
                 )
 
-
         def combined_difference(self, origin, ov=EmptyI, sv=EmptyI):
                 """Where difference() returns three lists, combined_difference()
                 returns a single list of the concatenation of the three."""
@@ -242,6 +266,148 @@ class Manifest(object):
                                 out += "%s -> %s\n" % (src, dest)
                 return out
 
+        def _gen_dirs_to_str(self):
+                """Generate contents of dircache file containing all dirctories
+                referenced explicitly or implicitly from self.actions.  Include
+                variants as values; collapse variants where possible."""
+
+                def gen_references(a):
+                        for d in expanddirs(a.directory_references()):
+                                yield d
+
+                dirs = self._actions_to_dict(gen_references)
+                for d in dirs:
+                        for v in dirs[d]:
+                                yield "dir path=%s %s\n" % \
+                                    (d, " ".join("%s=%s" % t \
+                                    for t in v.iteritems()))
+
+        def _gen_mediators_to_str(self):
+                """Generate contents of mediatorcache file containing all
+                mediators referenced explicitly or implicitly from self.actions.
+                Include variants as values; collapse variants where possible."""
+
+                def gen_references(a):
+                        if (a.name == "link" or a.name == "hardlink") and \
+                            "mediator" in a.attrs:
+                                yield (a.attrs.get("mediator"),
+                                   a.attrs.get("mediator-priority"),
+                                   a.attrs.get("mediator-version"),
+                                   a.attrs.get("mediator-implementation"))
+
+                mediators = self._actions_to_dict(gen_references)
+                for mediation, mvariants in mediators.iteritems():
+                        values = {
+                            "mediator-priority": mediation[1],
+                            "mediator-version": mediation[2],
+                            "mediator-implementation": mediation[3],
+                        }
+                        for mvariant in mvariants:
+                                a = "set name=pkg.mediator " \
+                                    "value=%s %s %s\n".rstrip() % (mediation[0],
+                                     " ".join((
+                                         "=".join(t)
+                                          for t in values.iteritems()
+                                          if t[1]
+                                     )),
+                                     " ".join((
+                                         "=".join(t)
+                                         for t in mvariant.iteritems()
+                                     ))
+                                )
+                                yield a
+
+        def _actions_to_dict(self, references):
+                """create dictionary of all actions referenced explicitly or
+                implicitly from self.actions... include variants as values;
+                collapse variants where possible"""
+
+                refs = {}
+                # build a dictionary containing all directories tagged w/
+                # variants
+                for a in self.actions:
+                        v, f = a.get_varcet_keys()
+                        variants = dict((name, a.attrs[name]) for name in v + f)
+                        for ref in references(a):
+                                if ref not in refs:
+                                        refs[ref] = [variants]
+                                elif variants not in refs[ref]:
+                                        refs[ref].append(variants)
+
+                # remove any tags if any entries are always delivered (NULL)
+                for ref in refs:
+                        if {} in refs[ref]:
+                                refs[ref] = [{}]
+                                continue
+                        # could collapse refs where all variants are present
+                        # (the current logic only collapses them if at least
+                        # one reference is delivered without a facet or
+                        # variant)
+                return refs
+
+        def get_directories(self, excludes):
+                """ return a list of directories implicitly or
+                explicitly referenced by this object"""
+
+                try:
+                        alist = self._cache["manifest.dircache"]
+                except KeyError:
+                        # generate actions that contain directories
+                        alist = self._cache["manifest.dircache"] = [
+                            actions.fromstr(s.strip())
+                            for s in self._gen_dirs_to_str()
+                        ]
+
+                s = set([
+                    a.attrs["path"]
+                    for a in alist
+                    if a.include_this(excludes)
+                ])
+
+                return list(s)
+
+        def gen_mediators(self, excludes=EmptyI):
+                """A generator function that yields tuples of the form (mediator,
+                mediations) expressing the set of possible mediations for this
+                package, where 'mediations' is a set() of possible mediations for
+                the mediator.  Each mediation is a tuple of the form (priority,
+                version, implementation).
+                """
+
+                try:
+                        alist = self._cache["manifest.mediatorcache"]
+                except KeyError:
+                        # generate actions that contain mediators
+                        alist = self._cache["manifest.mediatorcache"] = [
+                            actions.fromstr(s.strip())
+                            for s in self._gen_mediators_to_str()
+                        ]
+
+                ret = defaultdict(set)
+                for attrs in (
+                    act.attrs
+                    for act in alist
+                    if act.include_this(excludes)):
+                        med_ver = attrs.get("mediator-version")
+                        if med_ver:
+                                try:
+                                        med_ver = version.Version(med_ver,
+                                            "5.11")
+                                except version.VersionError:
+                                        # Consider this mediation unavailable
+                                        # if it can't be parsed for whatever
+                                        # reason.
+                                        continue
+
+                        ret[attrs["value"]].add((
+                            attrs.get("mediator-priority"),
+                            med_ver,
+                            attrs.get("mediator-implementation"),
+                        ))
+
+                for m in ret:
+                        yield m, ret[m]
+
         def gen_actions(self, excludes=EmptyI):
                 """Generate actions in manifest through ordered callable list"""
                 for a in self.actions:
@@ -259,6 +425,14 @@ class Manifest(object):
                                 if not c(a):
                                         break
                         else:
+                                yield a
+
+        def gen_actions_by_types(self, atypes, excludes=EmptyI):
+                """Generate actions in the manifest of types "atypes"
+                through ordered callable list."""
+                for atype in atypes:
+                        for a in self.gen_actions_by_type(atype,
+                            excludes=excludes):
                                 yield a
 
         def gen_key_attribute_value_by_type(self, atype, excludes=EmptyI):
@@ -338,7 +512,7 @@ class Manifest(object):
 
                 'excludes' is an optional list of variants to exclude from the
                 manifest.
-        
+
                 'pathname' is an optional filename containing the location of
                 the manifest content.
 
@@ -425,13 +599,18 @@ class Manifest(object):
                 # append any variants and facets to manifest dict
                 v_list, f_list = action.get_varcet_keys()
 
-                if v_list or f_list:
+                if not (v_list or f_list):
+                        return
+
+                try:
                         for v, d in zip(v_list, repeat(self.variants)) \
                             + zip(f_list, repeat(self.facets)):
-                                if v not in d:
-                                        d[v] = set([action.attrs[v]])
-                                else:
-                                        d[v].add(action.attrs[v])
+                                d.setdefault(v, set()).add(action.attrs[v])
+                except TypeError:
+                        # Lists can't be set elements.
+                        raise actions.InvalidActionError(action,
+                            _("%(forv)s '%(v)s' specified multiple times") %
+                            {"forv": v.split(".", 1)[0], "v": v})
 
         def fill_attributes(self, action):
                 """Fill attribute array w/ set action contents."""
@@ -584,7 +763,7 @@ class Manifest(object):
                         if e.errno == errno.EACCES:
                                 raise apx.PermissionsException(e.filename)
                         if e.errno == errno.EROFS:
-                                raise apx.ReadOnlyFileSystemException( 
+                                raise apx.ReadOnlyFileSystemException(
                                     e.filename)
                         raise
 
@@ -653,8 +832,7 @@ class Manifest(object):
 
                 size = 0
                 for a in self.gen_actions(excludes):
-                        size += int(a.attrs.get("pkg.size", "0"))
-
+                        size += a.get_size()
                 return size
 
         def __getitem__(self, key):
@@ -707,10 +885,10 @@ class FactoredManifest(Manifest):
                 'pathname' is an optional string containing the pathname of a
                 manifest.  If not provided, it is assumed that the manifest is
                 stored in a file named 'manifest' in the directory indicated by
-                'cache_root'.
+                'cache_root'.  If provided, and contents is also provided, then
+                'contents' will be stored in 'pathname' if it does not already
+                exist.
                 """
-
-                assert not (contents and pathname)
 
                 Manifest.__init__(self, fmri)
                 self.__cache_root = cache_root
@@ -791,6 +969,9 @@ class FactoredManifest(Manifest):
 
                 t_dir = self.__cache_root
 
+                # Ensure target cache directory and intermediates exist.
+                misc.makedirs(t_dir)
+
                 # create per-action type cache; use rename to avoid
                 # corrupt files if ^C'd in the middle
                 for n in self.actions_bytype.keys():
@@ -805,54 +986,20 @@ class FactoredManifest(Manifest):
                         os.chmod(fn, PKG_FILE_MODE)
                         portable.rename(fn, self.__cache_path("manifest.%s" % n))
 
-                # create dircache
-                fd, fn = tempfile.mkstemp(dir=t_dir,
-                    prefix="manifest.dircache.")
-                f = os.fdopen(fd, "wb")
-                dirs = self.__actions_to_dirs()
+                def create_cache(name, refs):
+                        try:
+                                fd, fn = tempfile.mkstemp(dir=t_dir,
+                                    prefix="manifest.dircache.")
+                                with os.fdopen(fd, "wb") as f:
+                                        f.writelines(refs())
+                                os.chmod(fn, PKG_FILE_MODE)
+                                portable.rename(fn, self.__cache_path(name))
+                        except EnvironmentError, e:
+                                raise apx._convert_error(e)
 
-                for s in self.__gen_dirs_to_str(dirs):
-                        f.write(s)
-
-                f.close()
-                os.chmod(fn, PKG_FILE_MODE)
-                portable.rename(fn, self.__cache_path("manifest.dircache"))
-
-        @staticmethod
-        def __gen_dirs_to_str(dirs):
-                """ from a dictionary of paths, generate contents of dircache
-                file"""
-                for d in dirs:
-                        for v in dirs[d]:
-                                yield "dir path=%s %s\n" % \
-                                    (d, " ".join("%s=%s" % t \
-                                    for t in v.iteritems()))
-
-        def __actions_to_dirs(self):
-                """ create dictionary of all directories referenced
-                by actions explicitly or implicitly from self.actions...
-                include variants as values; collapse variants where possible"""
-                assert self.loaded
-
-                dirs = {}
-                # build a dictionary containing all directories tagged w/
-                # variants
-                for a in self.actions:
-                        v, f = a.get_varcet_keys()
-                        variants = dict((name, a.attrs[name]) for name in v + f)
-                        for d in expanddirs(a.directory_references()):
-                                if d not in dirs:
-                                        dirs[d] = [variants]
-                                elif variants not in dirs[d]:
-                                        dirs[d].append(variants)
-
-                # remove any tags if any entries are always installed (NULL)
-                for d in dirs:
-                        if {} in dirs[d]:
-                                dirs[d] = [{}]
-                                continue
-                        # could collapse dirs where all variants are present
-                return dirs
+                create_cache("manifest.dircache", self._gen_dirs_to_str)
+                create_cache("manifest.mediatorcache",
+                    self._gen_mediators_to_str)
 
         @staticmethod
         def clear_cache(cache_root):
@@ -871,36 +1018,41 @@ class FactoredManifest(Manifest):
                                         if e.errno != errno.ENOENT:
                                                 raise
                 except EnvironmentError, e:
-                        apx._convert_error(e, ignored_errors=[errno.ENOENT])
+                        if e.errno != errno.ENOENT:
+                                # Only raise error if failure wasn't due to
+                                # cache directory not existing.
+                                raise apx._convert_error(e)
 
-        def get_directories(self, excludes):
-                """ return a list of directories implicitly or
-                explicitly referenced by this object"""
+        def __load_cached_data(self, name):
+                """Private helper function for loading arbitrary cached manifest
+                data.
+                """
 
-                mpath = self.__cache_path("manifest.dircache")
-
+                mpath = self.__cache_path(name)
                 if not os.path.exists(mpath):
                         # no cached copy
                         if not self.loaded:
                                 # need to load from disk
                                 self.__load()
-                        # generate actions that contain directories
-                        alist = [
-                                actions.fromstr(s.strip())
-                                for s in self.__gen_dirs_to_str(
-                                    self.__actions_to_dirs())
+                        assert self.loaded
+                        return
+
+                # we have cached copy on disk; use it
+                try:
+                        with open(mpath, "rb") as f:
+                                self._cache[name] = [
+                                    actions.fromstr(s.strip())
+                                    for s in f
                                 ]
-                else:
-                        # we have cached copy on disk; use it
-                        f = file(mpath)
-                        alist = [actions.fromstr(s.strip()) for s in f]
-                        f.close()
-                s = set([
-                         a.attrs["path"]
-                         for a in alist
-                         if a.include_this(excludes)
-                         ])
-                return list(s)
+                except EnvironmentError, e:
+                        raise apx._convert_error(e)
+
+        def get_directories(self, excludes):
+                """ return a list of directories implicitly or explicitly
+                referenced by this object
+                """
+                self.__load_cached_data("manifest.dircache")
+                return Manifest.get_directories(self, excludes)
 
         def gen_actions_by_type(self, atype, excludes=EmptyI):
                 """ generate actions of the specified type;
@@ -914,6 +1066,9 @@ class FactoredManifest(Manifest):
                                 yield a
                         return
 
+                # This checks if we've already written out the factorerd
+                # manifest files.  If so, we'll use it, and if not, then
+                # we'll load the full manifest.
                 mpath = self.__cache_path("manifest.dircache")
 
                 if not os.path.exists(mpath):
@@ -938,6 +1093,13 @@ class FactoredManifest(Manifest):
                                 if a.include_this(excludes):
                                         yield a
                         f.close()
+
+        def gen_mediators(self, excludes):
+                """A generator function that yields set actions expressing the
+                set of possible mediations for this package.
+                """
+                self.__load_cached_data("manifest.mediatorcache")
+                return Manifest.gen_mediators(self, excludes)
 
         def __load_attributes(self):
                 """Load attributes dictionary from cached set actions;
@@ -1050,3 +1212,18 @@ class EmptyFactoredManifest(Manifest):
                 return []
 
 NullFactoredManifest = EmptyFactoredManifest()
+
+class ManifestError(Exception):
+        """Simple Exception class to handle manifest specific errors"""
+
+        def __init__(self, duplicates=EmptyI):
+                self.__duplicates = duplicates
+
+        def __str__(self):
+                ret = []
+                for d in self.__duplicates:
+                        ret.append("%s\n%s\n\n" % d)
+
+                return "\n".join(ret)
+
+

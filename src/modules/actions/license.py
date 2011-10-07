@@ -21,7 +21,7 @@
 #
 
 #
-# Copyright (c) 2007, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2007, 2011, Oracle and/or its affiliates. All rights reserved.
 #
 
 """module describing a license packaging object
@@ -38,6 +38,10 @@ from stat import S_IWRITE, S_IREAD
 import generic
 import pkg.misc as misc
 import pkg.portable as portable
+import urllib
+import zlib
+
+from pkg.client.api_errors import ActionExecutionError
 
 class LicenseAction(generic.Action):
         """Class representing a license packaging object."""
@@ -46,7 +50,10 @@ class LicenseAction(generic.Action):
 
         name = "license"
         key_attr = "license"
+        unique_attrs = ("license", )
         reverse_indices = ("license", )
+        refcountable = True
+        globally_identical = True
 
         has_payload = True
 
@@ -54,12 +61,38 @@ class LicenseAction(generic.Action):
                 generic.Action.__init__(self, data, **attrs)
                 self.hash = "NOHASH"
 
+        def __getstate__(self):
+                """This object doesn't have a default __dict__, instead it
+                stores its contents via __slots__.  Hence, this routine must
+                be provide to translate this object's contents into a
+                dictionary for pickling"""
+
+                pstate = generic.Action.__getstate__(self)
+                state = {}
+                for name in LicenseAction.__slots__:
+                        if not hasattr(self, name):
+                                continue
+                        state[name] = getattr(self, name)
+                return (state, pstate)
+
+        def __setstate__(self, state):
+                """This object doesn't have a default __dict__, instead it
+                stores its contents via __slots__.  Hence, this routine must
+                be provide to translate a pickled dictionary copy of this
+                object's contents into a real in-memory object."""
+
+                (state, pstate) = state
+                generic.Action.__setstate__(self, pstate)
+                for name in state:
+                        setattr(self, name, state[name])
+
         def preinstall(self, pkgplan, orig):
                 # Set attrs["path"] so filelist can handle this action;
                 # the path must be relative to the root of the image.
                 self.attrs["path"] = misc.relpath(os.path.join(
                     pkgplan.image.get_license_dir(pkgplan.destination_fmri),
-                    "license." + self.attrs["license"]), pkgplan.image.root)
+                    "license." + urllib.quote(self.attrs["license"], "")),
+                    pkgplan.image.root)
 
         def install(self, pkgplan, orig):
                 """Client-side method that installs the license."""
@@ -82,12 +115,25 @@ class LicenseAction(generic.Action):
                         os.chmod(path, misc.PKG_FILE_MODE)
 
                 lfile = file(path, "wb")
-                # XXX Should throw an exception if shasum doesn't match
-                # self.hash
-                shasum = misc.gunzip_from_stream(stream, lfile)
+                try:
+                        shasum = misc.gunzip_from_stream(stream, lfile)
+                except zlib.error, e:
+                        raise ActionExecutionError(self, details=_("Error "
+                            "decompressing payload: %s") %
+                            (" ".join([str(a) for a in e.args])), error=e)
+                finally:
+                        lfile.close()
+                        stream.close()
 
-                lfile.close()
-                stream.close()
+                if shasum != self.hash:
+                        raise ActionExecutionError(self, details=_("Action "
+                            "data hash verification failure: expected: "
+                            "%(expected)s computed: %(actual)s action: "
+                            "%(action)s") % {
+                                "expected": self.hash,
+                                "actual": shasum,
+                                "action": self
+                            })
 
                 os.chmod(path, misc.PKG_RO_FILE_MODE)
 
@@ -111,7 +157,7 @@ class LicenseAction(generic.Action):
                 info = []
 
                 path = os.path.join(img.get_license_dir(pfmri),
-                    "license." + self.attrs["license"])
+                    "license." + urllib.quote(self.attrs["license"], ""))
 
                 if args["forever"] == True:
                         try:
@@ -132,7 +178,7 @@ class LicenseAction(generic.Action):
         def remove(self, pkgplan):
                 path = os.path.join(
                     pkgplan.image.get_license_dir(pkgplan.origin_fmri),
-                    "license." + self.attrs["license"])
+                    "license." + urllib.quote(self.attrs["license"], ""))
 
                 try:
                         # Make file writable so it can be deleted
@@ -153,11 +199,15 @@ class LicenseAction(generic.Action):
 
                 return indices
 
-        def get_text(self, img, pfmri):
+        def get_text(self, img, pfmri, alt_pub=None):
                 """Retrieves and returns the payload of the license (which
                 should be text).  This may require remote retrieval of
                 resources and so this could raise a TransportError or other
-                ApiException."""
+                ApiException.
+
+                'alt_pub' is an optional alternate Publisher to use for
+                any required transport operations.
+                """
 
                 opener = self.get_local_opener(img, pfmri)
                 if opener:
@@ -165,8 +215,11 @@ class LicenseAction(generic.Action):
                         return opener().read()
 
                 try:
-                        pub = img.get_publisher(pfmri.publisher)
-                        return img.transport.get_content(pub, self.hash)
+                        if not alt_pub:
+                                alt_pub = img.get_publisher(pfmri.publisher)
+                        assert pfmri.publisher == alt_pub.prefix
+                        return img.transport.get_content(alt_pub, self.hash,
+                            fmri=pfmri)
                 finally:
                         img.cleanup_downloads()
 
@@ -174,8 +227,17 @@ class LicenseAction(generic.Action):
                 """Return an opener for the license text from the local disk or
                 None if the data for the text is not on-disk."""
 
-                path = os.path.join(img.get_license_dir(pfmri),
-                    "license." + self.attrs["license"])
+                if img.version <= 3:
+                        # Older images stored licenses without accounting for
+                        # '/', spaces, etc. properly.
+                        path = os.path.join(img.get_license_dir(pfmri),
+                            "license." + self.attrs["license"])
+                else:
+                        # Newer images ensure licenses are stored with encoded
+                        # name so that '/', spaces, etc. are properly handled.
+                        path = os.path.join(img.get_license_dir(pfmri),
+                            "license." + urllib.quote(self.attrs["license"],
+                            ""))
 
                 if not os.path.exists(path):
                         return None
@@ -201,3 +263,17 @@ class LicenseAction(generic.Action):
 
                 return self.attrs.get("must-display", "").lower() == "true"
 
+        def validate(self, fmri=None):
+                """Performs additional validation of action attributes that
+                for performance or other reasons cannot or should not be done
+                during Action object creation.  An ActionError exception (or
+                subclass of) will be raised if any attributes are not valid.
+                This is primarily intended for use during publication or during
+                error handling to provide additional diagonostics.
+
+                'fmri' is an optional package FMRI (object or string) indicating
+                what package contained this action."""
+
+                generic.Action._validate(self, fmri=fmri,
+                    numeric_attrs=("pkg.csize", "pkg.size"),
+                    single_attrs=("chash", "must-accept", "must-display"))

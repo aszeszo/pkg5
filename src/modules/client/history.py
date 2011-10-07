@@ -21,33 +21,36 @@
 #
 
 #
-# Copyright 2010 Sun Microsystems, Inc.  All rights reserved.
-# Use is subject to license terms.
+# Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
 #
 
 import copy
 import errno
+import gettext
+import locale
 import os
 import shutil
 import sys
 import traceback
 import xml.dom.minidom as xmini
-import xml.parsers.expat as expat
 
 import pkg
-import pkg.client.api_errors as api_errors
+import pkg.client.api_errors as apx
+import pkg.client.bootenv as bootenv
 import pkg.fmri as fmri
 import pkg.misc as misc
 import pkg.portable as portable
 
-# Constants for the (outcome, reason) combination for operation result.
+# Constants for the (outcome, reason) combination for operation result
+# and reason.  The first field, 'outcome' should be a single word to allow easy
+# extraction from 'pkg history' but 'reason' may be a phrase.
 # Indicates that the user canceled the operation.
-RESULT_CANCELED = ["Canceled"]
+RESULT_CANCELED = ["Canceled", "None"]
 # Indicates that the operation had no work to perform or didn't need to make
 # any changes to the image.
-RESULT_NOTHING_TO_DO = ["Nothing to do"]
+RESULT_NOTHING_TO_DO = ["Ignored", "Nothing to do"]
 # Indicates that the operation succeeded.
-RESULT_SUCCEEDED = ["Succeeded"]
+RESULT_SUCCEEDED = ["Succeeded", "None"]
 # Indicates that the user or client provided bad information which resulted in
 # operation failure.
 RESULT_FAILED_BAD_REQUEST = ["Failed", "Bad Request"]
@@ -69,6 +72,8 @@ RESULT_FAILED_TRANSPORT = ["Failed", "Transport"]
 RESULT_FAILED_ACTUATOR = ["Failed", "Actuator"]
 # Indicates that the operation failed due to not enough memory
 RESULT_FAILED_OUTOFMEMORY = ["Failed", "Out of Memory"]
+# Indicates that the operation failed because of conflicting actions
+RESULT_CONFLICTING_ACTIONS = ["Failed", "Conflicting Actions"]
 # Indicates that the operation failed for an unknown reason.
 RESULT_FAILED_UNKNOWN = ["Failed", "Unknown"]
 
@@ -78,70 +83,51 @@ DISCARDED_OPERATIONS = ["contents", "info", "list"]
 # Cross-reference table for errors and results.  Entries should be ordered
 # most-specific to least-specific.
 error_results = {
-    api_errors.ImageLockedError: RESULT_FAILED_LOCKED,
-    api_errors.InvalidCatalogFile: RESULT_FAILED_STORAGE,
-    api_errors.BENamingNotSupported: RESULT_FAILED_BAD_REQUEST,
-    api_errors.InvalidBENameException: RESULT_FAILED_BAD_REQUEST,
-    api_errors.CertificateError: RESULT_FAILED_CONFIGURATION,
-    api_errors.PublisherError: RESULT_FAILED_BAD_REQUEST,
-    api_errors.CanceledException: RESULT_CANCELED,
-    api_errors.ImageUpdateOnLiveImageException: RESULT_FAILED_BAD_REQUEST,
-    api_errors.ProblematicPermissionsIndexException: RESULT_FAILED_STORAGE,
-    api_errors.PermissionsException: RESULT_FAILED_STORAGE,
-    api_errors.SearchException: RESULT_FAILED_SEARCH,
-    api_errors.PlanCreationException: RESULT_FAILED_CONSTRAINED,
-    api_errors.NonLeafPackageException: RESULT_FAILED_CONSTRAINED,
-    api_errors.IpkgOutOfDateException: RESULT_FAILED_CONSTRAINED,
-    api_errors.InvalidDepotResponseException: RESULT_FAILED_TRANSPORT,
+    apx.ImageLockedError: RESULT_FAILED_LOCKED,
+    apx.InvalidCatalogFile: RESULT_FAILED_STORAGE,
+    apx.BENamingNotSupported: RESULT_FAILED_BAD_REQUEST,
+    apx.InvalidBENameException: RESULT_FAILED_BAD_REQUEST,
+    apx.CertificateError: RESULT_FAILED_CONFIGURATION,
+    apx.PublisherError: RESULT_FAILED_BAD_REQUEST,
+    apx.CanceledException: RESULT_CANCELED,
+    apx.ImageUpdateOnLiveImageException: RESULT_FAILED_BAD_REQUEST,
+    apx.ProblematicPermissionsIndexException: RESULT_FAILED_STORAGE,
+    apx.PermissionsException: RESULT_FAILED_STORAGE,
+    apx.SearchException: RESULT_FAILED_SEARCH,
+    apx.PlanCreationException: RESULT_FAILED_CONSTRAINED,
+    apx.NonLeafPackageException: RESULT_FAILED_CONSTRAINED,
+    apx.IpkgOutOfDateException: RESULT_FAILED_CONSTRAINED,
+    apx.InvalidDepotResponseException: RESULT_FAILED_TRANSPORT,
+    apx.ConflictingActionErrors: RESULT_CONFLICTING_ACTIONS,
     fmri.IllegalFmri: RESULT_FAILED_BAD_REQUEST,
     KeyboardInterrupt: RESULT_CANCELED,
     MemoryError: RESULT_FAILED_OUTOFMEMORY,
 }
 
-class _HistoryException(Exception):
-        """Private base exception class for all History exceptions."""
+misc.setlocale(locale.LC_ALL, "")
+gettext.install("pkg", "/usr/share/locale")
 
-        def __init__(self, *args):
-                Exception.__init__(self, *args)
-                self.error = args[0]
-
-        def __unicode__(self):
-                # To workaround python issues 6108 and 2517, this provides a
-                # a standard wrapper for this class' exceptions so that they
-                # have a chance of being stringified correctly.
-                return str(self)
-
-        def __str__(self):
-                return str(self.error)
-
-class HistoryLoadException(_HistoryException):
-        """Used to indicate that an unexpected error occurred while loading
-        History operation information.
-
-        The first argument should be an exception object related to the
-        error encountered.
-        """
-        def __init__(self, *args):
-                _HistoryException.__init__(self, *args)
-                self.parse_failure = isinstance(self.error, expat.ExpatError)
-
-class HistoryStoreException(_HistoryException):
-        """Used to indicate that an unexpected error occurred while storing
-        History operation information.
-
-        The first argument should be an exception object related to the
-        error encountered.
-        """
-        pass
-
-class HistoryPurgeException(_HistoryException):
-        """Used to indicate that an unexpected error occurred while purging
-        History operation information.
-
-        The first argument should be an exception object related to the
-        error encountered.
-        """
-        pass
+# since we store english text in our XML files, we need a way for clients
+# obtain a translated version of these messages.
+result_l10n = {
+    "Canceled": _("Canceled"),
+    "Failed": _("Failed"),
+    "Ignored": _("Ignored"),
+    "Nothing to do": _("Nothing to do"),
+    "Succeeded": _("Succeeded"),
+    "Bad Request": _("Bad Request"),
+    "Configuration": _("Configuration"),
+    "Constrained": _("Constrained"),
+    "Locked": _("Locked"),
+    "Search": _("Search"),
+    "Storage": _("Storage"),
+    "Transport": _("Transport"),
+    "Actuator": _("Actuator"),
+    "Out of Memory": _("Out of Memory"),
+    "Conflicting Actions": _("Conflicting Actions"),
+    "Unknown": _("Unknown"),
+    "None": _("None")
+}
 
 class _HistoryOperation(object):
         """A _HistoryOperation object is a representation of data about an
@@ -156,13 +142,17 @@ class _HistoryOperation(object):
         def __copy__(self):
                 h = _HistoryOperation()
                 for attr in ("name", "start_time", "end_time", "start_state",
-                    "end_state", "username", "userid", "result"):
+                    "end_state", "username", "userid", "be", "be_exists",
+                    "be_uuid", "current_be", "current_new_be", "new_be",
+                    "new_be_exists", "new_be_uuid", "result", "snapshot"):
                         setattr(h, attr, getattr(self, attr))
                 h.errors = [copy.copy(e) for e in self.errors]
                 return h
 
         def __setattr__(self, name, value):
-                if name not in ("result", "errors"):
+                if name not in ("result", "errors", "be", "be_uuid",
+                    "current_be", "current_new_be", "new_be", "new_be_exists",
+                    "new_be_uuid", "snapshot"):
                         # Force all other attribute values to be a string
                         # to avoid issues with minidom.
                         value = str(value)
@@ -180,11 +170,19 @@ Operation Start State:
 Operation End State:
 %s
 Operation User: %s (%s)
+Operation Boot Env.: %s
+Operation Boot Env. Currrent: %s
+Operation Boot Env. UUID: %s
+Operation New Boot Env.: %s
+Operation New Boot Env. Current: %s
+Operation New Boot Env. UUID: %s
+Operation Snapshot: %s
 Operation Errors:
 %s
 """ % (self.name, self.result, self.start_time, self.end_time,
     self.start_state, self.end_state, self.username, self.userid,
-    self.errors)
+    self.be, self.current_be, self.be_uuid, self.new_be, self.current_new_be,
+    self.new_be_uuid, self.snapshot, self.errors)
 
         # All "time" values should be in UTC, using ISO 8601 as the format.
         # Name of the operation performed (e.g. install, update, etc.).
@@ -203,12 +201,40 @@ Operation Errors:
         username = None
         # id of the user that performed the operation.
         userid = None
+        # The boot environment on which the user performed the operation
+        be = None
+        # The current name of the boot environment.
+        current_be = None
+        # The uuid of the BE on which the user performed the operation
+        be_uuid = None
+        # The new boot environment that was created as a result of the operation
+        new_be = None
+        # The current name of the new boot environment.
+        current_new_be = None
+        # The uuid of the boot environment that was created as a result of the
+        # operation
+        new_be_uuid = None
+
+        # The snapshot that was created while running this operation
+        # set to None if no snapshot was taken, or destroyed after successful
+        # completion
+        snapshot = None
+
         # The result of the operation (must be a list indicating (outcome,
         # reason)).
         result = None
 
         def __init__(self):
                 self.errors = []
+
+        @property
+        def result_text(self):
+                """Returns a tuple containing the translated text for the
+                operation result of the form (outcome, reason)."""
+                if not self.start_time or not self.result:
+                        return ("", "")
+                return (result_l10n[self.result[0]],
+                    result_l10n[self.result[1]])
 
 
 class History(object):
@@ -239,10 +265,17 @@ class History(object):
         operation_name = None
         operation_username = None
         operation_userid = None
+        operation_current_be = None
+        operation_be = None
+        operation_be_uuid = None
+        operation_current_new_be = None
+        operation_new_be = None
+        operation_new_be_uuid = None
         operation_start_time = None
         operation_end_time = None
         operation_start_state = None
         operation_end_state = None
+        operation_snapshot = None
         operation_errors = None
         operation_result = None
 
@@ -310,7 +343,10 @@ class History(object):
                         # Mark the operation as having started and record
                         # other, relevant information.
                         op.start_time = misc.time_to_timestamp(None)
-                        op.username = portable.get_username()
+                        try:
+                                op.username = portable.get_username()
+                        except KeyError:
+                                op.username = "unknown"
                         op.userid = portable.get_userid()
 
                         ca = None
@@ -416,7 +452,7 @@ class History(object):
                                         pass
 
         @staticmethod
-        def __load_operation_data(node):
+        def __load_operation_data(node, uuid_be_dic):
                 """Internal function to load the operation data from the given
                 XML 'node' object and return a _HistoryOperation object.
                 """
@@ -427,6 +463,29 @@ class History(object):
                 op.username = node.getAttribute("username")
                 op.userid = node.getAttribute("userid")
                 op.result = node.getAttribute("result").split(", ")
+
+                if len(op.result) == 1:
+                        op.result.append("None")
+
+                # older clients simply wrote "Nothing to do" instead of
+                # "Ignored, Nothing to do", so work around that
+                if op.result[0] == "Nothing to do":
+                        op.result = RESULT_NOTHING_TO_DO
+
+                if node.hasAttribute("be_uuid"):
+                        op.be_uuid = node.getAttribute("be_uuid")
+                if node.hasAttribute("new_be_uuid"):
+                        op.new_be_uuid = node.getAttribute("new_be_uuid")
+                if node.hasAttribute("be"):
+                        op.be = node.getAttribute("be")
+                        if op.be_uuid:
+                                op.current_be = uuid_be_dic.get(op.be_uuid,
+                                    op.be)
+                if node.hasAttribute("new_be"):
+                        op.new_be = node.getAttribute("new_be")
+                        if op.new_be_uuid:
+                                op.current_new_be = uuid_be_dic.get(
+                                    op.new_be_uuid, op.new_be)
 
                 def get_node_values(parent_name, child_name=None):
                         try:
@@ -462,6 +521,11 @@ class History(object):
                 self.clear()
 
                 try:
+                        uuid_be_dic = bootenv.BootEnv.get_uuid_be_dic()
+                except apx.ApiException, e:
+                        uuid_be_dic = {}
+
+                try:
                         pathname = os.path.join(self.path, filename)
                         d = xmini.parse(pathname)
                         root = d.documentElement
@@ -475,12 +539,12 @@ class History(object):
                                             "pathname": pathname,
                                             "operation":
                                                 self.__load_operation_data(
-                                                cnode)
+                                                cnode, uuid_be_dic)
                                             })
                 except KeyboardInterrupt:
                         raise
                 except Exception, e:
-                        raise HistoryLoadException(e)
+                        raise apx.HistoryLoadException(e)
 
         def __serialize_client_data(self, d):
                 """Internal function used to serialize current client data
@@ -511,13 +575,14 @@ class History(object):
                 """
 
                 if self.operation_userid is None:
-                        raise HistoryStoreException("Unable to determine the "
-                            "id of the user that performed the current "
+                        raise apx.HistoryStoreException("Unable to determine "
+                            "the id of the user that performed the current "
                             "operation; unable to store history information.")
                 elif self.operation_username is None:
-                        raise HistoryStoreException("Unable to determine the "
-                            "username of the user that performed the current "
-                            "operation; unable to store history information.")
+                        raise apx.HistoryStoreException("Unable to determine "
+                            "the username of the user that performed the "
+                            "current operation; unable to store history "
+                            "information.")
 
                 root = d.documentElement
                 op = d.createElement("operation")
@@ -529,6 +594,19 @@ class History(object):
                 op.setAttribute("result", ", ".join(self.operation_result))
                 op.setAttribute("start_time", self.operation_start_time)
                 op.setAttribute("end_time", self.operation_end_time)
+
+                if self.operation_be:
+                        op.setAttribute("be", self.operation_be)
+                if self.operation_be_uuid:
+                        op.setAttribute("be_uuid", self.operation_be_uuid)
+                if self.operation_new_be:
+                        op.setAttribute("new_be", self.operation_new_be)
+                if self.operation_new_be_uuid:
+                        op.setAttribute("new_be_uuid",
+                            self.operation_new_be_uuid)
+                if self.operation_snapshot:
+                        op.setAttribute("snapshot", self.operation_snapshot)
+
                 root.appendChild(op)
 
                 if self.operation_start_state:
@@ -575,14 +653,14 @@ class History(object):
                                         # access errors as it isn't critical
                                         # to the image that this data is
                                         # written.
-                                        raise HistoryStoreException(e)
+                                        raise apx.HistoryStoreException(e)
                                 # Return, since without the directory, the rest
                                 # of this will fail.
                                 return
                         except KeyboardInterrupt:
                                 raise
                         except Exception, e:
-                                raise HistoryStoreException(e)
+                                raise apx.HistoryStoreException(e)
 
                 # Repeatedly attempt to write the history (only if it's because
                 # the file already exists).  This is necessary due to multiple
@@ -614,21 +692,24 @@ class History(object):
                                         # access errors as it isn't critical
                                         # to the image that this data is
                                         # written.
-                                        raise HistoryStoreException(e)
+                                        raise apx.HistoryStoreException(e)
                                 # For all other failures, return, and avoid any
                                 # further attempts.
                                 return
                         except KeyboardInterrupt:
                                 raise
                         except Exception, e:
-                                raise HistoryStoreException(e)
+                                raise apx.HistoryStoreException(e)
 
-        def purge(self):
+        def purge(self, be_name=None, be_uuid=None):
                 """Removes all history information by deleting the directory
                 indicated by the value self.path and then creates a new history
                 entry to record that this purge occurred.
                 """
                 self.operation_name = "purge-history"
+                self.operation_be = be_name
+                self.operation_be_uuid = be_uuid
+
                 try:
                         shutil.rmtree(self.path)
                 except KeyboardInterrupt:
@@ -638,9 +719,9 @@ class History(object):
                                 # History already purged; record as successful.
                                 self.operation_result = RESULT_SUCCEEDED
                                 return
-                        raise HistoryPurgeException(e)
+                        raise apx.HistoryPurgeException(e)
                 except Exception, e:
-                        raise HistoryPurgeException(e)
+                        raise apx.HistoryPurgeException(e)
                 else:
                         self.operation_result = RESULT_SUCCEEDED
 
@@ -662,10 +743,12 @@ class History(object):
                         # of the history information to fail.
                         return
 
-        def log_operation_start(self, name):
+        def log_operation_start(self, name, be_name=None, be_uuid=None):
                 """Marks the start of an operation to be recorded in image
                 history."""
                 self.operation_name = name
+                self.operation_be = be_name
+                self.operation_be_uuid = be_uuid
 
         def log_operation_end(self, error=None, result=None):
                 """Marks the end of an operation to be recorded in image
@@ -680,6 +763,8 @@ class History(object):
 
                 if error:
                         self.log_operation_error(error)
+                        self.operation_new_be = None
+                        self.operation_new_be_uuid = None
 
                 if error and not result:
                         try:
@@ -722,7 +807,9 @@ class History(object):
                                         output = traceback.format_exc()
                                         use_current_stack = False
 
-                        if use_current_stack:
+                        if isinstance(error, basestring):
+                                output = error
+                        elif use_current_stack:
                                 # Assume the current stack is more useful if
                                 # the error doesn't inherit from Exception or
                                 # we can't use the last exception's stack.

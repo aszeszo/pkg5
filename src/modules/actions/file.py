@@ -21,7 +21,7 @@
 #
 
 #
-# Copyright (c) 2007, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2007, 2011, Oracle and/or its affiliates. All rights reserved.
 #
 
 """module describing a file packaging object
@@ -34,10 +34,15 @@ import errno
 import tempfile
 import stat
 import generic
+import zlib
+
+import pkg.actions
+import pkg.client.api_errors as api_errors
 import pkg.misc as misc
 import pkg.portable as portable
-import pkg.client.api_errors as api_errors
-import pkg.actions
+
+from pkg.client.api_errors import ActionExecutionError
+
 try:
         import pkg.elf as elf
         haveelf = True
@@ -51,7 +56,9 @@ class FileAction(generic.Action):
 
         name = "file"
         key_attr = "path"
-        globally_unique = True
+        unique_attrs = "path", "mode", "owner", "group", "preserve"
+        globally_identical = True
+        namespace_group = "path"
 
         has_payload = True
 
@@ -59,11 +66,31 @@ class FileAction(generic.Action):
                 generic.Action.__init__(self, data, **attrs)
                 self.hash = "NOHASH"
                 self.replace_required = False
-                if "path" in self.attrs:
-                        self.attrs["path"] = self.attrs["path"].lstrip("/")
-                        if not self.attrs["path"]:
-                                raise pkg.actions.InvalidActionError(
-                                    str(self), _("Empty path attribute"))
+
+        def __getstate__(self):
+                """This object doesn't have a default __dict__, instead it
+                stores its contents via __slots__.  Hence, this routine must
+                be provide to translate this object's contents into a
+                dictionary for pickling"""
+
+                pstate = generic.Action.__getstate__(self)
+                state = {}
+                for name in FileAction.__slots__:
+                        if not hasattr(self, name):
+                                continue
+                        state[name] = getattr(self, name)
+                return (state, pstate)
+
+        def __setstate__(self, state):
+                """This object doesn't have a default __dict__, instead it
+                stores its contents via __slots__.  Hence, this routine must
+                be provide to translate a pickled dictionary copy of this
+                object's contents into a real in-memory object."""
+
+                (state, pstate) = state
+                generic.Action.__setstate__(self, pstate)
+                for name in state:
+                        setattr(self, name, state[name])
 
         # this check is only needed on Windows
         if portable.ostype == "windows":
@@ -119,6 +146,11 @@ class FileAction(generic.Action):
                         self.makedirs(os.path.dirname(final_path),
                             mode=misc.PKG_DIR_MODE,
                             fmri=pkgplan.destination_fmri)
+                elif not orig and not pkgplan.origin_fmri and \
+                     "preserve" in self.attrs and os.path.isfile(final_path):
+                        # Unpackaged editable file is already present during
+                        # initial install; salvage it before continuing.
+                        pkgplan.salvage(final_path)
 
                 # XXX If we're upgrading, do we need to preserve file perms from
                 # existing file?
@@ -140,11 +172,17 @@ class FileAction(generic.Action):
                 # should it be stored?
                 pres_type = self.__check_preserve(orig, pkgplan)
                 do_content = True
+                old_path = None
                 if pres_type == True or (pres_type and
                     pkgplan.origin_fmri == pkgplan.destination_fmri):
                         # File is marked to be preserved and exists so don't
                         # reinstall content.
                         do_content = False
+                elif pres_type == "legacy":
+                        # Only rename old file if this is a transition to
+                        # preserve=legacy from something else.
+                        if orig.attrs.get("preserve", None) != "legacy":
+                                old_path = final_path + ".legacy"
                 elif pres_type == "renameold.update":
                         old_path = final_path + ".update"
                 elif pres_type == "renameold":
@@ -163,7 +201,7 @@ class FileAction(generic.Action):
                                 if e.errno == errno.ENOENT:
                                         pass
                                 elif e.errno in (errno.EEXIST, errno.ENOTEMPTY):
-                                        pkgplan.image.salvage(final_path)
+                                        pkgplan.salvage(final_path)
                                 elif e.errno != errno.EACCES:
                                         # this happens on Windows
                                         raise
@@ -175,13 +213,26 @@ class FileAction(generic.Action):
                             final_path))
                         stream = self.data()
                         tfile = os.fdopen(tfilefd, "wb")
-                        shasum = misc.gunzip_from_stream(stream, tfile)
+                        try:
+                                shasum = misc.gunzip_from_stream(stream, tfile)
+                        except zlib.error, e:
+                                raise ActionExecutionError(self,
+                                    details=_("Error decompressing payload: %s")
+                                    % (" ".join([str(a) for a in e.args])),
+                                    error=e)
+                        finally:
+                                tfile.close()
+                                stream.close()
 
-                        tfile.close()
-                        stream.close()
-
-                        # XXX Should throw an exception if shasum doesn't match
-                        # self.hash
+                        if shasum != self.hash:
+                                raise ActionExecutionError(self,
+                                    details=_("Action data hash verification "
+                                    "failure: expected: %(expected)s computed: "
+                                    "%(actual)s action: %(action)s") % {
+                                        "expected": self.hash,
+                                        "actual": shasum,
+                                        "action": self
+                                    })
                 else:
                         temp = final_path
 
@@ -203,9 +254,13 @@ class FileAction(generic.Action):
 
                 # XXX There's a window where final_path doesn't exist, but we
                 # probably don't care.
-                if do_content and pres_type in ("renameold",
-                    "renameold.update"):
-                        portable.rename(final_path, old_path)
+                if do_content and old_path:
+                        try:
+                                portable.rename(final_path, old_path)
+                        except OSError, e:
+                                if e.errno != errno.ENOENT:
+                                        # Only care if file isn't gone already.
+                                        raise
 
                 # This is safe even if temp == final_path.
                 portable.rename(temp, final_path)
@@ -245,6 +300,7 @@ class FileAction(generic.Action):
 
                 if abort:
                         assert errors
+                        self.replace_required = True
                         return errors, warnings, info
 
                 if path.lower().endswith("/bobcat") and args["verbose"] == True:
@@ -282,9 +338,14 @@ class FileAction(generic.Action):
                 # Check file contents
                 #
                 try:
+                        # This is a generic mechanism, but only used for libc on
+                        # x86, where the "best" version of libc is lofs-mounted
+                        # on the canonical path, foiling the standard verify
+                        # checks.
+                        is_mtpt = self.attrs.get("mountpoint", "").lower() == "true"
                         elfhash = None
                         elferror = None
-                        if "elfhash" in self.attrs and haveelf:
+                        if "elfhash" in self.attrs and haveelf and not is_mtpt:
                                 #
                                 # It's possible for the elf module to
                                 # throw while computing the hash,
@@ -309,7 +370,7 @@ class FileAction(generic.Action):
                         # matches, it indicates that the content hash algorithm
                         # changed, since obviously the file hash is a superset
                         # of the content hash.
-                        if elfhash is None or elferror:
+                        if (elfhash is None or elferror) and not is_mtpt:
                                 hashvalue, data = misc.get_data_digest(path)
                                 if hashvalue != self.hash:
                                         # Prefer the content hash error message.
@@ -338,35 +399,53 @@ class FileAction(generic.Action):
                 Returns None if preservation is not defined by the action.
                 Returns False if it is, but no preservation is necessary.
                 Returns True for the normal preservation form.  Returns one of
-                the strings 'renameold', 'renameold.update', or 'renamenew'
-                for each of the respective forms of preservation.
+                the strings 'renameold', 'renameold.update', 'renamenew',
+                or 'legacy' for each of the respective forms of preservation.
                 """
 
-                if not "preserve" in self.attrs:
+                try:
+                        pres_type = self.attrs["preserve"]
+                except KeyError:
                         return None
 
                 final_path = os.path.normpath(os.path.sep.join(
                     (pkgplan.image.get_root(), self.attrs["path"])))
 
-                pres_type = False
+                # 'legacy' preservation is very different than other forms of
+                # preservation as it doesn't account for the on-disk state of
+                # the action's payload.
+                if pres_type == "legacy":
+                        if not orig:
+                                # This is an initial install or a repair, so
+                                # there's nothing to deliver.
+                                return True
+                        return pres_type
+
                 # If action has been marked with a preserve attribute, the
                 # hash of the preserved file has changed between versions,
                 # and the package being installed is older than the package
                 # that was installed, and the version on disk is different
                 # than the installed package's original version, then preserve
                 # the installed file by renaming it.
+                #
+                # If pkgplan.origin_fmri isn't set, but there is an orig action,
+                # then this file is moving between packages and it can't be
+                # a downgrade since that isn't allowed across rename or obsolete
+                # boundaries.
+                is_file = os.path.isfile(final_path)
                 if orig and pkgplan.destination_fmri and \
                     self.hash != orig.hash and \
+                    pkgplan.origin_fmri and \
                     pkgplan.destination_fmri.version < pkgplan.origin_fmri.version:
                         # Installed, preserved file is for a package newer than
                         # what will be installed.  So check if the version on
                         # disk is different than what was originally delivered,
                         # and if so, preserve it.
-                        if os.path.isfile(final_path):
+                        if is_file:
                                 ihash, cdata = misc.get_data_digest(final_path)
                                 if ihash != orig.hash:
                                         # .old is intentionally avoided here to
-                                        # avoid accidental collisions with the
+                                        # prevent accidental collisions with the
                                         # normal install process.
                                         return "renameold.update"
                         return False
@@ -374,17 +453,17 @@ class FileAction(generic.Action):
                 # If the action has been marked with a preserve attribute, and
                 # the file exists and has a content hash different from what the
                 # system expected it to be, then we preserve the original file
-                # in some way, depending on the value of preserve.
-                if os.path.isfile(final_path):
+                # in some way, depending on the value of preserve.  If the
+                # action is an overlay, then we always overwrite.
+                overlay = self.attrs.get("overlay") == "true"
+                if is_file and not overlay:
                         chash, cdata = misc.get_data_digest(final_path)
-
                         if not orig or chash != orig.hash:
-                                pres_type = self.attrs["preserve"]
                                 if pres_type in ("renameold", "renamenew"):
                                         return pres_type
-                                else:
-                                        return True
-                return pres_type
+                                return True
+
+                return False
 
         # If we're not upgrading, or the file contents have changed,
         # retrieve the file and write it to a temporary location.
@@ -409,7 +488,10 @@ class FileAction(generic.Action):
                         if not os.path.isfile(path):
                                 return True
 
-                if self.__check_preserve(orig, pkgplan):
+                pres_type = self.__check_preserve(orig, pkgplan)
+                if pres_type != None and pres_type != True:
+                        # Preserved files only need data if they're being
+                        # changed (e.g. "renameold", etc.).
                         return True
 
                 return False
@@ -431,6 +513,23 @@ class FileAction(generic.Action):
                                 # Already gone; don't care.
                                 return
                         raise
+
+                if not pkgplan.destination_fmri and \
+                    self.attrs.get("preserve", "false").lower() != "false":
+                        # Preserved files are salvaged if they have been
+                        # modified since they were installed and this is
+                        # not an upgrade.
+                        try:
+                                ihash, cdata = misc.get_data_digest(path)
+                                if ihash != self.hash:
+                                        pkgplan.salvage(path)
+                                        # Nothing more to do.
+                                        return
+                        except EnvironmentError, e:
+                                if e.errno == errno.ENOENT:
+                                        # Already gone; don't care.
+                                        return
+                                raise
 
                 # Attempt to remove the file.
                 self.remove_fsobj(pkgplan, path)
@@ -517,4 +616,12 @@ class FileAction(generic.Action):
                 'fmri' is an optional package FMRI (object or string) indicating
                 what package contained this action."""
 
-                return self.validate_fsobj_common(fmri=fmri)
+                errors = generic.Action._validate(self, fmri=fmri,
+                    numeric_attrs=("pkg.csize", "pkg.size"), raise_errors=False,
+                    required_attrs=("owner", "group"), single_attrs=("chash",
+                    "preserve", "overlay", "elfarch", "elfbits", "elfhash",
+                    "original_name"))
+                errors.extend(self._validate_fsobj_common())
+                if errors:
+                        raise pkg.actions.InvalidActionAttributesError(self,
+                            errors, fmri=fmri)

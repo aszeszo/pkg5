@@ -20,24 +20,25 @@
 #
 
 #
-# Copyright (c) 2007, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2007, 2011, Oracle and/or its affiliates. All rights reserved.
 #
 
 PYTHON = /usr/bin/python2.6
 
 all := TARGET = all
-link := TARGET = link
 install := TARGET = install
 packages := TARGET = install
-link-clean := TARGET = link-clean
 clean := TARGET = clean
 clobber := TARGET = clobber
+lint := TARGET = lint
+clint := TARGET = clint
+pylint := TARGET = pylint
 test := TARGET = test
 test-verbose := TARGET = test-verbose
 test-generate := TARGET = test-generate
 test-leaks := TARGET = test-leaks
 
-SUBDIRS=web gui um po util/misc brand
+SUBDIRS=brand
 
 all: $(SUBDIRS)
 	$(PYTHON) setup.py build
@@ -50,8 +51,21 @@ clobber: $(SUBDIRS)
 	$(PYTHON) setup.py clobber
 	@cd pkg; pwd; make clobber
 
+#
+# run pylint as part of the install target.
+# it's the best way to ensure things stay pylint clean.
+#
 install: $(SUBDIRS)
 	$(PYTHON) setup.py install
+
+lint:
+	$(PYTHON) setup.py lint
+
+clint:
+	$(PYTHON) setup.py clint
+
+pylint:
+	$(PYTHON) setup.py pylint
 
 #
 # This rule propagates the current make target through all of the
@@ -61,42 +75,10 @@ $(SUBDIRS): FRC
 	@cd $@; pwd; $(MAKE) $(TARGET)
 
 # Use the bits we just built to create the packages.
-packages: install
-	@cd pkg; pwd; $(MAKE) $(TARGET) check \
+packages: install pylint
+	@cd pkg; pwd; $(MAKE) $(TARGET) check svr4_test \
 		PATH=$$(hg root)/proto/root_$$(uname -p)/usr/bin:$$PATH \
 		PYTHONPATH=$$(hg root)/proto/root_$$(uname -p)/usr/lib/python2.6/vendor-packages
-
-# XXX link is a developer target to connect the local machine to the current
-# repository's working copy's versions of the commands, modules, and supporting
-# files.
-PWD:sh = pwd
-link:
-	ln -sf $(PWD)/client.py /usr/bin/pkg
-	ln -sf $(PWD)/pull.py /usr/bin/pkgrecv
-	ln -sf $(PWD)/publish.py /usr/bin/pkgsend
-	ln -sf $(PWD)/depot.py /usr/lib/pkg.depotd
-	ln -sf $(PWD)/modules /usr/lib/python2.6/vendor-packages/pkg
-	ln -sf $(PWD)/pkg-server.xml /var/svc/manifest/application/pkg-server.xml
-	ln -sf $(PWD)/pkg-update.xml /var/svc/manifest/application/pkg-update.xml
-	@cd web; pwd; $(MAKE) $(TARGET)
-	@cd brand; pwd; $(MAKE) $(TARGET)
-	@cd man; pwd; $(MAKE) $(TARGET)
-	@cd gui; pwd; $(MAKE) $(TARGET)
-	@cd um; pwd; $(MAKE) $(TARGET)
-
-link-clean:
-	rm -f /usr/bin/pkg
-	rm -f /usr/bin/pkgrecv
-	rm -f /usr/bin/pkgsend
-	rm -f /usr/lib/pkg.depotd
-	rm -f /usr/lib/python2.6/vendor-packages/pkg
-	rm -f /var/svc/manifest/application/pkg-server.xml
-	rm -f /var/svc/manifest/application/pkg-update.xml
-	@cd web; pwd; $(MAKE) $(TARGET)
-	@cd brand; pwd; $(MAKE) $(TARGET)
-	@cd man; pwd; $(MAKE) $(TARGET)
-	@cd gui; pwd; $(MAKE) $(TARGET)
-	@cd um; pwd; $(MAKE) $(TARGET)
 
 test:
 	$(PYTHON) setup.py test
@@ -104,7 +86,7 @@ test:
 test-verbose:
 	$(PYTHON) setup.py test -v
 
-test-generate: 
+test-generate:
 	$(PYTHON) setup.py test -g
 
 test-leaks:

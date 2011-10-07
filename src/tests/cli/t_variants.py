@@ -20,7 +20,7 @@
 # CDDL HEADER END
 #
 
-# Copyright (c) 2009, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2009, 2011, Oracle and/or its affiliates. All rights reserved.
 
 import testutils
 if __name__ == "__main__":
@@ -32,8 +32,6 @@ import unittest
 
 
 class TestPkgVariants(pkg5unittest.SingleDepotTestCase):
-        # Only start/stop the depot once (instead of for every test)
-        persistent_setup = True
 
         bronze10 = """
         open bronze@1.0,5.11-0
@@ -61,6 +59,22 @@ class TestPkgVariants(pkg5unittest.SingleDepotTestCase):
         add file tmp/bronze_i386/etc/motd mode=0555 owner=root group=bin path=etc/motd variant.arch=i386
         close"""
 
+        mumble10 = """
+        open mumble-true@1.0,5.11-0
+        add set name=variant.mumble value=true
+        close
+        open mumble-false@1.0,5.11-0
+        add set name=variant.mumble value=false
+        close"""
+
+        mumblefratz = """
+        open mumblefratz@1.0,5.11-0
+        add set name=variant.mumble value=true
+        close
+        open mumblefratz@2.0,5.11-0
+        add set name=variant.mumble value=false
+        close"""
+
         misc_files = [ 
             "tmp/bronze_sparc/etc/motd",
             "tmp/bronze_i386/etc/motd",
@@ -79,10 +93,38 @@ class TestPkgVariants(pkg5unittest.SingleDepotTestCase):
 
         def setUp(self):
                 pkg5unittest.SingleDepotTestCase.setUp(self)
+                self.pkgsend_bulk(self.rurl, self.mumble10)
+                self.pkgsend_bulk(self.rurl, self.mumblefratz)
                 self.make_misc_files(self.misc_files)
 
         def test_variant_1(self):
                 self.__test_common("no-change", "no-change")
+
+        def test_variant_2_matching(self):
+                """Verify that install matching allows '*' even when some
+                packages are not supported by image variant."""
+
+                self.image_create(self.rurl,
+                    variants={ "variant.mumble": "false" })
+                self.pkg("install \*")
+                self.pkg("info mumble-true", exit=1)
+                self.pkg("info mumble-false")
+
+        def test_variant_3_latest(self):
+                """Verify that install matching for '@latest' matches the
+                newest version allowed by image variants."""
+
+                self.image_create(self.rurl,
+                    variants={ "variant.mumble": "true" })
+                self.pkg("install mumblefratz@latest")
+                self.pkg("info mumblefratz@1.0")
+                self.pkg("info mumblefratz@2.0", exit=1)
+
+                self.image_create(self.rurl,
+                    variants={ "variant.mumble": "false" })
+                self.pkg("install mumblefratz@latest")
+                self.pkg("info mumblefratz@1.0", exit=1)
+                self.pkg("info mumblefratz@2.0")
 
         def test_old_zones_pkgs(self):
                 self.__test_common("variant.opensolaris.zone",
@@ -123,21 +165,6 @@ class TestPkgVariants(pkg5unittest.SingleDepotTestCase):
                 self.file_contains("etc/zone_arch", arch)
                 self.file_contains("etc/isdebug", isdebug)
                 self.image_destroy()
-
-        def file_contains(self, path, string):
-                file_path = os.path.join(self.get_img_path(), path)
-                try:
-                        f = file(file_path)
-                except:
-                        self.assert_(False, "File %s is missing" % path)
-                for line in f:
-                        if string in line:
-                                f.close()
-                                break
-                else:
-                        f.close()
-                        self.assert_(False, "File %s does not contain %s" % (path, string))
-
 
 if __name__ == "__main__":
         unittest.main()

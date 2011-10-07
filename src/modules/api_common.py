@@ -21,7 +21,7 @@
 #
 
 #
-# Copyright (c) 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2010, 2011, Oracle and/or its affiliates. All rights reserved.
 #
 # Visible changes to classes here require an update to
 # doc/client_api_versions.txt and/or doc/server_api_versions.txt.
@@ -37,8 +37,9 @@ class LicenseInfo(object):
         """A class representing the license information a package
         provides.  Not intended for instantiation by API consumers."""
 
-        def __init__(self, pfmri, act, img=None, text=None):
+        def __init__(self, pfmri, act, img=None, text=None, alt_pub=None):
                 self.__action = act
+                self.__alt_pub = alt_pub
                 self.__fmri = pfmri
                 self.__img = img
                 self.__text = text
@@ -54,7 +55,8 @@ class LicenseInfo(object):
 
                 if not self.__img:
                         return self.__text
-                return self.__action.get_text(self.__img, self.__fmri)
+                return self.__action.get_text(self.__img, self.__fmri,
+                    alt_pub=self.__alt_pub)
 
         @property
         def fmri(self):
@@ -110,7 +112,6 @@ class PackageInfo(object):
         # Possible package states; these constants should match the values used
         # by the Image class.  Constants with negative values are not currently
         # available.
-        FROZEN = -1
         INCORPORATED = -2
         EXCLUDES = -3
         KNOWN = image.Image.PKG_STATE_KNOWN
@@ -119,11 +120,12 @@ class PackageInfo(object):
         OBSOLETE = image.Image.PKG_STATE_OBSOLETE
         RENAMED = image.Image.PKG_STATE_RENAMED
         UNSUPPORTED = image.Image.PKG_STATE_UNSUPPORTED
+        FROZEN = image.Image.PKG_STATE_FROZEN
 
-        __NUM_PROPS = 12
+        __NUM_PROPS = 13
         IDENTITY, SUMMARY, CATEGORIES, STATE, SIZE, LICENSES, LINKS, \
-            HARDLINKS, FILES, DIRS, DEPENDENCIES, DESCRIPTION = \
-            range(__NUM_PROPS)
+            HARDLINKS, FILES, DIRS, DEPENDENCIES, DESCRIPTION, \
+            ALL_ATTRIBUTES = range(__NUM_PROPS)
         ALL_OPTIONS = frozenset(range(__NUM_PROPS))
         ACTION_OPTIONS = frozenset([LINKS, HARDLINKS, FILES, DIRS,
             DEPENDENCIES])
@@ -132,7 +134,7 @@ class PackageInfo(object):
             category_info_list=None, states=None, publisher=None,
             version=None, build_release=None, branch=None, packaging_date=None,
             size=None, licenses=None, links=None, hardlinks=None, files=None,
-            dirs=None, dependencies=None, description=None):
+            dirs=None, dependencies=None, description=None, attrs=None):
                 self.pkg_stem = pkg_stem
 
                 self.summary = summary
@@ -154,9 +156,10 @@ class PackageInfo(object):
                 self.dirs = dirs
                 self.dependencies = dependencies
                 self.description = description
+                self.attrs = attrs or {}
 
         def __str__(self):
-                return self.fmri
+                return str(self.fmri)
 
         @staticmethod
         def build_from_fmri(f):
@@ -168,7 +171,29 @@ class PackageInfo(object):
                     version=version.release,
                     build_release=version.build_release, branch=version.branch,
                     packaging_date=version.get_timestamp().strftime("%c"),
-                    pfmri=str(f))
+                    pfmri=f)
+
+        def get_attr_values(self, name, modifiers=()):
+                """Returns a list of the values of the package attribute 'name'.
+
+                The 'modifiers' parameter, if present, is a dict containing
+                key/value pairs, all of which must be present on an action in
+                order for the values to be returned.
+
+                Returns an empty list if there are no values.
+                """
+
+                # XXX should the modifiers parameter be allowed to be a subset
+                # of an action's modifiers?
+                if isinstance(modifiers, dict):
+                        modifiers = tuple(
+                            (k, isinstance(modifiers[k], basestring) and
+                                tuple([sorted(modifiers[k])]) or
+                                tuple(sorted(modifiers[k])))
+                            for k in sorted(modifiers.iterkeys())
+                        )
+                return self.attrs.get(name, {modifiers: []}).get(
+                    modifiers, [])
 
 
 def _get_pkg_cat_data(cat, info_needed, actions=None,

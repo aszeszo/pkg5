@@ -20,7 +20,7 @@
 # CDDL HEADER END
 #
 
-# Copyright (c) 2009, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2009, 2011, Oracle and/or its affiliates. All rights reserved.
 
 import testutils
 if __name__ == "__main__":
@@ -58,13 +58,23 @@ class TestDependencyAnalyzer(pkg5unittest.Pkg5TestCase):
             "libc_path": "lib/libc.so.1",
             "pkg_path":
                 "usr/lib/python2.6/vendor-packages/pkg_test/client/__init__.py",
+            "bypass_path": "pkgdep_test/file.py",
+            "relative_dependee":
+                "usr/lib/python2.6/vendor-packages/pkg_test/client/bar.py",
+            "relative_depender":
+                "usr/lib/python2.6/vendor-packages/pkg_test/client/foo.py",
+            "runpath_mod_path": "opt/pkgdep_runpath/__init__.py",
+            "runpath_mod_test_path": "opt/pkgdep_runpath/pdtest.py",
             "script_path": "lib/svc/method/svc-pkg-depot",
-            "syslog_path": "var/log/syslog"
+            "syslog_path": "var/log/syslog",
+            "py_mod_path": "usr/lib/python2.6/vendor-packages/cProfile.py",
+            "py_mod_path24": "usr/lib/python2.4/vendor-packages/cProfile.py"
         }
 
         smf_paths = {
             "broken":
                 "var/svc/manifest/broken-service.xml",
+            "delete": "var/svc/manifest/delete-service.xml",
             "delivered_many_nodeps":
                 "var/svc/manifest/delivered-many-nodeps.xml",
             "foreign_many_nodeps":
@@ -120,6 +130,19 @@ file NOHASH group=bin mode=0755 owner=root path=%(indexer_path)s
 file NOHASH group=bin mode=0755 owner=root path=%(pkg_path)s
 """ % paths
 
+        python_mod_manf = """ \
+file NOHASH group=bin mode=0755 owner=root path=%(py_mod_path)s
+file NOHASH group=bin mode=0755 owner=root path=%(py_mod_path24)s
+""" % paths
+
+        relative_ext_depender_manf = """ \
+file NOHASH group=bin mode=0755 owner=root path=%(relative_depender)s
+""" % paths
+        relative_int_manf = """ \
+file NOHASH group=bin mode=0755 owner=root path=%(relative_dependee)s
+file NOHASH group=bin mode=0755 owner=root path=%(relative_depender)s
+""" % paths
+
         variant_manf_1 = """ \
 set name=variant.arch value=foo value=bar value=baz
 file NOHASH group=bin mode=0755 owner=root path=%(script_path)s
@@ -154,6 +177,7 @@ import os
 import sys
 import pkg_test.indexer_test.foobar as indexer
 import pkg.search_storage as ss
+import xml.dom.minidom
 from ..misc_test import EmptyI
 """
 
@@ -164,7 +188,17 @@ import os
 import sys
 import pkg_test.indexer_test.foobar as indexer
 import pkg.search_storage as ss
+import xml.dom.minidom
 from pkg_test.misc_test import EmptyI
+"""
+        # a python module that causes slightly different behaviour in
+        # modulefinder.py
+        python_module_text = """\
+#! /usr/bin/python
+
+class Foo(object):
+        def run(self):
+                import __main__
 """
 
         smf_fmris = {}
@@ -651,6 +685,39 @@ None of these services or instances declare any dependencies.
 </service>
 </service_bundle>
 """
+        smf_fmris["delete"] = [ \
+            "svc:/application/pkg5test/deleteservice",
+            "svc:/application/pkg5test/deleteservice:default" ]
+        smf_known_deps["svc:/application/pkg5test/deleteservice"] = []
+        smf_known_deps["svc:/application/pkg5test/deleteservice:default"] = []
+        smf_manifest_text["delete"] = \
+"""<?xml version="1.0"?>
+<!DOCTYPE service_bundle SYSTEM "/usr/share/lib/xml/dtd/service_bundle.dtd.1">
+<service_bundle type='manifest' name='delete-service'>
+
+<!-- svc:/application/pkg5test/deleteservice
+     svc:/application/pkg5test/deleteservice:default
+    While we do have an SMF dependency, this shouldn't be used to generate
+    pkg dependencies, since it has the 'delete' attribute set to true.
+-->
+<service
+
+	name='application/pkg5test/deleteservice'
+	type='service'
+	version='0.1'>
+	<create_default_instance enabled='true' />
+	<single_instance/>
+        <dependency name='network'
+                    grouping='require_all'
+                    restart_on='error'
+                    type='service'
+                    delete='true'>
+                    <service_fmri value='svc:/application/pkg5test/delivered-many'/>
+        </dependency>
+</service>
+</service_bundle>
+"""
+
         int_smf_manf = """\
 file NOHASH group=sys mode=0644 owner=root path=%(service_single)s
 file NOHASH group=sys mode=0644 owner=root path=%(delivered_many_nodeps)s
@@ -667,6 +734,11 @@ file NOHASH group=sys mode=0644 owner=root path=%(delivered_many_nodeps)s
 file NOHASH group=sys mode=0644 owner=root path=%(service_single)s
 """ % paths
 
+        delete_smf_manf = """\
+file NOHASH group=sys mode=0644 owner=root path=%(delete)s
+file NOHASH group=sys mode=0644 owner=root path=%(foreign_single_nodeps)s
+""" % paths
+
         faildeps_smf_manf = """\
 file NOHASH group=sys mode=0644 owner=root path=%(delivered_many_nodeps)s
 file NOHASH group=sys mode=0644 owner=root path=%(service_single)s
@@ -674,6 +746,137 @@ file NOHASH group=sys mode=0644 owner=root path=%(service_unknown)s
 """ % paths
 
         script_text = "#!/usr/bin/ksh -p\n"
+
+        # the following scripts and manifests are used to test pkgdepend
+        # runpath and bypass
+        python_bypass_text = """\
+#!/usr/bin/python2.6
+# This python script has an import used to test pkgdepend runpath and bypass
+# functionality. pdtest is installed in a non-standard location and generates
+# dependencies on multiple files (pdtest.py, pdtest.pyc, pdtest.pyo, etc.)
+import pkgdep_runpath.pdtest
+"""
+
+        # standard use of a runpath attribute
+        python_runpath_manf = """\
+file NOHASH group=sys mode=0755 owner=root path=%(bypass_path)s \
+    pkg.depend.runpath=opt:$PKGDEPEND_RUNPATH:dummy_directory
+file NOHASH group=sys mode=0755 owner=root path=%(runpath_mod_path)s
+file NOHASH group=sys mode=0755 owner=root path=%(runpath_mod_test_path)s
+""" % paths
+
+        # a manifest which has an empty runpath (which is zany) - we will
+        # throw an error here and want to test for it
+        python_empty_runpath_manf = """
+file NOHASH group=sys mode=0755 owner=root path=%(bypass_path)s \
+    pkg.depend.runpath=""
+file NOHASH group=sys mode=0755 owner=root path=%(runpath_mod_path)s
+file NOHASH group=sys mode=0755 owner=root path=%(runpath_mod_test_path)s
+""" % paths
+
+        # a manifest which has a broken runpath
+        python_invalid_runpath_manf = """
+file NOHASH group=sys mode=0755 owner=root path=%(bypass_path)s \
+    pkg.depend.runpath=foo pkg.depend.runpath=bar pkg.depend.runpath=opt
+file NOHASH group=sys mode=0755 owner=root path=%(runpath_mod_path)s
+file NOHASH group=sys mode=0755 owner=root path=%(runpath_mod_test_path)s
+""" % paths
+
+        # a manifest which needs a runpath in order to generate deps properly
+        python_invalid_runpath2_manf = """
+file NOHASH group=sys mode=0755 owner=root path=%(bypass_path)s \
+    pkg.depend.runpath=$PKGDEPEND_RUNPATH:foo:$PKGDEPEND_RUNPATH
+file NOHASH group=sys mode=0755 owner=root path=%(runpath_mod_path)s
+file NOHASH group=sys mode=0755 owner=root path=%(runpath_mod_test_path)s
+""" % paths
+
+
+        # a manifest that bypasses two files and sets a runpath
+        python_bypass_manf = """
+file NOHASH group=sys mode=0755 owner=root path=%(bypass_path)s \
+    pkg.depend.bypass-generate=opt/pkgdep_runpath/pdtest.py \
+    pkg.depend.bypass-generate=usr/lib/python2.6/lib-dynload/pkgdep_runpath/pdtestmodule.so \
+    pkg.depend.runpath=opt:$PKGDEPEND_RUNPATH
+file NOHASH group=sys mode=0755 owner=root path=%(runpath_mod_path)s
+file NOHASH group=sys mode=0755 owner=root path=%(runpath_mod_test_path)s
+""" % paths
+
+        # a manifest that generates a single dependency, which we want to
+        # bypass
+        ksh_bypass_manf = """
+file NOHASH group=sys mode=055 owner=root path=%(script_path)s \
+    pkg.depend.bypass-generate=usr/bin/ksh
+""" % paths
+
+        # a manifest that generates a single dependency, which we want to
+        # bypass.  Specifying just the filename means we should bypass all
+        # paths to that filename (we implicitly add ".*/")
+        ksh_bypass_filename_manf = """
+file NOHASH group=sys mode=055 owner=root path=%(script_path)s \
+    pkg.depend.bypass-generate=ksh
+""" % paths
+
+        # a manifest that generates a single dependency, which we want to
+        # bypass, duplicating the value
+        ksh_bypass_dup_manf = """
+file NOHASH group=sys mode=055 owner=root path=%(script_path)s \
+    pkg.depend.bypass-generate=usr/bin/ksh \
+    pkg.depend.bypass-generate=usr/bin/ksh
+""" % paths
+
+        # a manifest that declares bypasses, none of which match the
+        # dependences we generate
+        python_bypass_nomatch_manf = """
+file NOHASH group=sys mode=0755 owner=root path=%(bypass_path)s \
+    pkg.depend.bypass-generate=cats \
+    pkg.depend.bypass-generate=dogs \
+    pkg.depend.runpath=$PKGDEPEND_RUNPATH:opt
+file NOHASH group=sys mode=0755 owner=root path=%(runpath_mod_path)s
+file NOHASH group=sys mode=0755 owner=root path=%(runpath_mod_test_path)s
+""" % paths
+
+        # a manifest which uses a wildcard to bypass all dependency generation
+        python_wildcard_bypass_manf = """
+file NOHASH group=sys mode=0755 owner=root path=%(bypass_path)s \
+    pkg.depend.bypass-generate=.* \
+    pkg.depend.runpath=$PKGDEPEND_RUNPATH:opt
+file NOHASH group=sys mode=0755 owner=root path=%(runpath_mod_path)s
+file NOHASH group=sys mode=0755 owner=root path=%(runpath_mod_test_path)s
+""" % paths
+
+        # a manifest which uses a file wildcard to bypass generation
+        python_wildcard_file_bypass_manf = """
+file NOHASH group=sys mode=0755 owner=root path=%(bypass_path)s \
+    pkg.depend.bypass-generate=opt/pkgdep_runpath/.* \
+    pkg.depend.runpath=$PKGDEPEND_RUNPATH:opt
+file NOHASH group=sys mode=0755 owner=root path=%(runpath_mod_path)s
+file NOHASH group=sys mode=0755 owner=root path=%(runpath_mod_test_path)s
+""" % paths
+
+        # a manifest which uses a dir wildcard to bypass generation
+        python_wildcard_dir_bypass_manf = """
+file NOHASH group=sys mode=0755 owner=root path=%(bypass_path)s \
+    pkg.depend.bypass-generate=pdtest.py \
+    pkg.depend.bypass-generate=pdtest.pyc \
+    pkg.depend.bypass-generate=pdtest.pyo \
+    pkg.depend.bypass-generate=pdtest.so \
+    pkg.depend.bypass-generate=pdtestmodule.so \
+    pkg.depend.runpath=$PKGDEPEND_RUNPATH:opt
+file NOHASH group=sys mode=0755 owner=root path=%(runpath_mod_path)s
+file NOHASH group=sys mode=0755 owner=root path=%(runpath_mod_test_path)s
+""" % paths
+
+        # a manifest which uses a combination of directory, file and normal
+        # bypass entries
+        python_wildcard_combo_bypass_manf = """
+file NOHASH group=sys mode=0755 owner=root path=%(bypass_path)s \
+    pkg.depend.bypass-generate=pdtest.py \
+    pkg.depend.bypass-generate=usr/lib/python2.6/vendor-packages/.* \
+    pkg.depend.bypass-generate=usr/lib/python2.6/site-packages/pkgdep_runpath/pdtestmodule.so \
+    pkg.depend.runpath=$PKGDEPEND_RUNPATH:opt
+file NOHASH group=sys mode=0755 owner=root path=%(runpath_mod_path)s
+file NOHASH group=sys mode=0755 owner=root path=%(runpath_mod_test_path)s
+""" % paths
 
         def setUp(self):
                 pkg5unittest.Pkg5TestCase.setUp(self)
@@ -691,6 +894,24 @@ file NOHASH group=sys mode=0644 owner=root path=%(service_unknown)s
                 self.make_proto_text_file(
                     "%s/pkg_test/indexer_test/__init__.py" % pdir,
                     "#!/usr/bin/python")
+                self.make_proto_text_file("%s/cProfile.py" % pdir,
+                    self.python_module_text)
+                self.make_proto_text_file("%s/pkg_test/client/foo.py" % pdir,
+                    "#!/usr/bin/python\nimport bar")
+                self.make_proto_text_file("%s/pkg_test/client/bar.py" % pdir,
+                    "#!/usr/bin/python\n")
+                # install these in non-sys.path locations
+                self.make_proto_text_file(self.paths["bypass_path"],
+                    self.python_bypass_text)
+                self.make_proto_text_file(self.paths["runpath_mod_path"],
+                    "#!/usr/bin/python2.6")
+                self.make_proto_text_file(self.paths["runpath_mod_test_path"],
+                    "#!/usr/bin/python2.6")
+
+        def make_broken_python_test_file(self, py_version):
+                pdir = "usr/lib/python%s/vendor-packages" % py_version
+                self.make_proto_text_file("%s/cProfile.py" % pdir,
+                    "#!/usr/bin/python\n\\1" + self.python_module_text)
                 
 	def make_smf_test_files(self):
                 for manifest in self.smf_paths.keys():
@@ -781,6 +1002,7 @@ file NOHASH group=sys mode=0644 owner=root path=%(service_unknown)s
                 self.assertEqual(d.dep_key(), self.__path_to_key(
                     self.paths["syslog_path"]))
                 self.assertEqual(d.action.attrs["path"], "usr/foo")
+                self.assert_(dependencies.is_file_dependency(d))
 
         def test_ext_script(self):
                 """Check that a file that starts with #! and references a file
@@ -840,6 +1062,7 @@ file NOHASH group=sys mode=0644 owner=root path=%(service_unknown)s
                 for d in ds:
                         self.assert_(d.is_error())
                         self.assert_(d.dep_vars.is_satisfied())
+                        self.assert_(dependencies.is_file_dependency(d))
                         if d.dep_key() == self.__path_to_key(
                             self.paths["ksh_path"]):
                                 self.assertEqual(d.action.attrs["path"],
@@ -874,6 +1097,7 @@ file NOHASH group=sys mode=0644 owner=root path=%(service_unknown)s
                         self.assertEqual(
                                 d.action.attrs["path"],
                                 self.paths["curses_path"])
+                        self.assert_(dependencies.is_file_dependency(d))
 
                 t_path = self.make_manifest(self.ext_elf_manf)
                 self.make_elf(self.paths["curses_path"])
@@ -905,6 +1129,7 @@ file NOHASH group=sys mode=0644 owner=root path=%(service_unknown)s
                             self.__path_to_key(self.paths["libc_path"]))
                         self.assertEqual(d.action.attrs["path"],
                             self.paths["curses_path"])
+                        self.assert_(dependencies.is_file_dependency(d))
 
                 t_path = self.make_manifest(self.int_elf_manf)
                 self.make_elf(self.paths["curses_path"])
@@ -928,10 +1153,12 @@ file NOHASH group=sys mode=0644 owner=root path=%(service_unknown)s
 
                 def _check_all_res(res):
                         ds, es, ms, pkg_attrs = res
-                        mod_suffs = ["/__init__.py", ".py", ".pyc", ".pyo"]
+                        mod_suffs = ["/__init__.py", ".py", ".pyc", ".pyo",
+                            ".so", "module.so"]
                         mod_names = ["foobar", "misc_test", "os",
-                            "search_storage"]
-                        pkg_names = ["indexer_test", "pkg", "pkg_test"]
+                            "search_storage", "minidom"]
+                        pkg_names = ["indexer_test", "pkg", "pkg_test", "xml",
+                            "dom"]
                         expected_deps = set([("python",)] +
                             [tuple(sorted([
                                 "%s%s" % (n,s) for s in mod_suffs
@@ -977,9 +1204,12 @@ file NOHASH group=sys mode=0644 owner=root path=%(service_unknown)s
 
                 def _check_all_res(res):
                         ds, es, ms, pkg_attrs = res
-                        mod_suffs = ["/__init__.py", ".py", ".pyc", ".pyo"]
-                        mod_names = ["foobar", "os", "search_storage"]
-                        pkg_names = ["indexer_test", "pkg", "pkg_test"]
+                        mod_suffs = ["/__init__.py", ".py", ".pyc", ".pyo",
+                            ".so", "module.so"]
+                        mod_names = ["foobar", "os", "search_storage",
+                            "minidom"]
+                        pkg_names = ["indexer_test", "pkg", "pkg_test", "xml",
+                            "dom"]
                         expected_deps = set([("python",)] +
                             [tuple(sorted([
                                 "%s%s" % (n,s) for s in mod_suffs
@@ -1029,10 +1259,18 @@ file NOHASH group=sys mode=0644 owner=root path=%(service_unknown)s
 
                 def _check_all_res(res):
                         ds, es, ms, pkg_attrs = res
-                        mod_suffs = ["/__init__.py", ".py", ".pyc", ".pyo"]
+                        mod_suffs = ["/__init__.py", ".py", ".pyc", ".pyo",
+                            ".so", "module.so"]
                         mod_names = ["foobar", "misc_test", "os",
-                            "search_storage"]
-                        pkg_names = ["indexer_test", "pkg", "pkg_test"]
+                            "search_storage", "minidom"]
+                        pkg_names = ["indexer_test", "pkg", "pkg_test",
+                            "xml", "dom"]
+
+                        # for a multi-level import, we should have the correct
+                        # dir suffixes generated for the pkg.debug.depend.paths
+                        path_suffixes = {"minidom.py": "xml/dom",
+                            "dom/__init__.py": "xml"}
+
                         expected_deps = set([("python",)] +
                             [tuple(sorted([
                                 "%s%s" % (n,s) for s in mod_suffs
@@ -1054,6 +1292,24 @@ file NOHASH group=sys mode=0644 owner=root path=%(service_unknown)s
                                         raise RuntimeError("Got this "
                                             "unexpected dep:%s\n\nd:%s" %
                                             (d.dep_key()[0], d))
+
+                                # check the suffixes generated in our
+                                # pkg.debug.depend.path
+                                for bn in d.base_names:
+                                        if bn not in path_suffixes:
+                                                continue
+
+                                        suffix = path_suffixes[bn]
+                                        for p in d.run_paths:
+                                                self.assert_(
+                                                    p.endswith(suffix) or
+                                                    p == os.path.dirname(
+                                                    self.paths["pkg_path"]),
+                                                    "suffix %s not found in "
+                                                    "paths for %s: %s" %
+                                                    (suffix, bn, " ".join(
+                                                    d.run_paths)))
+
                                 expected_deps.remove(d.dep_key()[0])
                                 self.assertEqual(d.action.attrs["path"],
                                         self.paths["pkg_path"])
@@ -1071,6 +1327,110 @@ file NOHASH group=sys mode=0644 owner=root path=%(service_unknown)s
                 _check_all_res(dependencies.list_implicit_deps(t_path,
                     [self.proto_dir], {}, [], remove_internal_deps=False,
                     convert=False))
+
+        def test_python_imp_main(self):
+                """Ensure we can generate a dependency from a python module
+                known to cause different behaviour in modulefinder, where
+                we try to import __main__"""
+
+                t_path = self.make_manifest(self.python_mod_manf)
+                self.make_python_test_files(2.4)
+                self.make_python_test_files(2.6)
+
+                ds, es, ms, pkg_attrs = dependencies.list_implicit_deps(t_path,
+                    [self.proto_dir], {}, [], convert=False)
+                self.assert_(es != 0, "Unexpected errors reported: %s" % es)
+                self.assert_(ds != 2, "Unexpected deps reported: %s" % ds)
+
+        def test_python_relative_import_generation(self):
+                """This is a test for bug 14094.  It ensures that a python
+                dependency's paths include the directory into which the file
+                will be delivered."""
+
+                t_path = self.make_manifest(
+                    self.relative_ext_depender_manf)
+                self.make_python_test_files(2.6)
+
+                ds, es, ms, pkg_attrs = dependencies.list_implicit_deps(t_path,
+                    [self.proto_dir], {}, [], remove_internal_deps=True,
+                    convert=False)
+
+                pddt = "pkg.debug.depend.type"
+                pddp = "pkg.debug.depend.path"
+                pddf = "pkg.debug.depend.file"
+
+                mod_suffs = ["/__init__.py", ".py", ".pyc", ".pyo", ".so",
+                    "module.so"]
+                expected_deps = set(["bar%s" % s for s in mod_suffs])
+                if es != []:
+                        raise RuntimeError("Got errors in results:" +
+                            "\n".join([str(s) for s in es]))
+                self.assertEqual(ms, {})
+                self.assertEqual(len(ds), 2)
+                got_relative_import = False
+                for d in ds:
+                        if d.attrs[pddt] == "script":
+                                continue
+                        self.assertEqual(d.attrs[pddt], "python")
+                        self.assertEqualDiff(expected_deps, set(d.attrs[pddf]))
+                        ep = os.path.dirname(self.paths["relative_depender"])
+                        if ep not in d.attrs[pddp]:
+                                raise RuntimeError("Expected %s to be in the "
+                                    "list of pkg.debug.depend.path attribute "
+                                    "values, but it wasn't seen." % ep)
+
+                t_path = self.make_manifest(
+                    self.relative_int_manf)
+                self.assert_(os.path.exists(os.path.join(self.proto_dir,
+                    self.paths["relative_dependee"])))
+
+                ds, es, ms, pkg_attrs = dependencies.list_implicit_deps(t_path,
+                    [self.proto_dir], {}, [], remove_internal_deps=True,
+                    convert=False)
+                if es != []:
+                        raise RuntimeError("Got errors in results:" +
+                            "\n".join([str(s) for s in es]))
+                self.assertEqual(ms, {})
+                self.assertEqual(len(ds), 2, "Expected two dependencies, "
+                    "got:\n%s" % "\n".join([str(d) for d in ds]))
+                for d in ds:
+                        self.assertEqual(d.attrs[pddt], "script", "Got this "
+                            "dependency which wasn't of the expected type:%s" %
+                            d)
+
+                ds, es, ms, pkg_attrs = dependencies.list_implicit_deps(t_path,
+                    [self.proto_dir], {}, [], remove_internal_deps=False,
+                    convert=False)
+                if es != []:
+                        raise RuntimeError("Got errors in results:" +
+                            "\n".join([str(s) for s in es]))
+                self.assertEqual(ms, {})
+                self.assertEqual(len(ds), 3)
+                got_relative_import = False
+                for d in ds:
+                        if d.attrs[pddt] == "script":
+                                continue
+                        self.assertEqual(d.attrs[pddt], "python")
+                        self.assertEqualDiff(expected_deps, set(d.attrs[pddf]))
+                        ep = os.path.dirname(self.paths["relative_depender"])
+                        if ep not in d.attrs[pddp]:
+                                raise RuntimeError("Expected %s to be in the "
+                                    "list of pkg.debug.depend.path attribute "
+                                    "values, but it wasn't seen." % ep)
+
+        def test_bug_18031(self):
+                """Test that an python file which python cannot import due to a
+                syntax error doesn't cause a traceback."""
+
+                t_path = self.make_manifest(self.python_mod_manf)
+                self.make_broken_python_test_file(2.4)
+                self.make_broken_python_test_file(2.6)
+                ds, es, ms, pkg_attrs = dependencies.list_implicit_deps(t_path,
+                    [self.proto_dir], {}, [], convert=False)
+                self.assert_(es != 2, "Unexpected errors reported: %s" % es)
+                self.assert_(ds != 0, "Unexpected deps reported: %s" % ds)
+                for e in es:
+                        self.debug(str(e))
 
         def test_variants_1(self):
                 """Test that a file which satisfies a dependency only under a
@@ -1244,11 +1604,10 @@ file NOHASH group=sys mode=0644 owner=root path=%(service_unknown)s
 
                 self.assert_(d.is_error())
                 expected_not_sat = set([frozenset([
-                    ("variant.arch", "foo"),
                     ("variant.opensolaris.zone", "global")])])
                 expected_sat = set()
-                self.assertEqual(expected_sat, d.dep_vars.sat_set)
-                self.assertEqual(expected_not_sat, d.dep_vars.not_sat_set)
+                self.assertEqualDiff(expected_sat, d.dep_vars.sat_set)
+                self.assertEqualDiff(expected_not_sat, d.dep_vars.not_sat_set)
 
                 self.assertEqual(d.base_names[0], "libc.so.1")
                 self.assertEqual(set(d.run_paths), set(["lib", "usr/lib"]))
@@ -1351,6 +1710,7 @@ file NOHASH group=sys mode=0644 owner=root path=%(service_unknown)s
                             self.__path_to_key(self.paths["libc_path"]))
                         self.assertEqual(d.action.attrs["path"],
                             self.paths["curses_path"])
+                        self.assert_(dependencies.is_file_dependency(d))
 
                 t_path = self.make_manifest(self.int_elf_manf)
                 self.make_elf(os.path.join("foo", self.paths["curses_path"]))
@@ -1363,10 +1723,10 @@ file NOHASH group=sys mode=0644 owner=root path=%(service_unknown)s
                 if len(es) != 1:
                         raise RuntimeError("Got errors in results:" +
                             "\n".join([str(s) for s in es]))
-                if es[0].file_path != \
-                    os.path.join(self.proto_dir, self.paths["curses_path"]):
+                if es[0].file_path != self.paths["curses_path"]:
                         raise RuntimeError("Wrong file was found missing:\n%s" %
                             es[0])
+                self.assertEqual(es[0].dirs, [self.proto_dir])
                 self.assertEqual(ms, {})
                 self.assert_(len(d_map) == 0)
 
@@ -1421,10 +1781,10 @@ file NOHASH group=sys mode=0644 owner=root path=%(service_unknown)s
                 if len(es) != 1:
                         raise RuntimeError("Got errors in results:" +
                             "\n".join([str(s) for s in es]))
-                if es[0].file_path != \
-                    os.path.join(self.proto_dir, self.paths["syslog_path"]):
+                if es[0].file_path != self.paths["syslog_path"]:
                         raise RuntimeError("Wrong file was found missing:\n%s" %
                             es[0])
+                self.assertEqual(es[0].dirs, [self.proto_dir])
                 self.assert_(len(ms) == 0)
                 self.assert_(len(ds) == 1)
 
@@ -1445,10 +1805,12 @@ file NOHASH group=sys mode=0644 owner=root path=%(service_unknown)s
 
                 def _py_check_all_res(res):
                         ds, es, ms, pkg_attrs = res
-                        mod_suffs = ["/__init__.py", ".py", ".pyc", ".pyo"]
+                        mod_suffs = ["/__init__.py", ".py", ".pyc", ".pyo",
+                            ".so", "module.so"]
                         mod_names = ["foobar", "misc_test", "os",
-                            "search_storage"]
-                        pkg_names = ["indexer_test", "pkg", "pkg_test"]
+                            "search_storage", "minidom"]
+                        pkg_names = ["indexer_test", "pkg", "pkg_test",
+                            "xml", "dom"]
                         expected_deps = set([("python",)] +
                             [tuple(sorted([
                                 "%s%s" % (n,s) for s in mod_suffs
@@ -1490,10 +1852,10 @@ file NOHASH group=sys mode=0644 owner=root path=%(service_unknown)s
                 if len(es) != 1:
                         raise RuntimeError("Got errors in results:" +
                             "\n".join([str(s) for s in es]))
-                if es[0].file_path != \
-                    os.path.join(self.proto_dir, self.paths["indexer_path"]):
+                if es[0].file_path != self.paths["indexer_path"]:
                         raise RuntimeError("Wrong file was found missing:\n%s" %
                             es[0])
+                self.assertEqual(es[0].dirs, [self.proto_dir])
                 self.assertEqual(len(ds), 0)
                 self.assertEqual(len(ms), 0)
 
@@ -1547,17 +1909,18 @@ file NOHASH group=sys mode=0644 owner=root path=%(service_unknown)s
                 present in the provided pkg_attrs dictionary. Errors are
                 reported in an assertion message that includes manifest_name."""
 
-                self.assert_(pkg_attrs.has_key("opensolaris.smf.fmri"),
-                    "Missing opensolaris.smf.fmri key for %s" % manifest_name)
+                self.assert_(pkg_attrs.has_key("org.opensolaris.smf.fmri"),
+                    "Missing org.opensolaris.smf.fmri key for %s" %
+                    manifest_name)
 
-                found = len(pkg_attrs["opensolaris.smf.fmri"])
+                found = len(pkg_attrs["org.opensolaris.smf.fmri"])
                 self.assertEqual(found, len(expected),
                     "Wrong no. of SMF instances/services found for %s: expected"
                     " %s got %s" % (manifest_name, len(expected), found))
 
                 for fmri in expected:
                             self.assert_(
-                                fmri in pkg_attrs["opensolaris.smf.fmri"],
+                                fmri in pkg_attrs["org.opensolaris.smf.fmri"],
                                 "%s not in list of SMF instances/services "
                                 "from %s" % (fmri, manifest_name))
 
@@ -1599,6 +1962,7 @@ file NOHASH group=sys mode=0644 owner=root path=%(service_unknown)s
                     convert=False)
                 self.assert_(len(ds) == 0, "Expected 0 dependencies, got %s" %
                     len(ds))
+                self.assert_(dependencies.is_file_dependency(d))
 
 
         def test_ext_smf_manifest(self):
@@ -1716,6 +2080,375 @@ file NOHASH group=sys mode=0644 owner=root path=%(service_unknown)s
                     self.smf_fmris["service_unknown"],
                     "faildeps_smf_manf")
 
+        def test_delete_smf_manifest(self):
+                """We don't create any SMF dependencies where a manifest
+                specifies a 'delete' attribute in its dependency."""
+
+                t_path = self.make_manifest(self.delete_smf_manf)
+                self.make_smf_test_files()
+
+                ds, es, ms, pkg_attrs = dependencies.list_implicit_deps(t_path,
+                    [self.proto_dir], {}, [], remove_internal_deps=False,
+                    convert=False)
+
+                self.assert_(len(es) == 0,
+                    "Detected %s error(s), expected 0" % len(es))
+                self.assert_(len(ds) == 0, "Expected 0 dependencies, got %s" %
+                    len(ds))
+                self.check_smf_fmris(pkg_attrs, self.smf_fmris["delete"] +
+                    self.smf_fmris["foreign_single_nodeps"], "delete")
+
+        def test_runpath_1(self):
+                """Test basic functionality of runpaths."""
+
+                t_path = self.make_manifest(self.python_runpath_manf)
+                self.make_python_test_files(2.6)
+
+                ds, es, ms, pkg_attrs = dependencies.list_implicit_deps(t_path,
+                    [self.proto_dir], {}, [], remove_internal_deps=False,
+                    convert=False)
+                self.assert_(es==[], "Unexpected errors reported: %s" % es)
+
+                for dep in ds:
+                        # only interested in seeing that our runpath was changed
+                        if "pdtest.py" in dep.attrs["pkg.debug.depend.file"]:
+                                self.assert_("opt/pkgdep_runpath" in
+                                    dep.attrs["pkg.debug.depend.path"])
+                                self.assert_("usr/lib/python2.6/pkgdep_runpath"
+                                    in dep.attrs["pkg.debug.depend.path"])
+                                # ensure this dependency was indeed generated
+                                # as a result of our test file
+                                self.assert_("pkgdep_test/file.py" in
+                                    dep.attrs["pkg.debug.depend.reason"])
+                        self.assert_(dependencies.is_file_dependency(dep))
+
+        def test_runpath_2(self):
+                """Test invalid runpath attributes."""
+
+                self.make_python_test_files(2.6)
+
+                # test a runpath with multiple values
+                t_path = self.make_manifest(self.python_invalid_runpath_manf)
+                ds, es, ms, pkg_attrs = dependencies.list_implicit_deps(t_path,
+                    [self.proto_dir], {}, [], remove_internal_deps=False,
+                    convert=False)
+                self.assert_(es != [], "No errors reported for broken runpath")
+
+                # test a runpath with multiple $PD_DEFAULT_RUNPATH components
+                t_path = self.make_manifest(self.python_invalid_runpath2_manf)
+                ds, es, ms, pkg_attrs = dependencies.list_implicit_deps(t_path,
+                    [self.proto_dir], {}, [], remove_internal_deps=False,
+                    convert=False)
+                self.assert_(es != [], "No errors reported for broken runpath")
+
+        def test_runpath_3(self):
+                """Test setting an empty runpath attribute"""
+
+                t_path = self.make_manifest(self.python_empty_runpath_manf)
+                self.make_python_test_files(2.6)
+
+                ds, es, ms, pkg_attrs = dependencies.list_implicit_deps(t_path,
+                    [self.proto_dir], {}, [], remove_internal_deps=False,
+                    convert=False)
+                self.assert_(es != [], "No errors reported for empty runpath")
+
+        def validate_bypass_dep(self, dep):
+                """Given a dependency which may be bypassed, if it has been,
+                it should have been expanded into a dependency containing just
+                pkg.debug.depend.fullpath entries.
+                """
+                self.assert_(dependencies.is_file_dependency(dep))
+
+                if dep.attrs.get("pkg.debug.depend.fullpath", None):
+                        for val in ["path", "file"]:
+                                self.assert_("pkg.debug.depend.%s" % val
+                                    not in dep.attrs, "We should not see a %s "
+                                    "entry in this dependency: %s" %
+                                    (val, dep))
+                                self.assert_(not dep.run_paths,
+                                    "Unexpected run_paths: %s" % dep)
+                                self.assert_(not dep.base_names,
+                                    "Unexpected base_names: %s" % dep)
+                else:
+                        self.assert_("pkg.debug.depend.fullpath" not in
+                            dep.attrs, "We should not see a fullpath "
+                            "entry in this dependency: %s" % dep)
+                        self.assert_(not dep.full_paths,
+                            "Unexpected full_paths: %s" % dep)
+
+        def verify_bypass(self, ds, es, bypass):
+                """Given a list of dependencies, and a list of bypass paths,
+                verify that we have not generated a dependency on any of the
+                items in the bypass list.
+
+                If a bypass has been performed, the dependency will have been
+                expanded to contain pkg.debug.depend.fullpath values,
+                otherwise we should have p.d.d.path and p.d.d.file items.
+                We should never have all three attributes set.
+                """
+
+                self.assert_(len(es) == 0, "Errors reported during bypass: %s" %
+                    es)
+
+                for dep in ds:
+                        # generate all possible paths this dep could represent
+                        dep_paths = set()
+                        self.validate_bypass_dep(dep)
+                        if dep.attrs.get("pkg.debug.depend.fullpath", None):
+                                dep_paths.update(
+                                    dep.attrs["pkg.debug.depend.fullpath"])
+                        else:
+                                for filename in dep.base_names:
+                                        dep_paths.update([os.path.join(dir,
+                                            filename)
+                                            for dir in dep.run_paths])
+
+                        self.assert_(dependencies.is_file_dependency(dep))
+
+                        # finally, check the dependencies
+                        if dep_paths.intersection(set(bypass)):
+                                self.debug("Some items were not bypassed: %s" %
+                                    "\n".join(sorted(list(
+                                    dep_paths.intersection(set(bypass))))))
+                                return False
+                return True
+
+        def verify_dep_generation(self, ds, expected):
+                """Verifies that we have generated dependencies on the given
+                files"""
+                dep_paths = set()
+                for dep in ds:
+                        self.debug(dep)
+                        self.validate_bypass_dep(dep)
+                        if dep.attrs.get("pkg.debug.depend.fullpath", None):
+                                dep_paths.update(
+                                    dep.attrs["pkg.debug.depend.fullpath"])
+                        else:
+                                # generate all paths this dep could represent
+                                for filename in dep.base_names:
+                                        dep_paths.update([
+                                            os.path.join(dir, filename)
+                                            for dir in dep.run_paths])
+                for item in expected:
+                        if item not in dep_paths:
+                                self.debug("Expected to see dependency on %s" %
+                                    item)
+                                return False
+                return True
+
+        def test_bypass_1(self):
+                """Ensure we can bypass dependency generation on a given file,
+                or set of files
+                """
+                # this manifest should result in multiple dependencies
+                t_path = self.make_manifest(self.python_bypass_manf)
+                self.make_python_test_files(2.6)
+
+                ds, es, ms, pkg_attrs = dependencies.list_implicit_deps(t_path,
+                    [self.proto_dir], {}, [], remove_internal_deps=False,
+                    convert=False)
+                self.assert_(self.verify_bypass(ds, es, [
+                    "opt/pkgdep_runpath/pdtest.py",
+                    "usr/lib/python2.6/lib-dynload/pkgdep_runpath/pdtestmodule.so"]),
+                    "Python script was not bypassed")
+                # now check we depend on some files which should not have been
+                # bypassed
+                self.assert_(self.verify_dep_generation(ds,
+                    ["usr/lib/python2.6/lib-dynload/pkgdep_runpath/pdtest.so",
+                    "usr/lib/python2.6/plat-sunos5/pkgdep_runpath/pdtest/__init__.py",
+                    "usr/lib/python2.6/lib-dynload/pkgdep_runpath/pdtest.py",
+                    "opt/pkgdep_runpath/pdtest.pyc"]))
+
+                # now run this again as a control, this time skipping bypass
+                ds, es, ms, pkg_attrs = dependencies.list_implicit_deps(t_path,
+                    [self.proto_dir], {}, [], remove_internal_deps=False,
+                    convert=False, ignore_bypass=True)
+                # the first two items in the list were previously bypassed
+                self.assert_(self.verify_dep_generation(ds,
+                    ["opt/pkgdep_runpath/pdtest.py",
+                    "usr/lib/python2.6/lib-dynload/pkgdep_runpath/pdtestmodule.so",
+                    "usr/lib/python2.6/lib-dynload/pkgdep_runpath/pdtest.so",
+                    "usr/lib/python2.6/plat-sunos5/pkgdep_runpath/pdtest/__init__.py",
+                    "opt/pkgdep_runpath/pdtest.pyc"]),
+                    "Python script did not generate a dependency on bypassed")
+
+                self.make_proto_text_file(self.paths["script_path"],
+                    self.script_text)
+
+                # these manifests should only generate 1 dependency
+                # we also test that duplicated bypass entries are ignored
+                for manifest in [self.ksh_bypass_manf,
+                    self.ksh_bypass_dup_manf, self.ksh_bypass_filename_manf]:
+                        t_path = self.make_manifest(manifest)
+
+                        ds, es, ms, pkg_attrs = \
+                            dependencies.list_implicit_deps(t_path,
+                            [self.proto_dir], {}, [],
+                            remove_internal_deps=False, convert=False)
+                        self.assert_(len(ds) == 0,
+                            "Did not generate exactly 0 dependencies")
+                        self.assert_(self.verify_bypass(ds, es,
+                            ["usr/bin/ksh"]), "Ksh script was not bypassed")
+
+                        # don't perform bypass
+                        ds, es, ms, pkg_attrs = \
+                            dependencies.list_implicit_deps(t_path,
+                            [self.proto_dir], {}, [],
+                            remove_internal_deps=False, convert=False,
+                            ignore_bypass=True)
+                        self.assert_(len(ds) == 1,
+                            "Did not generate exactly 1 dependency on ksh")
+                        self.assert_(self.verify_dep_generation(
+                            ds, ["usr/bin/ksh"]),
+                            "Ksh script did not generate a dependency on ksh")
+
+        def test_bypass_2(self):
+                """Ensure that bypasses containing wildcards work"""
+                t_path = self.make_manifest(self.python_wildcard_bypass_manf)
+                self.make_python_test_files(2.6)
+
+                ds, es, ms, pkg_attrs = dependencies.list_implicit_deps(t_path,
+                    [self.proto_dir], {}, [], remove_internal_deps=False,
+                    convert=False)
+
+                self.assert_(len(es) == 0, "Errors reported during bypass: %s" %
+                    es)
+
+                # we should have bypassed all dependency generation on all files
+                self.assert_(len(ds) == 0, "Generated dependencies despite "
+                    "request to bypass all dependency generation.")
+
+                t_path = self.make_manifest(
+                    self.python_wildcard_dir_bypass_manf)
+
+                ds, es, ms, pkg_attrs = dependencies.list_implicit_deps(t_path,
+                    [self.proto_dir], {}, [], remove_internal_deps=False,
+                    convert=False)
+
+                self.assert_(self.verify_bypass(ds, es, [
+                    "usr/lib/python2.6/lib-dynload/pkgdep_runpath/pdtest.pyo",
+                    "usr/lib/python2.6/lib-old/pkgdep_runpath/pdtestmodule.so"]),
+                    "Directory bypass wildcard failed")
+                self.assert_(self.verify_dep_generation(ds, [
+                    "usr/lib/python2.6/pkgdep_runpath/__init__.py",
+                    "usr/lib/python2.6/lib-old/pkgdep_runpath/__init__.py"]),
+                    "Failed to generate dependencies, despite dir-wildcards")
+
+                t_path = self.make_manifest(
+                    self.python_wildcard_file_bypass_manf)
+
+                ds, es, ms, pkg_attrs = dependencies.list_implicit_deps(t_path,
+                    [self.proto_dir], {}, [], remove_internal_deps=False,
+                    convert=False)
+                self.assert_(self.verify_bypass(ds, es, [
+                    "opt/pkgdep_runpath/pdtest.pyo",
+                    "opt/pkgdep_runpath/pdtestmodule.so"]),
+                    "Failed to bypass some paths despite use of file-wildcard")
+                # we should still have dependencies on these
+                self.assert_(self.verify_dep_generation(ds, [
+                    "usr/lib/python2.6/lib-dynload/pkgdep_runpath/pdtest.pyo",
+                    "usr/lib/python2.6/lib-old/pkgdep_runpath/pdtestmodule.so"]),
+                    "Failed to generate dependencies, despite file-wildcards")
+
+                # finally, test a combination of the above, we have:
+                # pkg.depend.bypass-generate=.*/pdtest.py \
+                # pkg.depend.bypass-generate=usr/lib/python2.6/vendor-packages/.* \
+                # pkg.depend.bypass-generate=usr/lib/python2.6/site-packages/pkgdep_runpath/pdtestmodule.so
+                t_path = self.make_manifest(
+                    self.python_wildcard_combo_bypass_manf)
+
+                ds, es, ms, pkg_attrs = dependencies.list_implicit_deps(t_path,
+                    [self.proto_dir], {}, [], remove_internal_deps=False,
+                    convert=False)
+                self.assert_(self.verify_bypass(ds, es, [
+                    "opt/pkgdep_runpath/pdtest.py",
+                    "usr/lib/python2.6/vendor-packages/pkgdep_runpath/pdtest.py"
+                    "usr/lib/python2.6/site-packages/pkgdep_runpath/pdtest.py",
+                    "usr/lib/python2.6/site-packages/pkgdep_runpath/pdtestmodule.so"]),
+                    "Failed to bypass some paths despite use of combo-wildcard")
+                # we should still have dependencies on these
+                self.assert_(self.verify_dep_generation(ds, [
+                    "usr/lib/python2.6/site-packages/pkgdep_runpath/pdtest.pyc",
+                    "usr/lib/python2.6/lib-old/pkgdep_runpath/pdtestmodule.so"]),
+                    "Failed to generate dependencies, despite file-wildcards")
+
+        def test_bypass_3(self):
+                """Ensure that bypasses which don't match any dependencies have
+                no effect on the computed dependencies."""
+                t_path = self.make_manifest(self.python_bypass_nomatch_manf)
+                self.make_python_test_files(2.6)
+
+                ds, es, ms, pkg_attrs = dependencies.list_implicit_deps(t_path,
+                    [self.proto_dir], {}, [], remove_internal_deps=False,
+                    convert=False)
+
+                for dep in ds:
+                        # we expect that there are only file/path attributes
+                        # since no bypasses have been performed
+                        self.assert_("pkg.debug.depend.file" in dep.attrs)
+                        self.assert_("pkg.debug.depend.path" in dep.attrs)
+                        self.assert_("pkg.debug.depend.fullpath"
+                            not in dep.attrs)
+
+                def all_paths(ds):
+                        """Return all paths this list of dependencies could
+                        generate"""
+                        dep_paths = set()
+                        for dep in ds:
+                                # generate all paths this dep could represent
+                                dep_paths = set()
+                                for filename in dep.base_names + ["*"]:
+                                        dep_paths.update(os.path.join(dir, filename)
+                                            for dir in dep.run_paths + ["*"])
+                                dep_paths.remove("*/*")
+                        return dep_paths
+
+                gen_paths = all_paths(ds)
+
+                # now run again, without trying to perform dependency bypass
+                ds, es, ms, pkg_attrs = dependencies.list_implicit_deps(t_path,
+                    [self.proto_dir], {}, [], remove_internal_deps=False,
+                    convert=False, ignore_bypass=True)
+
+                self.assert_(gen_paths == all_paths(ds),
+                    "generating dependencies with non-matching bypass entries "
+                    "changed the returned dependencies")
+
+        def test_symlinked_proto(self):
+                """Ensure that the behavior when using a symlink to a proto dir
+                is identical to the behavior when using that proto dir for all
+                flavors."""
+
+                multi_flavor_manf = (self.ext_hardlink_manf +
+                     self.ext_script_manf + self.ext_elf_manf +
+                     self.ext_python_manf + self.ext_smf_manf +
+                     self.relative_int_manf)
+                t_path = self.make_manifest(multi_flavor_manf)
+
+                linked_proto = os.path.join(self.test_root, "linked_proto")
+                os.symlink(self.proto_dir, linked_proto)
+
+                self.make_proto_text_file(self.paths["script_path"],
+                    self.script_text)
+                self.make_smf_test_files()
+                self.make_python_test_files(2.6)
+                self.make_elf(self.paths["curses_path"])
+
+                ds, es, ms, pkg_attrs = dependencies.list_implicit_deps(t_path,
+                    [self.proto_dir], {}, [], remove_internal_deps=False,
+                    convert=False)
+
+                smf.SMFManifestDependency._clear_cache()
+
+                # now run the same function, this time using our symlinked dir
+                dsl, esl, msl, pkg_attrsl = dependencies.list_implicit_deps(
+                    t_path, [linked_proto], {}, [],
+                    remove_internal_deps=False, convert=False)
+
+                for a, b in [(ds, dsl), (pkg_attrs, pkg_attrsl)]:
+                            self.assert_(a == b, "Differences found comparing "
+                                "proto_dir with symlinked proto_dir: %s vs. %s"
+                                % (a, b))
 
 if __name__ == "__main__":
         unittest.main()

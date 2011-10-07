@@ -21,7 +21,7 @@
 #
 
 #
-# Copyright (c) 2009, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2009, 2011, Oracle and/or its affiliates. All rights reserved.
 #
 
 import testutils
@@ -60,7 +60,6 @@ class TestP5I(pkg5unittest.Pkg5TestCase):
   "publishers": [
     {
       "alias": "cat", 
-      "intermediate_certs": [], 
       "name": "bobcat", 
       "packages": [
         "pkg:/foo@1.0,5.11-0"
@@ -81,8 +80,7 @@ class TestP5I(pkg5unittest.Pkg5TestCase):
           "registration_uri": "", 
           "related_uris": []
         }
-      ], 
-      "signing_ca_certs": []
+      ]
     }
   ], 
   "version": 1
@@ -97,15 +95,14 @@ class TestP5I(pkg5unittest.Pkg5TestCase):
 
         def __get_bobcat_pub(self, omit_repo=False):
                 # First build a publisher object matching our expected data.
-                repos = []
+                repo = None
                 if not omit_repo:
                         repo = publisher.Repository(description="xkcd.net/325",
                             legal_uris=["http://xkcd.com/license.html"],
                             name="source", origins=["http://localhost:12001/"],
                             refresh_seconds=43200)
-                        repos.append(repo)
                 pub = publisher.Publisher("bobcat", alias="cat",
-                    repositories=repos)
+                    repository=repo)
 
                 return pub
 
@@ -143,7 +140,7 @@ class TestP5I(pkg5unittest.Pkg5TestCase):
 
                         self.assertEqual(pub.prefix, "bobcat")
                         self.assertEqual(pub.alias, "cat")
-                        repo = pub.selected_repository
+                        repo = pub.repository
                         self.assertEqual(repo.name, "source")
                         self.assertEqual(repo.description, "xkcd.net/325")
                         self.assertEqual(repo.legal_uris[0],
@@ -226,11 +223,9 @@ class TestP5I(pkg5unittest.Pkg5TestCase):
   "publishers": [
     {
       "alias": "cat", 
-      "intermediate_certs": [], 
       "name": "bobcat", 
       "packages": [], 
-      "repositories": [], 
-      "signing_ca_certs": []
+      "repositories": []
     }
   ], 
   "version": 1
@@ -250,7 +245,7 @@ class TestP5I(pkg5unittest.Pkg5TestCase):
 
                 # Now parse the result and verify no repositories are defined.
                 pub, pkg_names = p5i.parse(data=output)[0]
-                self.assert_(not pub.selected_repository)
+                self.assert_(not pub.repository)
 
                 # Next, test the partial repository configuration case.  No
                 # origin is provided, but everything else is.
@@ -259,7 +254,6 @@ class TestP5I(pkg5unittest.Pkg5TestCase):
   "publishers": [
     {
       "alias": "cat", 
-      "intermediate_certs": [], 
       "name": "bobcat", 
       "packages": [], 
       "repositories": [
@@ -276,8 +270,7 @@ class TestP5I(pkg5unittest.Pkg5TestCase):
           "registration_uri": "", 
           "related_uris": []
         }
-      ], 
-      "signing_ca_certs": []
+      ]
     }
   ], 
   "version": 1
@@ -286,7 +279,7 @@ class TestP5I(pkg5unittest.Pkg5TestCase):
                 pub = self.__get_bobcat_pub()
 
                 # Nuke the origin data.
-                pub.selected_repository.reset_origins()
+                pub.repository.reset_origins()
 
                 # Dump the p5i data.
                 fobj = cStringIO.StringIO()
@@ -300,7 +293,7 @@ class TestP5I(pkg5unittest.Pkg5TestCase):
                 # Now parse the result and verify that there is a repository,
                 # but without origins information.
                 pub, pkg_names = p5i.parse(data=output)[0]
-                self.assertPrettyEqual(pub.selected_repository.origins, [])
+                self.assertPrettyEqual(pub.repository.origins, [])
 
 
 if __name__ == "__main__":

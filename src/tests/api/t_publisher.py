@@ -21,7 +21,7 @@
 #
 
 #
-# Copyright (c) 2009, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2009, 2011, Oracle and/or its affiliates. All rights reserved.
 #
 
 
@@ -46,6 +46,9 @@ import pkg.misc as misc
 class TestPublisher(pkg5unittest.Pkg5TestCase):
         """Class to test the functionality of the pkg.client.publisher module.
         """
+
+        # Tests in this suite use the read only data directory.
+        need_ro_data = True
 
         misc_files = [ "test.cert", "test.key", "test2.cert", "test2.key" ]
 
@@ -97,12 +100,8 @@ class TestPublisher(pkg5unittest.Pkg5TestCase):
                     setattr, uobj, "priority", "foo")
                 self.assertRaises(api_errors.BadRepositoryAttributeValue,
                     setattr, uobj, "ssl_cert", -1)
-                self.assertRaises(api_errors.NoSuchCertificate, setattr, uobj,
-                    "ssl_cert", nsfile)
                 self.assertRaises(api_errors.BadRepositoryAttributeValue,
                     setattr, uobj, "ssl_key", -1)
-                self.assertRaises(api_errors.NoSuchKey, setattr, uobj,
-                    "ssl_key", nsfile)
 
                 # Verify that changing the URI scheme will null properties that
                 # no longer apply.
@@ -336,8 +335,7 @@ class TestPublisher(pkg5unittest.Pkg5TestCase):
                     "client_uuid": "2c6a8ff8-20e5-11de-a818-001fd0979039",
                     "disabled": True,
                     "meta_root": os.path.join(self.test_root, "bobcat"),
-                    "repositories": [robj, r2obj],
-                    "selected_repository": r2obj,
+                    "repository": r2obj,
                 }
 
                 # Check that all properties can be set at construction time.
@@ -351,23 +349,20 @@ class TestPublisher(pkg5unittest.Pkg5TestCase):
                 # Verify that a copy matches its original.
                 cpobj = copy.copy(pobj)
                 for p in pprops:
-                        if p in ("repositories", "selected_repository"):
+                        if p == "repository":
                                 # These attributes can't be directly compared.
                                 continue
                         self.assertEqual(getattr(pobj, p), getattr(cpobj, p))
 
                 # Assume that if the origins match, we have the right selected
                 # repository.
-                self.assertEqual(cpobj.selected_repository.origins,
+                self.assertEqual(cpobj.repository.origins,
                     r2obj.origins)
 
-                # Compare all of the repository objects individually.  Assume
-                # that if the source_object_id matches, that the copy happened
-                # correctly.
-                for i in range(0, len(pobj.repositories)):
-                        srepo = pobj.repositories[i]
-                        crepo = cpobj.repositories[i]
-                        self.assertEqual(id(srepo), crepo._source_object_id)
+                # Compare the source_object_id of the copied repository object
+                # with the id of the source repository object.
+                self.assertEqual(id(pobj), cpobj._source_object_id)
+
                 cpobj = None
 
                 # Verify that individual properties can be set.
@@ -383,24 +378,12 @@ class TestPublisher(pkg5unittest.Pkg5TestCase):
                                 setattr(pobj, p, pprops[p])
                         self.assertEqual(getattr(pobj, p), pprops[p])
 
-                pobj.selected_repository = robj
-                self.assertEqual(pobj.selected_repository, robj)
+                pobj.repository = robj
+                self.assertEqual(pobj.repository, robj)
 
                 # An invalid value shouldn't be allowed.
                 self.assertRaises(api_errors.UnknownRepository, setattr,
-                    pobj, "selected_repository", -1)
-
-                # A repository object not already in the list of repositories
-                # shouldn't be allowed.
-                self.assertRaises(api_errors.UnknownRepository, setattr,
-                    pobj, "selected_repository", publisher.Repository())
-
-                # Verify that management methods work as expected.
-                pobj.set_selected_repository(origin=r2obj.origins[-1])
-                self.assertEqual(pobj.selected_repository, r2obj)
-
-                pobj.set_selected_repository(name=robj.name)
-                self.assertEqual(pobj.selected_repository, robj)
+                    pobj, "repository", -1)
 
                 pobj.reset_client_uuid()
                 self.assertNotEqual(pobj.client_uuid, None)
@@ -411,58 +394,6 @@ class TestPublisher(pkg5unittest.Pkg5TestCase):
 
                 pobj.remove_meta_root()
                 self.assertFalse(os.path.exists(pobj.meta_root))
-
-                # Verify that get and remove works as expected.
-                for r in pprops["repositories"]:
-                        gr = pobj.get_repository(name=r.name)
-                        self.assertEqual(r, gr)
-
-                        gr = pobj.get_repository(origin=r.origins[-1])
-                        self.assertEqual(r, gr)
-
-                        if r == pobj.selected_repository:
-                                # Attempting to remove the selected repository
-                                # should raise an exception.
-                                ex = api_errors.SelectedRepositoryRemoval
-                                self.assertRaises(ex, pobj.remove_repository,
-                                    name=r.name)
-                        else:
-                                pobj.remove_repository(name=r.name)
-                                self.assertRaises(api_errors.UnknownRepository,
-                                    pobj.get_repository, name=r.name)
-
-                # Verify that adding, removing, and unsetting ca certs works
-                # as expected.
-                pobj.create_meta_root()
-                self.pub_cas_dir = os.path.join(self.ro_data_root,
-                    "signing_certs", "produced", "publisher_cas")
-                ca_path = os.path.join(self.pub_cas_dir, "pubCA1_ta3_cert.pem")
-                with open(ca_path, "rb") as fh:
-                        ca_data = fh.read()
-                hsh = self.calc_file_hash(ca_path)
-                # Test revoking a ca cert.
-                pobj.revoke_ca_cert(hsh)
-                self.assert_(hsh in pobj.revoked_ca_certs)
-                # Test moving from revoked to approved
-                pobj.approve_ca_cert(ca_data, manual=True)
-                self.assert_(hsh not in pobj.revoked_ca_certs)
-                self.assert_(hsh in pobj.approved_ca_certs)
-                self.assert_(hsh in pobj.signing_ca_certs)
-                # Test unsetting from approved
-                pobj.unset_ca_cert(hsh)
-                self.assert_(hsh not in pobj.revoked_ca_certs)
-                self.assert_(hsh not in pobj.approved_ca_certs)
-                # Test approving a ca cert
-                pobj.approve_ca_cert(ca_data, manual=True)
-                self.assert_(hsh in pobj.approved_ca_certs)
-                # Test moving from approved to revoked
-                pobj.revoke_ca_cert(hsh)
-                self.assert_(hsh in pobj.revoked_ca_certs)
-                self.assert_(hsh not in pobj.approved_ca_certs)
-                # Test moving from revoked to unset
-                pobj.unset_ca_cert(hsh)
-                self.assert_(hsh not in pobj.revoked_ca_certs)
-                self.assert_(hsh not in pobj.approved_ca_certs)
 
 
 if __name__ == "__main__":

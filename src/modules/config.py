@@ -21,7 +21,7 @@
 #
 
 #
-# Copyright (c) 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2010, 2011, Oracle and/or its affiliates. All rights reserved.
 #
 
 """The pkg.config module provides a set of classes for managing both 'flat'
@@ -60,6 +60,7 @@ import tempfile
 import uuid
 
 from pkg import misc, portable
+import pkg.version
 import pkg.client.api_errors as api_errors
 
 
@@ -107,11 +108,25 @@ class InvalidPropertyTemplateNameError(PropertyConfigError):
 class InvalidPropertyValueError(PropertyConfigError):
         """Exception class used to indicate an invalid property value."""
 
-        def __init__(self, section=None, prop=None, value=None):
+        def __init__(self, maximum=None, minimum=None, section=None, prop=None,
+            value=None):
                 PropertyConfigError.__init__(self, section=section, prop=prop)
+                assert not (minimum is not None and maximum is not None)
+                self.maximum = maximum
+                self.minimum = minimum
                 self.value = value
 
         def __str__(self):
+                if self.minimum is not None:
+                        return _("'%(value)s' is less than the minimum "
+                            "of '%(minimum)s' permitted for property "
+                            "'%(prop)s' in section '%(section)s'.") % \
+                            self.__dict__
+                if self.maximum is not None:
+                        return _("'%(value)s' is greater than the maximum "
+                            "of '%(maximum)s' permitted for property "
+                            "'%(prop)s' in section '%(section)s'.") % \
+                            self.__dict__
                 if self.section:
                         return _("Invalid value '%(value)s' for property "
                             "'%(prop)s' in section '%(section)s'.") % \
@@ -390,23 +405,51 @@ class PropBool(Property):
 class PropInt(Property):
         """Class representing a property with an integer value."""
 
-        def __init__(self, name, default=0, value_map=misc.EmptyDict):
+        def __init__(self, name, default=0, maximum=None,
+            minimum=0, value_map=misc.EmptyDict):
+                assert minimum is None or type(minimum) == int
+                assert maximum is None or type(maximum) == int
+                self.__maximum = maximum
+                self.__minimum = minimum
                 Property.__init__(self, name, default=default,
                     value_map=value_map)
+
+        def __copy__(self):
+                prop = Property.__copy__(self)
+                prop.__maximum = self.__maximum
+                prop.__minimum = self.__minimum
+                return prop
+
+        @property
+        def minimum(self):
+                """Minimum value permitted for this property or None."""
+                return self.__minimum
+
+        @property
+        def maximum(self):
+                """Maximum value permitted for this property or None."""
+                return self.__maximum
 
         @Property.value.setter
         def value(self, value):
                 if isinstance(value, basestring):
                         value = self._value_map.get(value, value)
                 if value is None or value == "":
-                        self._value = 0
-                        return
+                        value = 0
 
                 try:
-                        self._value = int(value)
+                        nvalue = int(value)
                 except Exception:
                         raise InvalidPropertyValueError(prop=self.name,
                             value=value)
+
+                if self.minimum is not None and nvalue < self.minimum:
+                        raise InvalidPropertyValueError(prop=self.name,
+                            minimum=self.minimum, value=value)
+                if self.maximum is not None and nvalue > self.maximum:
+                        raise InvalidPropertyValueError(prop=self.name,
+                            maximum=self.maximum, value=value)
+                self._value = nvalue
 
 
 class PropPublisher(Property):
@@ -673,6 +716,36 @@ class PropUUID(Property):
                         # Not a valid UUID.
                         raise InvalidPropertyValueError(prop=self.name,
                             value=value)
+
+
+class PropVersion(Property):
+        """Class representing a property with a non-negative integer dotsequence
+        value."""
+
+        def __init__(self, name, default="0", value_map=misc.EmptyDict):
+                Property.__init__(self, name, default=default,
+                    value_map=value_map)
+
+        def __str__(self):
+                return self.value.get_short_version()
+
+        @Property.value.setter
+        def value(self, value):
+                if isinstance(value, basestring):
+                        value = self._value_map.get(value, value)
+                if value is None or value == "":
+                        value = "0"
+
+                if isinstance(value, pkg.version.Version):
+                        nvalue = value
+                else:
+                        try:
+                                nvalue = pkg.version.Version(value, "5.11")
+                        except Exception:
+                                raise InvalidPropertyValueError(prop=self.name,
+                                    value=value)
+
+                self._value = nvalue
 
 
 class PropertySection(object):
@@ -1019,7 +1092,12 @@ class Config(object):
                 # property.
                 pval = copy.copy(propobj.value)
                 pval.append(value)
-                propobj.value = pval
+                try:
+                        propobj.value = pval
+                except PropertyConfigError, e:
+                        if hasattr(e, "section") and not e.section:
+                                e.section = section
+                        raise
                 self._dirty = True
 
         def add_section(self, section):
@@ -1132,7 +1210,12 @@ class Config(object):
                         raise UnknownPropertyValueError(section=section,
                             prop=name, value=value)
                 else:
-                        propobj.value = pval
+                        try:
+                                propobj.value = pval
+                        except PropertyConfigError, e:
+                                if hasattr(e, "section") and not e.section:
+                                        e.section = section
+                                raise
                 self._dirty = True
 
         def remove_section(self, name):
@@ -1169,7 +1252,12 @@ class Config(object):
                 self._validate_property_name(name)
 
                 propobj = self._get_matching_property(section, name)
-                propobj.value = value
+                try:
+                        propobj.value = value
+                except PropertyConfigError, e:
+                        if hasattr(e, "section") and not e.section:
+                                e.section = section
+                        raise
                 self._dirty = True
 
         def set_properties(self, properties):
@@ -1229,7 +1317,7 @@ class FileConfig(Config):
 
         [pkg]
         port = 80
-        inst_root = /var/pkg/repo
+        inst_root = /export/repo
 
         [pub_example_com]
         feed_description = example.com's software
@@ -1329,7 +1417,13 @@ class FileConfig(Config):
                                 except UnicodeEncodeError:
                                         # Value contains unicode.
                                         pass
-                                propobj.value = value
+                                try:
+                                        propobj.value = value
+                                except PropertyConfigError, e:
+                                        if hasattr(e, "section") and \
+                                            not e.section:
+                                                e.section = section
+                                        raise
 
         def reset(self, overrides=misc.EmptyDict):
                 """Discards current configuration state and returns the
@@ -1629,7 +1723,13 @@ class SMFConfig(Config):
                                         value = ''.join(shlex.split(value))
 
                                 # Finally, set the property value.
-                                propobj.value = value
+                                try:
+                                        propobj.value = value
+                                except PropertyConfigError, e:
+                                        if hasattr(e, "section") and \
+                                            not e.section:
+                                                e.section = section
+                                        raise
 
         def reset(self, overrides=misc.EmptyDict):
                 """Discards current configuration state and returns the

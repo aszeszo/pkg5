@@ -21,7 +21,7 @@
 #
 
 #
-# Copyright (c) 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2010, 2011, Oracle and/or its affiliates. All rights reserved.
 #
 
 import getopt
@@ -32,20 +32,18 @@ import shutil
 import sys
 import tempfile
 import traceback
-import urllib
-import urlparse
 
 import pkg
 import pkg.actions as actions
 import pkg.client.api_errors as api_errors
 import pkg.client.transport.transport as transport
-import pkg.config as cfg
 import pkg.fmri as fmri
 import pkg.manifest as manifest
 import pkg.misc as misc
 import pkg.publish.transaction as trans
 from pkg.client import global_settings
 from pkg.misc import emsg, msg, PipeError
+import M2Crypto as m2
 
 PKG_CLIENT_NAME = "pkgsign"
 
@@ -84,18 +82,14 @@ def usage(usage_error=None, cmd=None, retcode=EXIT_BADOPT):
                 error(usage_error, cmd=cmd)
         emsg (_("""\
 Usage:
-        pkgsign [-aciks] [--no-index] [--no-catalog]
-            [--sign-all | fmri-to-sign ...]
+        pkgsign -s path_or_uri [-acikn] [--no-index] [--no-catalog]
+            (fmri|pattern) ...
 """))
 
         sys.exit(retcode)
 
-def fetch_catalog(src_pub, xport, temp_root, list_packages=False):
+def fetch_catalog(src_pub, xport, temp_root):
         """Fetch the catalog from src_uri."""
-        global complete_catalog
-
-        src_uri = src_pub.selected_repository.origins[0].uri
-        # tracker.catalog_start(src_uri)
 
         if not src_pub.meta_root:
                 # Create a temporary directory for catalog.
@@ -105,21 +99,18 @@ def fetch_catalog(src_pub, xport, temp_root, list_packages=False):
         src_pub.transport = xport
         src_pub.refresh(True, True)
 
-        if not list_packages:
-                return
-        
-        cat = src_pub.catalog
+        return src_pub.catalog
 
-        d = {}
-        fmri_list = []
-        for f in cat.fmris():
-                fmri_list.append(f)
-                d.setdefault(f.pkg_name, [f]).append(f)
-        for k in d.keys():
-                d[k].sort(reverse=True)
-
-        complete_catalog = d
-        return fmri_list
+def __make_tmp_cert(d, pth):
+        try:
+                cert = m2.X509.load_cert(pth)
+        except m2.X509.X509Error, e:
+                raise api_errors.BadFileFormat(_("The file %s was expected to "
+                    "be a PEM certificate but it could not be read.") % pth)
+        fd, fp = tempfile.mkstemp(dir=d)
+        with os.fdopen(fd, "wb") as fh:
+                fh.write(cert.as_pem())
+        return fp
 
 def main_func():
         misc.setlocale(locale.LC_ALL, "", error)
@@ -127,8 +118,8 @@ def main_func():
         global_settings.client_name = "pkgsign"
 
         try:
-                opts, pargs = getopt.getopt(sys.argv[1:], "a:c:i:k:s:",
-                    ["help", "no-index", "no-catalog", "sign-all"])
+                opts, pargs = getopt.getopt(sys.argv[1:], "a:c:i:k:ns:",
+                    ["help", "no-index", "no-catalog"])
         except getopt.GetoptError, e:
                 usage(_("illegal global option -- %s") % e.opt)
 
@@ -139,13 +130,9 @@ def main_func():
         chain_certs = []
         add_to_catalog = True
         set_alg = False
-        sign_all = False
+        dry_run = False
 
-        try:
-                repo_uri = os.environ["PKG_REPO"]
-        except KeyError:
-                repo_uri = "http://localhost:10000"
-        
+        repo_uri = os.getenv("PKG_REPO", None)
         for opt, arg in opts:
                 if opt == "-a":
                         sig_alg = arg
@@ -166,17 +153,20 @@ def main_func():
                         if not os.path.isfile(key_path):
                                 usage(_("%s was expected to be a key file "
                                     "but isn't a file.") % key_path)
+                elif opt == "-n":
+                        dry_run = True
                 elif opt == "-s":
-                        repo_uri = arg
+                        repo_uri = misc.parse_uri(arg)
                 elif opt == "--help":
                         show_usage = True
                 elif opt == "--no-catalog":
                         add_to_catalog = False
-                elif opt == "--sign-all":
-                        sign_all = True
 
         if show_usage:
                 usage(retcode=EXIT_OK)
+
+        if not repo_uri:
+                usage(_("a repository must be provided"))
 
         if key_path and not cert_path:
                 usage(_("If a key is given to sign with, its associated "
@@ -190,12 +180,9 @@ def main_func():
                 usage(_("Intermediate certificates are only valid if a key "
                     "and certificate are also provided."))
 
-        if not pargs and not sign_all:
-                usage(_("At least one fmri must be provided for signing."))
-
-        if pargs and sign_all:
-                usage(_("No fmris may be provided if the sign-all option is "
-                    "set."))
+        if not pargs:
+                usage(_("At least one fmri or pattern must be provided to "
+                    "sign."))
 
         if not set_alg and not key_path:
                 sig_alg = "sha256"
@@ -221,28 +208,65 @@ def main_func():
         
         cache_dir = tempfile.mkdtemp(dir=temp_root)
         incoming_dir = tempfile.mkdtemp(dir=temp_root)
+        chash_dir = tempfile.mkdtemp(dir=temp_root)
+        cert_dir = tempfile.mkdtemp(dir=temp_root)
 
         try:
+                chain_certs = [
+                    __make_tmp_cert(cert_dir, c) for c in chain_certs
+                ]
+                if cert_path is not None:
+                        cert_path = __make_tmp_cert(cert_dir, cert_path)
+
                 xport, xport_cfg = transport.setup_transport()
                 xport_cfg.add_cache(cache_dir, readonly=False)
                 xport_cfg.incoming_root = incoming_dir
 
-                # Configure src publisher
-                src_pub = transport.setup_publisher(repo_uri, "source", xport,
+                # Configure publisher(s)
+                transport.setup_publisher(repo_uri, "source", xport,
                     xport_cfg, remote_prefix=True)
-                fmris = fetch_catalog(src_pub, xport, temp_root,
-                    list_packages=sign_all)
-                if not sign_all:
-                        fmris = pargs
+                pats = pargs
                 successful_publish = False
 
-                for pfmri in fmris:
+                concrete_fmris = []
+                unmatched_pats = set(pats)
+                all_pats = frozenset(pats)
+                get_all_pubs = False
+                pub_prefs = set()
+                matches = {}
+                # Gather the publishers whose catalogs will be needed.
+                for pat in pats:
                         try:
-                                if isinstance(pfmri, basestring):
-                                        pfmri = fmri.PkgFmri(pfmri)
+                                p_obj = fmri.MatchingPkgFmri(pat)
+                        except fmri.IllegalMatchingFmri, e:
+                                errors.append(e)
+                                continue
+                        pub_prefix = p_obj.get_publisher()
+                        if pub_prefix:
+                                pub_prefs.add(pub_prefix)
+                        else:
+                                get_all_pubs = True
+                # Check each publisher for matches to our patterns.
+                for p in xport_cfg.gen_publishers():
+                        if not get_all_pubs and p.prefix not in pub_prefs:
+                                continue
+                        cat = fetch_catalog(p, xport, temp_root)
+                        ms, tmp1, u = cat.get_matching_fmris(pats,
+                            raise_unmatched=False)
+                        # Find which patterns matched.
+                        matched_pats = all_pats - u
+                        # Remove those patterns from the unmatched set.
+                        unmatched_pats -= matched_pats
+                        for v_list in ms.values():
+                                concrete_fmris.extend([(v, p) for v in v_list])
+                if unmatched_pats:
+                        raise api_errors.PackageMatchErrors(
+                            unmatched_fmris=unmatched_pats)
 
+                for pfmri, src_pub in sorted(set(concrete_fmris)):
+                        try:
                                 # Get the existing manifest for the package to
-                                # be sign.
+                                # be signed.
                                 m_str = xport.get_manifest(pfmri,
                                     content_only=True, pub=src_pub)
                                 m = manifest.Manifest()
@@ -261,22 +285,58 @@ def main_func():
                                 # Set the signature value and certificate
                                 # information for the signature action.
                                 a.set_signature(m.gen_actions(),
-                                    key_path=key_path, chain_paths=chain_certs)
+                                    key_path=key_path, chain_paths=chain_certs,
+                                    chash_dir=chash_dir)
 
-                                # Append the finished signature action to the
-                                # published manifest.
-                                t = trans.Transaction(repo_uri,
-                                    pkg_name=str(pfmri), xport=xport,
-                                    pub=src_pub)
-                                t.append()
-                                try:
-                                        t.add(a)
-                                        for c in chain_certs:
-                                                t.add_file(c)
-                                        t.close(add_to_catalog=add_to_catalog)
-                                except:
-                                        t.close(abandon=True)
-                                        raise
+                                # The hash of 'a' is currently a path, we need
+                                # to find the hash of that file to allow
+                                # comparison to existing signatures.
+                                hsh = None
+                                if cert_path:
+                                        hsh, _dummy = \
+                                            misc.get_data_digest(cert_path)
+
+                                # Check whether the signature about to be added
+                                # is identical, or almost identical, to existing
+                                # signatures on the package.  Because 'a' has
+                                # already been added to the manifest, it is
+                                # generated by gen_actions_by_type, so the cnt
+                                # must be 2 or higher to be an issue.
+                                cnt = 0
+                                almost_identical = False
+                                for a2 in m.gen_actions_by_type("signature"):
+                                        try:
+                                                if a.identical(a2, hsh):
+                                                        cnt += 1
+                                        except api_errors.AlmostIdentical, e:
+                                                e.pkg = pfmri
+                                                errors.append(e)
+                                                almost_identical = True
+                                if almost_identical:
+                                        continue
+                                if cnt == 2:
+                                        continue
+                                elif cnt > 2:
+                                        raise api_errors.DuplicateSignaturesAlreadyExist(pfmri)
+                                assert cnt == 1, "Cnt was:%s" % cnt
+
+                                if not dry_run:
+                                        # Append the finished signature action
+                                        # to the published manifest.
+                                        t = trans.Transaction(repo_uri,
+                                            pkg_name=str(pfmri), xport=xport,
+                                            pub=src_pub)
+                                        try:
+                                                t.append()
+                                                t.add(a)
+                                                for c in chain_certs:
+                                                        t.add_file(c)
+                                                t.close(add_to_catalog=
+                                                    add_to_catalog)
+                                        except:
+                                                if t.trans_id:
+                                                        t.close(abandon=True)
+                                                raise
                                 msg(_("Signed %s") % pfmri)
                                 successful_publish = True
                         except (api_errors.ApiException, fmri.FmriError,
@@ -293,8 +353,7 @@ def main_func():
                 error(e)
                 return EXIT_OOPS
         finally:
-                shutil.rmtree(cache_dir)
-                shutil.rmtree(incoming_dir)
+                shutil.rmtree(temp_root)
 
 #
 # Establish a specific exit status which means: "python barfed an exception"
@@ -311,11 +370,6 @@ if __name__ == "__main__":
                 raise _e
         except:
                 traceback.print_exc()
-                error(
-                    _("\n\nThis is an internal error.  Please let the "
-                    "developers know about this\nproblem by filing a bug at "
-                    "http://defect.opensolaris.org and including the\nabove "
-                    "traceback and this message.  The version of pkg(5) is "
-                    "'%s'.") % pkg.VERSION)
+                error(misc.get_traceback_message())
                 __ret = 99
         sys.exit(__ret)

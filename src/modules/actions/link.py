@@ -21,8 +21,7 @@
 #
 
 #
-# Copyright 2010 Sun Microsystems, Inc.  All rights reserved.
-# Use is subject to license terms.
+# Copyright (c) 2007, 2011, Oracle and/or its affiliates. All rights reserved.
 #
 
 """module describing a (symbolic) link packaging object
@@ -36,7 +35,10 @@ import stat
 
 import generic
 import pkg.actions
+import pkg.mediator as med
+
 from pkg import misc
+from pkg.client.api_errors import ActionExecutionError
 
 class LinkAction(generic.Action):
         """Class representing a link-type packaging object."""
@@ -45,16 +47,10 @@ class LinkAction(generic.Action):
 
         name = "link"
         key_attr = "path"
-        globally_unique = True
-
-        def __init__(self, data=None, **attrs):
-                generic.Action.__init__(self, data, **attrs)
-                if "path" in self.attrs:
-                        self.attrs["path"] = self.attrs["path"].lstrip(
-                            os.path.sep)
-                        if not self.attrs["path"]:
-                                raise pkg.actions.InvalidActionError(
-                                    str(self), _("Empty path attribute"))
+        unique_attrs = "path", "target"
+        globally_identical = True
+        refcountable = True
+        namespace_group = "path"
 
         def install(self, pkgplan, orig):
                 """Client-side method that installs a link."""
@@ -118,8 +114,86 @@ class LinkAction(generic.Action):
                 """Generates the indices needed by the search dictionary.  See
                 generic.py for a more detailed explanation."""
 
-                return [
+                rval = [
                     (self.name, "basename", os.path.basename(self.attrs["path"]),
                     None),
-                    (self.name, "path", os.path.sep + self.attrs["path"], None)
+                    (self.name, "path", os.path.sep + self.attrs["path"], None),
                 ]
+                if "mediator" in self.attrs:
+                        rval.extend(
+                            (self.name, k, v, None)
+                            for k, v in self.attrs.iteritems()
+                            if k.startswith("mediator")
+                        )
+                return rval
+
+        def validate(self, fmri=None):
+                """Performs additional validation of action attributes that
+                for performance or other reasons cannot or should not be done
+                during Action object creation.  An ActionError exception (or
+                subclass of) will be raised if any attributes are not valid.
+                This is primarily intended for use during publication or during
+                error handling to provide additional diagonostics.
+
+                'fmri' is an optional package FMRI (object or string) indicating
+                what package contained this action."""
+
+                errors = generic.Action._validate(self, fmri=fmri,
+                    raise_errors=False, required_attrs=("target",),
+                    single_attrs=("target", "mediator", "mediator-version",
+                    "mediator-implementation", "mediator-priority"))
+
+                if "mediator" not in self.attrs and \
+                    "mediator-version" not in self.attrs and \
+                    "mediator-implementation" not in self.attrs and \
+                    "mediator-priority" not in self.attrs:
+                        if errors:
+                                raise pkg.actions.InvalidActionAttributesError(
+                                    self, errors, fmri=fmri)
+                        return
+
+                mediator = self.attrs.get("mediator")
+                med_version = self.attrs.get("mediator-version")
+                med_implementation = self.attrs.get("mediator-implementation")
+                med_priority = self.attrs.get("mediator-priority")
+
+                if not mediator and (med_version or med_implementation or
+                    med_priority):
+                        errors.append(("mediator", _("a mediator must be "
+                            "provided when mediator-version, "
+                            "mediator-implementation, or mediator-priority "
+                            "is specified")))
+                elif mediator is not None and \
+                    not isinstance(mediator, list):
+                        valid, error = med.valid_mediator(mediator)
+                        if not valid:
+                                errors.append(("mediator", error))
+
+                if not (med_version or med_implementation):
+                        errors.append(("mediator", _("a mediator-version or "
+                            "mediator-implementation must be provided if a "
+                            "mediator is specified")))
+
+                if med_version is not None and \
+                    not isinstance(med_version, list):
+                        valid, error = med.valid_mediator_version(med_version)
+                        if not valid:
+                                errors.append(("mediator-version", error))
+
+                if med_implementation is not None and \
+                    not isinstance(med_implementation, list):
+                        valid, error = med.valid_mediator_implementation(
+                            med_implementation)
+                        if not valid:
+                                errors.append(("mediator-implementation",
+                                    error))
+
+                if med_priority is not None and \
+                    not isinstance(med_priority, list):
+                        valid, error = med.valid_mediator_priority(med_priority)
+                        if not valid:
+                                errors.append(("mediator-priority", error))
+
+                if errors:
+                        raise pkg.actions.InvalidActionAttributesError(self,
+                            errors, fmri=fmri)

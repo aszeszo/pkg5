@@ -19,7 +19,7 @@
 #
 # CDDL HEADER END
 #
-# Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2008, 2011, Oracle and/or its affiliates. All rights reserved.
 #
 
 NOTEBOOK_PACKAGE_LIST_PAGE = 0            # Main Package List page index
@@ -88,6 +88,7 @@ import pkg.misc as misc
 import pkg.client.progress as progress
 import pkg.client.api_errors as api_errors
 import pkg.client.api as api
+import pkg.client.publisher as publisher
 import pkg.portable as portable
 import pkg.fmri as fmri
 import pkg.nrlock as nrlock
@@ -280,7 +281,7 @@ class PackageManager:
                         self.w_main_statusbar_label.set_use_markup(True) 
     
                 self.w_statusbar_hbox = self.builder.get_object("statusbar_hbox")
-                self.w_infosearch_frame = self.builder.get_object("infosearch_frame")
+                self.w_logalert_frame = self.builder.get_object("logalert_frame")
 
                 self.w_progress_frame = self.builder.get_object("progress_frame")
                 self.w_status_progressbar = self.builder.get_object("status_progressbar")
@@ -344,6 +345,11 @@ class PackageManager:
                 self.w_paste_menuitem = self.builder.get_object("edit_paste")
                 self.w_delete_menuitem = self.builder.get_object("edit_delete")
                 self.w_selectall_menuitem = self.builder.get_object("edit_select_all")
+                help_stock_item = gtk.stock_lookup("gtk-help")
+                if help_stock_item:
+                        help_menu_item =  self.builder.get_object("help")
+                        help_menu_item.set_label(help_stock_item[1])
+
                 self.w_selectupdates_menuitem = \
                     self.builder.get_object("edit_select_updates")
                 self.w_deselect_menuitem = self.builder.get_object("edit_deselect")
@@ -365,8 +371,8 @@ class PackageManager:
                 self.w_edit_preferences_menuitem = self.builder.get_object(
                     "edit_preferences")
                 self.w_log_menuitem = self.builder.get_object("log")
-                self.w_infosearch_eventbox = self.builder.get_object(
-                    "infosearch_eventbox")
+                self.w_logalert_eventbox = self.builder.get_object(
+                    "logalert_eventbox")
                 self.progress_cancel = self.builder.get_object("progress_cancel")
                 self.progress_cancel.set_tooltip_text(
                     _("Cancel current operation"))
@@ -387,8 +393,10 @@ class PackageManager:
                 self.detailspanel = detailspanel.DetailsPanel(self, self.builder)
                 self.exportconfirm = exportconfirm.ExportConfirm(self.builder,
                     self.window_icon, self.gconf, self)
-                self.logging = logging.PMLogging(self.builder, self.window_icon)
-                self.preferences = preferences.Preferences(self.builder,
+                is_normal_logging_setup = gui_misc.setup_logging()
+                self.logging = logging.PMLogging(self.builder, self.window_icon,
+                    is_normal_logging_setup)
+                self.preferences = preferences.Preferences(self, self.builder,
                     self.window_icon, self.gconf)
                 self.searcherror = searcherror.SearchError(self.builder,
                     self.gconf, self)
@@ -432,7 +440,6 @@ class PackageManager:
                 self.versioninfo.set_modal_and_transient(self.w_main_window)
 
                 self.__setup_text_signals()
-                gui_misc.setup_logging()
 
                 # Theme: prevent cell background being set for Inverse themes
                 self.is_inverse_theme = False
@@ -535,8 +542,8 @@ class PackageManager:
                      self.__on_remove),
                      (self.w_info_notebook, "switch_page", 
                      self.__on_notebook_change),
-                     (self.w_infosearch_eventbox, "button_press_event", 
-                     self.__on_infosearch_button_press_event),
+                     (self.w_logalert_eventbox, "button_press_event",
+                     self.__on_logalert_button_press_event),
                      (self.w_application_treeview, "button_press_event", 
                      self.__on_applicationtreeview_button_and_key_events),
                      (self.w_application_treeview, "key_press_event", 
@@ -613,7 +620,7 @@ class PackageManager:
                 # Theme: setup Main list Selection icon for Theme
                 if self.application_select_column:
                         self.application_select_column.set_widget(
-                            self.__get_theme_selection_coloumn_image())
+                            self.get_theme_selection_coloumn_image())
 
                 # Theme: setup Main list status icons
                 self.__reset_application_list_status_icons(self.application_list)
@@ -624,7 +631,7 @@ class PackageManager:
                 if self.selected_pkgstem != None:
                         self.__process_package_selection()
 
-        def __get_theme_selection_coloumn_image(self):
+        def get_theme_selection_coloumn_image(self):
                 select_image = gtk.Image()
                 select_image.set_from_pixbuf(gui_misc.get_icon(
                     self.icon_theme, 'selection'))
@@ -781,19 +788,18 @@ class PackageManager:
                 self.current_repos_with_search_errors = []
 
                 for pub, err in error.failed_servers:
-                        logger.error(_("Publisher:") + " " + pub + ": " +
-                            _("failed to respond") + "\n" + str(err))
+                        logger.error(_("Publisher: %(o)s failed to respond\n%(msg)s") % \
+                            {"o": pub, "msg": err})
                         gui_misc.notify_log_error(self)
                 for pub in error.invalid_servers:
-                        logger.error(_("Publisher:") + " " + pub + ": " +
-                            _("invalid response") + "\n" +
-                            _("A valid response was not returned."))
+                        logger.error(_("Publisher: %s: invalid response\n" 
+                            "A valid response was not returned.") % pub)
                         gui_misc.notify_log_error(self)
                 for pub, err in error.unsupported_servers:
                         self.current_repos_with_search_errors.append(
                             (pub, _("unsupported search"), err))
 
-        def __on_infosearch_button_press_event(self, widget, event):
+        def __on_logalert_button_press_event(self, widget, event):
                 if len(self.current_repos_with_search_errors) > 0:
                         self.__handle_api_search_error(True)
                         return
@@ -805,7 +811,7 @@ class PackageManager:
                         return
                 if len(self.current_repos_with_search_errors) == 0:
                         if not self.error_logged:
-                                self.w_infosearch_frame.hide()
+                                self.w_logalert_frame.hide()
                         return
 
                 repo_count = 0
@@ -814,13 +820,13 @@ class PackageManager:
                                 repo_count += 1
                 if repo_count == 0:
                         if not self.error_logged:
-                                self.w_infosearch_frame.hide()
+                                self.w_logalert_frame.hide()
                         return
 
-                self.w_infosearch_frame.set_tooltip_text(
+                self.w_logalert_frame.set_tooltip_text(
                     _("Search Errors: click to view"))
 
-                self.w_infosearch_frame.show()
+                self.w_logalert_frame.show()
                 self.searcherror.display_search_errors(show_all)
 
         def __get_publisher_combobox_index(self, pub_name):
@@ -872,6 +878,9 @@ class PackageManager:
                         return
                 rs_iter = category_tree.iter_children(
                     self.recent_searches_cat_iter)
+                rs_path = category_tree.get_path(self.recent_searches_cat_iter)
+                if not self.w_categories_treeview.row_expanded(rs_path):
+                        self.w_categories_treeview.expand_row(rs_path, False)
                 while rs_iter:
                         rs_value = category_tree.get_value(rs_iter,
                             enumerations.CATEGORY_VISIBLE_NAME)
@@ -1025,7 +1034,7 @@ class PackageManager:
                 column.set_cell_data_func(toggle_renderer, self.cell_data_function, self)
                 column.set_clickable(True)
                 column.connect('clicked', self.__select_column_clicked)
-                select_image = self.__get_theme_selection_coloumn_image()
+                select_image = self.get_theme_selection_coloumn_image()
                 column.set_widget(select_image)
                 self.w_application_treeview.append_column(column)
                 self.application_select_column = column
@@ -1457,13 +1466,13 @@ class PackageManager:
                 ''' handler for manage publishers menu event '''
                 repository.Repository(self, self.image_directory,
                     action=enumerations.MANAGE_PUBLISHERS,
-                    main_window = self.w_main_window)
+                    main_window = self.w_main_window, gconf = self.gconf)
 
         def __on_file_add_publisher(self, widget):
                 ''' handler for add publisher menu event '''
                 repository.Repository(self, self.image_directory,
                     action=enumerations.ADD_PUBLISHER,
-                    main_window = self.w_main_window)
+                    main_window = self.w_main_window, gconf = self.gconf)
 
         def __on_file_be_activate(self, widget):
                 ''' handler for be menu event '''
@@ -1502,7 +1511,8 @@ class PackageManager:
                 self.is_all_publishers_installed = False
                 self.is_all_publishers = False
                 self.is_all_publishers_search = True
-                self.w_infosearch_frame.hide()
+                if not self.first_run:
+                    self.w_logalert_frame.hide()
                 if not self.w_searchentry.is_focus():
                         self.__set_searchentry_to_prompt()
                 
@@ -1601,7 +1611,7 @@ class PackageManager:
                 self.in_search_mode = False
                 self.in_recent_search = False
                 self.is_all_publishers_search = False
-                self.w_infosearch_frame.hide()
+                self.w_logalert_frame.hide()
                 if self.last_visible_publisher == \
                         self.publisher_options[PUBLISHER_INSTALLED]:
                         self.is_all_publishers_installed = True
@@ -1702,7 +1712,7 @@ class PackageManager:
                 self.set_busy_cursor()
                 self.in_search_mode = True
                         
-                self.w_infosearch_frame.hide()
+                self.w_logalert_frame.hide()
                 gobject.idle_add(self.__set_main_view_package_list)
                 Thread(target = self.__do_api_search,
                     args = (is_search_all, )).start()
@@ -1774,14 +1784,14 @@ class PackageManager:
                                 if pub_prefix != None:
                                         pub = self.api_o.get_publisher(prefix=pub_prefix)
                                 else:
-                                        pub = self.api_o.get_preferred_publisher()
+                                        pub = self.api_o.get_highest_ranked_publisher()
                         except api_errors.ApiException, ex:
                                 err = str(ex)
                                 gobject.idle_add(self.error_occurred, err,
                                     None, gtk.MESSAGE_INFO)
                                 gobject.idle_add(self.unset_busy_cursor)
                                 return
-                        origin_uri = gui_misc.get_origin_uri(pub.selected_repository)
+                        origin_uri = gui_misc.get_origin_uri(pub.repository)
                         servers.append({"origin": origin_uri})
                         self.publisher_being_searched = \
                                 self.get_publisher_display_name_from_prefix(pub.prefix)
@@ -1795,10 +1805,11 @@ class PackageManager:
                 last_name = ""
                 # Sorting results by Name gives best overall appearance and flow
                 sort_col = enumerations.NAME_COLUMN
+                # pylint: disable-msg=C0321
                 try:
                         searches.append(self.api_o.remote_search(
                             [api.Query(" ".join(pargs), case_sensitive, return_actions)],
-                            servers=servers))
+                                servers=servers))
                         if debug:
                                 print "Search Args: %s : cs: %s : retact: %s" % \
                                         ("".join(pargs), case_sensitive, return_actions)
@@ -2665,7 +2676,7 @@ class PackageManager:
                 self.__refilter_on_idle()
 
         def __unset_search(self, same_repo):
-                self.w_infosearch_frame.hide()
+                self.w_logalert_frame.hide()
                 self.__update_tooltips()
                 self.in_search_mode = False
                 self.in_recent_search = False
@@ -2784,12 +2795,19 @@ class PackageManager:
         def __do_refresh(self, pubs=None, immediate=False):
                 success = False
                 try:
-                        self.api_o.reset()
+                        if debug_perf:
+                                print "Time before reset",time.time()
+                        if immediate:
+                                self.api_o.reset()
+                        if debug_perf:
+                                print "Time after reset", time.time()
                         self.api_o.refresh(pubs=pubs, immediate=immediate)
+                        if debug_perf:
+                                print "after refresh", time.time()
                         success = True
                 except api_errors.CatalogRefreshException, cre:
-                        crerr = gui_misc.get_catalogrefresh_exception_msg(cre)
-                        logger.error(crerr)
+                        res = gui_misc.get_catalogrefresh_exception_msg(cre)
+                        logger.error(res[0])
                         gui_misc.notify_log_error(self)
                 except api_errors.TransportError, tpex:
                         err = str(tpex)
@@ -2859,7 +2877,7 @@ class PackageManager:
         def __on_log_activate(self, widget):                                
                 if self.error_logged:
                         self.error_logged = False
-                        self.w_infosearch_frame.hide()
+                        self.w_logalert_frame.hide()
                 self.logging.log_activate()
                 
         def __on_version_info(self, widget):
@@ -2880,7 +2898,7 @@ class PackageManager:
                 gui_misc.release_lock(self.api_lock)
 
         def __get_info_without_lock(self, pkg_stem, name):
-                if not self.__do_api_reset():
+                if not self.do_api_reset():
                         return
                 try:
                         if self.versioninfo.get_info(pkg_stem, name):
@@ -2892,7 +2910,7 @@ class PackageManager:
                         gobject.idle_add(self.unset_busy_cursor)
                 return
 
-        def __do_api_reset(self):
+        def do_api_reset(self):
                 if self.api_o == None:
                         return False
                 try:
@@ -2905,7 +2923,7 @@ class PackageManager:
                 return True
 
         def __on_install_update(self, widget):
-                if not self.__do_api_reset():
+                if not self.do_api_reset():
                         return
                 install_update = []
                 install_confirmation_list = []
@@ -2925,7 +2943,7 @@ class PackageManager:
                     gconf = self.gconf)
 
         def __on_update_all(self, widget):
-                if not self.__do_api_reset():
+                if not self.do_api_reset():
                         return
                 self.installupdate = installupdate.InstallUpdate([], self,
                     self.image_directory, action = enumerations.IMAGE_UPDATE,
@@ -2971,7 +2989,7 @@ class PackageManager:
                                                     desc, status, pkg_stem])
 
         def __on_remove(self, widget):
-                if not self.__do_api_reset():
+                if not self.do_api_reset():
                         return
                 remove_list = []
                 remove_confirmation_list = []
@@ -2992,30 +3010,31 @@ class PackageManager:
 
         def __on_reload(self, widget):
                 self.force_reload_packages = True
-                self.__do_reload(widget)
+                self.__do_reload(widget, True)
 
-        def __do_reload(self, widget):
+        def __do_reload(self, widget, immediate):
                 self.w_repository_combobox.grab_focus()
                 if self.force_reload_packages and (self.in_search_mode 
                     or self.is_all_publishers_search):
                         self.__unset_search(False)
-                self.__set_empty_details_panel()
+                if self.force_reload_packages:
+                        self.__set_empty_details_panel()
                 self.in_setup = True
                 self.last_visible_publisher = None
                 self.set_busy_cursor()
                 status_str = _("Refreshing package catalog information")
                 self.update_statusbar_message(status_str)
-                Thread(target = self.__catalog_refresh).start()
+                Thread(target = self.__catalog_refresh, args = (immediate,)).start()
 
-        def __catalog_refresh(self):
+        def __catalog_refresh(self, immediate):
                 self.api_lock.acquire()
                 gobject.idle_add(self.set_busy_cursor)
-                self.__catalog_refresh_without_lock()
+                self.__catalog_refresh_without_lock(immediate)
                 gui_misc.release_lock(self.api_lock)
 
-        def __catalog_refresh_without_lock(self):
+        def __catalog_refresh_without_lock(self, immediate):
                 """Update image's catalogs."""
-                success = self.__do_refresh(immediate=True)
+                success = self.__do_refresh(immediate=immediate)
                 if not success:
                         gobject.idle_add(self.unset_busy_cursor)
                         gobject.idle_add(self.update_statusbar)
@@ -3127,7 +3146,11 @@ class PackageManager:
                                    enumerations.REPOSITORY_PREFIX)
                 self.__disconnect_repository_model()
                 self.repositories_list = self.__get_new_repositories_liststore()
-                default_pub = api_o.get_preferred_publisher().prefix
+                highest_ranked_pub = api_o.get_highest_ranked_publisher()
+                default_pub = None
+                if highest_ranked_pub != None and  \
+                        isinstance(highest_ranked_pub, publisher.Publisher):
+                        default_pub = highest_ranked_pub.prefix
                 if self.default_publisher != default_pub:
                         self.__clear_pkg_selections()
                         self.default_publisher = default_pub
@@ -3939,6 +3962,8 @@ class PackageManager:
                         err = str(tpex)
                         logger.error(err)
                         gui_misc.notify_log_error(self)
+                except api_errors.CanceledException:
+                        gobject.idle_add(self.unset_busy_cursor)
                 except api_errors.ApiException, apiex:
                         err = str(apiex)
                         gobject.idle_add(self.error_occurred, err, _('Unexpected Error'))
@@ -3949,7 +3974,7 @@ class PackageManager:
                 #ImageInfo for categories
                 sectioninfo = imageinfo.ImageInfo()
                 share_path = os.path.join(self.application_dir, 
-                        "usr/share/package-manager/data")
+                        "usr/share/lib/pkg")
                 if len(pubs) == 0:
                         section = sectioninfo.read(os.path.join(share_path,
                                     "opensolaris.org.sections"))
@@ -4035,7 +4060,7 @@ class PackageManager:
                 self.special_package_names = []
                 pub_names = {}
                 for entry in pkgs_from_api:
-                        (pkg_pub, pkg_name, ver), summ, cats, states = entry
+                        (pkg_pub, pkg_name, ver), summ, cats, states, attrs = entry
                         if debug:
                                 print entry, ver
                         pkg_stem  = "pkg://" + pkg_pub + "/"  + pkg_name
@@ -4096,13 +4121,16 @@ class PackageManager:
                         if len(cat[1]) > 1:
                                 self.__add_package_to_category(cat[1],
                                     row_iter, application_list,
-                                    category_list)
+                                    category_list, pkg_name)
 
         @staticmethod
         def __add_package_to_category(category_name, package, 
-            application_list, category_list):
+            application_list, category_list, pkg_name):
                 category_names = category_name.split('/', 2)
-                if len(category_names) < 2:
+                if len(category_names) != 2:
+                        print _("Invalid category name [%(cat)s] for package %(pack)s") \
+                            % {"cat": category_name,
+                            "pack": pkg_name}
                         return
                 category_visible_name = category_names[1]
                 if not package or category_visible_name == 'All':
@@ -4287,8 +4315,7 @@ class PackageManager:
                         info = self.api_o.info(pkg_stems, True, frozenset(
                                     [api.PackageInfo.STATE, api.PackageInfo.IDENTITY]))
                         for info_s in info.get(0):
-                                pkg_stem = fmri.PkgFmri(info_s.fmri).get_pkg_stem(
-                                    include_scheme = True)
+                                pkg_stem = info_s.fmri.get_pkg_stem()
                                 if api.PackageInfo.INSTALLED in info_s.states:
                                         pkg_stem_states[pkg_stem] = \
                                                 api.PackageInfo.INSTALLED
@@ -4544,7 +4571,21 @@ class PackageManager:
                     self.pr, self.w_main_window)
                 self.cache_o = self.__get_cache_obj(self.api_o)
                 self.force_reload_packages = False
-                self.__do_reload(None)
+                self.__do_reload(None, False)
+
+        def update_facets(self, facets_to_set):
+                if facets_to_set == None or \
+                        len(facets_to_set.keys()) == 0:
+                        return
+                gobject.idle_add(self.__update_facets, facets_to_set)
+
+        def __update_facets(self, facets_to_set):
+                installupdate.InstallUpdate([], self,
+                    self.image_directory,
+                    action = enumerations.UPDATE_FACETS,
+                    main_window = self.w_main_window,
+                    api_lock = self.api_lock,
+                    facets = facets_to_set)
 
         def is_busy_cursor_set(self):
                 return self.gdk_window.is_visible()
@@ -4728,7 +4769,7 @@ class PackageManager:
                 self.after_install_remove = True
                 visible_publisher = self.__get_selected_publisher()
                 default_publisher = self.default_publisher
-                self.__do_refresh()
+                self.__do_refresh(immediate=True)
                 if update_list == None and not self.img_timestamp:
                         self.img_timestamp = self.cache_o.get_index_timestamp()
                         self.__on_reload(None)
@@ -4795,7 +4836,7 @@ class PackageManager:
 
         def install_version(self, version):
                 ''' Installed specified version of selected package'''
-                if not self.__do_api_reset():
+                if not self.do_api_reset():
                         return
                 to_install = "%s@%s" % (self.selected_pkgstem, version)
                 install_update = [to_install]
@@ -4920,7 +4961,7 @@ Use -U (--update-all) to proceed with Updates"""
                 try:
                         image_dir = os.environ["PKG_IMAGE"]
                 except KeyError:
-                        image_dir = os.getcwd()
+                        image_dir = "/"
 
         try:
                 gtk.init_check()

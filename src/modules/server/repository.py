@@ -19,7 +19,7 @@
 #
 # CDDL HEADER END
 #
-# Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2008, 2011, Oracle and/or its affiliates. All rights reserved.
 
 import cStringIO
 import codecs
@@ -38,6 +38,7 @@ import urllib
 import pkg.actions as actions
 import pkg.catalog as catalog
 import pkg.client.api_errors as apx
+import pkg.client.progress as progress
 import pkg.client.publisher as publisher
 import pkg.config as cfg
 import pkg.file_layout.file_manager as file_manager
@@ -274,6 +275,7 @@ class _RepoStore(object):
                 self.__catalog_root = None
                 self.__file_root = None
                 self.__in_flight_trans = {}
+                self.__read_only = read_only
                 self.__root = None
                 self.__sort_file_max_size = sort_file_max_size
                 self.__tmp_root = None
@@ -286,7 +288,6 @@ class _RepoStore(object):
                 self.log_obj = log_obj
                 self.mirror = mirror
                 self.publisher = pub
-                self.read_only = read_only
 
                 # Set before root, since it's possible to have the
                 # file_root in an entirely different location.  The root
@@ -323,6 +324,11 @@ class _RepoStore(object):
                         self.__init_state()
                 finally:
                         self.__unlock_rstore()
+
+        def __set_read_only(self, value):
+                self.__read_only = value
+                if self.__catalog:
+                        self.__catalog.read_only = value
 
         def __mkdtemp(self):
                 """Create a temp directory under repository directory for
@@ -569,6 +575,44 @@ class _RepoStore(object):
                         self.log_obj.log(msg=msg, context=context,
                             severity=severity)
 
+        def __purge_search_index(self):
+                """Private helper function to dump repository search data."""
+
+                if not self.index_root or not os.path.exists(self.index_root):
+                        return
+
+                ind = indexer.Indexer(self.index_root,
+                    self._get_manifest,
+                    self.manifest,
+                    log=self.__index_log,
+                    sort_file_max_size=self.__sort_file_max_size)
+
+                # To prevent issues with NFS consumers, attempt to lock the
+                # index first, but don't hold the lock as holding a lock while
+                # removing the directory containing it can cause rmtree() to
+                # fail.
+                ind.lock(blocking=False)
+                ind.unlock()
+
+                # Since the lock succeeded, immediately try to rename the index
+                # directory to prevent other consumers from using the index
+                # while it is being removed since a lock can't be held.
+                portable.rename(self.index_root, self.index_root + ".old")
+                try:
+                        shutil.rmtree(self.index_root + ".old")
+                except EnvironmentError, e:
+                        if e.errno == errno.EACCES:
+                                raise apx.PermissionsException(
+                                    e.filename)
+                        if e.errno == errno.EROFS:
+                                raise apx.ReadOnlyFileSystemException(
+                                    e.filename)
+                        if e.errno != errno.ENOENT:
+                                raise
+
+                # Discard in-memory search data.
+                self.reset_search()
+
         def __rebuild(self, build_catalog=True, build_index=False, lm=None,
             incremental=False):
                 """Private version; caller responsible for repository
@@ -579,7 +623,8 @@ class _RepoStore(object):
                         return
 
                 if build_catalog:
-                        self.__destroy_catalog()
+                        if not incremental:
+                                self.__destroy_catalog()
                         default_pub = self.publisher
                         if self.read_only:
                                 # Temporarily mark catalog as not read-only so
@@ -609,19 +654,24 @@ class _RepoStore(object):
                                 if pkgpath[0] == self.manifest_root:
                                         continue
 
-                                for e in os.listdir(pkgpath[0]):
-                                        f = self.__fmri_from_path(pkgpath[0], e)
+                                for fname in os.listdir(pkgpath[0]):
                                         try:
+                                                f = self.__fmri_from_path(
+                                                    pkgpath[0], fname)
                                                 add_package(f)
                                         except (apx.InvalidPackageErrors,
-                                            actions.ActionError), e:
+                                            actions.ActionError,
+                                            fmri.FmriError,
+                                            pkg.version.VersionError), e:
                                                 # Don't add packages with
                                                 # corrupt manifests to the
                                                 # catalog.
+                                                name = os.path.join(pkgpath[0],
+                                                    fname)
                                                 self.__log(_("Skipping "
-                                                    "%(fmri)s; invalid "
+                                                    "%(name)s; invalid "
                                                     "manifest: %(error)s") % {
-                                                    "fmri": f, "error": e })
+                                                    "name": name, "error": e })
                                         except apx.DuplicateCatalogEntry, e:
                                                 # Raise dups if not in
                                                 # incremental mode.
@@ -637,32 +687,10 @@ class _RepoStore(object):
                         self.catalog.finalize()
                         self.__save_catalog(lm=lm)
 
-                if not incremental and self.index_root and \
-                    os.path.exists(self.index_root):
+                if not incremental:
                         # Only discard search data if this isn't an incremental
-                        # rebuild, and there's an index to destroy.
-                        ind = indexer.Indexer(self.index_root,
-                            self._get_manifest,
-                            self.manifest,
-                            log=self.__index_log,
-                            sort_file_max_size=self.__sort_file_max_size)
-                        ind.lock(blocking=False)
-                        try:
-                                shutil.rmtree(self.index_root)
-                        except EnvironmentError, e:
-                                if e.errno == errno.EACCES:
-                                        raise apx.PermissionsException(
-                                            e.filename)
-                                if e.errno == errno.EROFS:
-                                        raise apx.ReadOnlyFileSystemException(
-                                            e.filename)
-                                if e.errno != errno.ENOENT:
-                                        raise
-                        finally:
-                                ind.unlock()
-
-                        # Discard in-memory search data.
-                        self.reset_search()
+                        # rebuild.
+                        self.__purge_search_index()
 
                 if build_index:
                         self.__refresh_index()
@@ -1050,7 +1078,7 @@ class _RepoStore(object):
                 """
                 if self.mirror:
                         raise RepositoryMirrorError()
-                if not self.catalog_root or self.catalog_version < 1:
+                if not self.catalog_root or self.catalog_version == 0:
                         raise RepositoryUnsupportedOperationError()
 
                 self.__lock_rstore()
@@ -1382,6 +1410,222 @@ class _RepoStore(object):
                 finally:
                         self.__unlock_rstore()
 
+        def remove_packages(self, packages, progtrack=None):
+                """Removes the specified packages from the repository store.  No
+                other modifying operations may be performed until complete.
+
+                'packages' is a list of FMRIs of packages to remove.
+
+                'progtrack' is an optional ProgressTracker object.
+                """
+
+                if self.mirror:
+                        raise RepositoryMirrorError()
+                if self.read_only:
+                        raise RepositoryReadOnlyError()
+                if not self.catalog_root or self.catalog_version < 1:
+                        raise RepositoryUnsupportedOperationError()
+                if not self.manifest_root:
+                        raise RepositoryUnsupportedOperationError()
+                if not progtrack:
+                        progtrack = progress.QuietProgressTracker()
+
+                def get_hashes(pfmri):
+                        """Given an FMRI, return a set containing all of the
+                        hashes of the files its manifest references."""
+
+                        m = self._get_manifest(pfmri)
+                        hashes = set()
+                        for a in m.gen_actions():
+                                if not a.has_payload or not a.hash:
+                                        # Nothing to archive.
+                                        continue
+
+                                # Action payload.
+                                hashes.add(a.hash)
+
+                                # Signature actions have additional payloads.
+                                if a.name == "signature":
+                                        hashes.update(a.attrs.get("chain",
+                                            "").split())
+                        return hashes
+
+                self.__lock_rstore()
+                c = self.catalog
+                try:
+                        # First, dump all search data as it will be invalidated
+                        # as soon as the catalog is updated.
+                        progtrack.actions_set_goal(_("Delete search index"), 1)
+                        self.__purge_search_index()
+                        progtrack.actions_add_progress()
+                        progtrack.actions_done()
+
+                        # Next, remove all of the packages to be removed
+                        # from the catalog (if they are present).  That way
+                        # any active clients are less likely to be surprised
+                        # when files for packages start disappearing.
+                        progtrack.actions_set_goal(_("Update catalog"), 1)
+                        c.batch_mode = True
+                        save_catalog = False
+                        for pfmri in packages:
+                                try:
+                                        c.remove_package(pfmri)
+                                except apx.UnknownCatalogEntry:
+                                        # Assume already removed from catalog or
+                                        # not yet added to it.
+                                        continue
+                                save_catalog = True
+
+                        c.batch_mode = False
+                        if save_catalog:
+                                # Only need to re-write catalog if at least one
+                                # package had to be removed from it.
+                                c.finalize(pfmris=packages)
+                                c.save()
+
+                        progtrack.actions_add_progress()
+                        progtrack.actions_done()
+
+                        # Next, build a list of all of the hashes for the files
+                        # that can potentially be removed from the repository.
+                        # This will also indirectly abort the operation should
+                        # any of the packages not actually have a manifest in
+                        # the repository.
+                        pfiles = set()
+                        progtrack.actions_set_goal(
+                            _("Analyze removed packages"), len(packages))
+                        for pfmri in packages:
+                                pfiles.update(get_hashes(pfmri))
+                                progtrack.actions_add_progress()
+                        progtrack.actions_done()
+
+                        # Now for the slow part; iterate over every manifest in
+                        # the repository (excluding the ones being removed) and
+                        # remove any hashes in use from the list to be removed.
+                        # However, if the package being removed doesn't have any
+                        # payloads, then we can skip checking all of the
+                        # packages in the repository for files in use.
+                        if pfiles:
+                                # Number of packages to check is total found in
+                                # repo minus number to be removed.
+                                slist = os.listdir(self.manifest_root)
+                                remaining = sum(
+                                    1
+                                    for s in slist
+                                    for v in os.listdir(os.path.join(
+                                        self.manifest_root, s))
+                                )
+
+                                progtrack.actions_set_goal(
+                                    _("Analyze repository packages"), remaining)
+                                for name in slist:
+                                        # Stem must be decoded before use.
+                                        try:
+                                                pname = urllib.unquote(name)
+                                        except Exception:
+                                                # Assume error is result of
+                                                # unexpected file in directory;
+                                                # just skip it and drive on.
+                                                continue
+
+                                        pdir = os.path.join(self.manifest_root,
+                                            name)
+                                        for ver in os.listdir(pdir):
+                                                if not pfiles:
+                                                        # Skip remaining entries
+                                                        # since no files are
+                                                        # safe to remove, but
+                                                        # update progress.
+                                                        progtrack.actions_add_progress()
+                                                        continue
+
+                                                # Version must be decoded before
+                                                # use.
+                                                pver = urllib.unquote(ver)
+                                                try:
+                                                        pfmri = fmri.PkgFmri(
+                                                            "@".join((pname,
+                                                            pver)), publisher=self.publisher)
+                                                except Exception:
+                                                        # Assume error is result
+                                                        # of unexpected file in
+                                                        # directory; just skip
+                                                        # it and drive on.
+                                                        progtrack.actions_add_progress()
+                                                        continue
+
+                                                if pfmri in packages:
+                                                        # Package is one of
+                                                        # those queued for
+                                                        # removal.
+                                                        progtrack.actions_add_progress()
+                                                        continue
+
+                                                # Any files in use by another
+                                                # package can't be removed.
+                                                pfiles -= get_hashes(pfmri)
+                                                progtrack.actions_add_progress()
+                                progtrack.actions_done()
+
+                        # Next, remove the manifests of the packages to be
+                        # removed.  (This is done before removing the files
+                        # so that clients won't have a chance to retrieve a
+                        # manifest which has missing files.)
+                        progtrack.actions_set_goal(
+                            _("Remove package manifests"), len(packages))
+                        for pfmri in packages:
+                                mpath = self.manifest(pfmri)
+                                portable.remove(mpath)
+                                progtrack.actions_add_progress()
+                        progtrack.actions_done()
+
+                        # Next, remove any package files that are not
+                        # referenced by other packages.
+                        progtrack.actions_set_goal(
+                            _("Remove package files"), len(pfiles))
+                        for h in pfiles:
+                                # File might already be gone (don't care if
+                                # it is).
+                                fpath = self.cache_store.lookup(h)
+                                if fpath is not None:
+                                        portable.remove(fpath)
+                                        progtrack.actions_add_progress()
+                        progtrack.actions_done()
+
+                        # Finally, tidy up repository structure by discarding
+                        # unused package data directories for any packages
+                        # removed.
+                        def rmdir(d):
+                                """rmdir; but ignores non-empty directories."""
+                                try:
+                                        os.rmdir(d)
+                                except OSError, e:
+                                        if e.errno not in (
+                                            errno.ENOTEMPTY,
+                                            errno.EEXIST):
+                                                raise
+
+                        for name in set(
+                            f.get_dir_path(stemonly=True)
+                            for f in packages):
+                                rmdir(os.path.join(self.manifest_root, name))
+
+                        if self.file_root:
+                                try:
+                                        for entry in os.listdir(self.file_root):
+                                                rmdir(os.path.join(
+                                                    self.file_root, entry))
+                                except EnvironmentError, e:
+                                        if e.errno != errno.ENOENT:
+                                                raise
+                except EnvironmentError, e:
+                        raise apx._convert_error(e)
+                finally:
+                        # This ensures batch_mode is reset in the event of an
+                        # error.
+                        c.batch_mode = False
+                        self.__unlock_rstore()
+
         def rebuild(self, build_catalog=True, build_index=False):
                 """Rebuilds the repository catalog and search indexes using the
                 package manifests currently in the repository.
@@ -1398,7 +1642,7 @@ class _RepoStore(object):
                         raise RepositoryMirrorError()
                 if self.read_only:
                         raise RepositoryReadOnlyError()
-                if not self.catalog_root or self.catalog_version < 1:
+                if not self.catalog_root or self.catalog_version == 0:
                         raise RepositoryUnsupportedOperationError()
 
                 self.__lock_rstore()
@@ -1572,6 +1816,7 @@ class _RepoStore(object):
 
         catalog_root = property(lambda self: self.__catalog_root)
         file_root = property(lambda self: self.__file_root)
+        read_only = property(lambda self: self.__read_only, __set_read_only)
         root = property(lambda self: self.__root)
         writable_root = property(lambda self: self.__writable_root)
 
@@ -1630,6 +1875,13 @@ class Repository(object):
                 """Private helper function to determine repository format and
                 validity.
                 """
+
+                try:
+                        if not create and self.root and \
+                            os.path.isfile(self.root):
+                                raise RepositoryInvalidError(self.root)
+                except EnvironmentError, e:
+                        raise apx._convert_error(e)
 
                 cfgpathname = None
                 if self.__cfgpathname:
@@ -1723,7 +1975,13 @@ class Repository(object):
                                     "publisher")
 
                         if not create and cfgpathname and \
-                            not os.path.exists(cfgpathname):
+                            not os.path.exists(cfgpathname) and \
+                            not (os.path.exists(self.pub_root) or
+                            os.path.exists(os.path.join(
+                                self.root, "pkg5.image")) and
+                            Image(self.root, augment_ta_from_parent_image=False,
+                                allow_ondisk_upgrade=False,
+                                should_exist=True).version >= 3):
                                 # If this isn't a repository creation operation,
                                 # and the base configuration file doesn't exist,
                                 # this isn't a valid repository.
@@ -2112,10 +2370,6 @@ class Repository(object):
                 assert self.version < 4
 
                 alias = self.cfg.get_property("publisher", "alias")
-                icas = self.cfg.get_property("publisher",
-                    "intermediate_certs")
-                scas = self.cfg.get_property("publisher",
-                    "signing_ca_certs")
 
                 rargs = {}
                 for prop in ("collection_type", "description",
@@ -2127,7 +2381,7 @@ class Repository(object):
 
                 repo = publisher.Repository(**rargs)
                 return publisher.Publisher(pub, alias=alias,
-                    repositories=[repo], ca_certs=scas, intermediate_certs=icas)
+                    repository=repo)
 
         def get_publishers(self):
                 """Return publisher objects for all publishers known by the
@@ -2289,6 +2543,89 @@ class Repository(object):
                         rstore = self.__new_rstore(pfmri.publisher)
                 return rstore.open(client_release, pfmri)
 
+        def get_matching_fmris(self, patterns, pubs=misc.EmptyI):
+                """Given a user-specified list of FMRI pattern strings, return
+                a tuple of ('matching', 'references'), where matching is a dict
+                of matching fmris and references is a dict of the patterns
+                indexed by matching FMRI respectively:
+
+                {
+                 pkgname: [fmri1, fmri2, ...],
+                 pkgname: [fmri1, fmri2, ...],
+                 ...
+                }
+
+                {
+                 fmri1: [pat1, pat2, ...],
+                 fmri2: [pat1, pat2, ...],
+                 ...
+                }
+
+                'patterns' is the list of package patterns to match.
+
+                'pubs' is an optional set of publisher prefixes to restrict the
+                results to.
+
+                Constraint used is always AUTO as per expected UI behavior when
+                determining successor versions.
+
+                Note that patterns starting w/ pkg:/ require an exact match;
+                patterns containing '*' will using fnmatch rules; the default
+                trailing match rules are used for remaining patterns.
+
+                Exactly duplicated patterns are ignored.
+
+                Routine raises PackageMatchErrors if errors occur: it is illegal
+                to specify multiple different patterns that match the same
+                package name.  Only patterns that contain wildcards are allowed
+                to match multiple packages.
+                """
+
+                def merge(src, dest):
+                        for k, v in src.iteritems():
+                                if k in dest:
+                                        dest[k].extend(v)
+                                else:
+                                        dest[k] = v
+
+                matching = {}
+                references = {}
+                unmatched = None
+                for rstore in self.rstores:
+                        if not rstore.catalog_root or not rstore.publisher:
+                                # No catalog to aggregate matches from.
+                                continue
+                        if pubs and rstore.publisher not in pubs:
+                                # Doesn't match specified publisher.
+                                continue
+
+                        # Get matching items from target catalog and then
+                        # merge the result.
+                        mdict, mrefs, munmatched = \
+                            rstore.catalog.get_matching_fmris(patterns,
+                                raise_unmatched=False)
+                        merge(mdict, matching)
+                        merge(mrefs, references)
+                        if unmatched is None:
+                                unmatched = munmatched
+                        else:
+                                # The only unmatched entries that are
+                                # interesting are the ones that have no
+                                # matches for any publisher.
+                                unmatched.intersection_update(munmatched)
+
+                        del mdict, mrefs, munmatched
+
+                if unmatched:
+                        # One or more patterns didn't match a package from any
+                        # publisher.
+                        raise apx.PackageMatchErrors(unmatched_fmris=unmatched)
+                if not matching:
+                        # No packages or no publishers matching 'pubs'.
+                        raise apx.PackageMatchErrors(unmatched_fmris=patterns)
+
+                return matching, references
+
         @property
         def publishers(self):
                 """A set containing the list of publishers known to the
@@ -2316,6 +2653,63 @@ class Repository(object):
                                 continue
                         rstore.refresh_index()
 
+        def remove_packages(self, packages, progtrack=None, pub=None):
+                """Removes the specified packages from the repository.
+
+                'packages' is a list of FMRIs of packages to remove.
+
+                'progtrack' is an optional ProgressTracker object.
+
+                'pub' is an optional publisher prefix to limit the operation to.
+                """
+
+                plist = set()
+                pubs = set()
+                for p in packages:
+                        try:
+                                pfmri = p
+                                if not isinstance(pfmri, fmri.PkgFmri):
+                                        pfmri = fmri.PkgFmri(pfmri)
+                                if pub and not pfmri.publisher:
+                                        pfmri.publisher = pub
+                                if pfmri.publisher:
+                                        pubs.add(pfmri.publisher)
+                                plist.add(pfmri)
+                        except fmri.FmriError, e:
+                                raise RepositoryInvalidFMRIError(e)
+
+                if len(pubs) > 1:
+                        # Don't allow removal of packages from different
+                        # publishers at the same time.  Current transaction
+                        # model relies on a single publisher at a time and
+                        # transport is mapped the same way.
+                        raise RepositoryUnsupportedOperationError()
+
+                if not pub and pubs:
+                        # Use publisher specified in one of the FMRIs instead
+                        # of default publisher.
+                        pub = list(pubs)[0]
+
+                try:
+                        rstore = self.get_pub_rstore(pub)
+                except RepositoryUnknownPublisher, e:
+                        for p in plist:
+                                if not pfmri.publisher:
+                                        # No publisher given in FMRI and no
+                                        # default publisher so treat as
+                                        # invalid FMRI.
+                                        raise RepositoryUnqualifiedFMRIError(
+                                            pfmri)
+                        raise
+
+                # Before moving on, assign publisher for every FMRI that doesn't
+                # have one already.
+                for p in plist:
+                        if not pfmri.publisher:
+                                pfmri.publisher = rstore.publisher
+
+                rstore.remove_packages(packages, progtrack=progtrack)
+
         def add_content(self, pub=None, refresh_index=False):
                 """Looks for packages added to the repository that are not in
                 the catalog, adds them, and then updates search data by default.
@@ -2334,62 +2728,6 @@ class Repository(object):
 
                 rstore = self.get_trans_rstore(trans_id)
                 return rstore.add_file(trans_id, data=data, size=size)
-
-        def add_signing_certs(self, cert_paths, ca, pub=None):
-                """Add the certificates stored in the given paths to the
-                files in the repository and as properties of the publisher.
-                Whether the certificates are added as CA certificates or
-                intermediate certificates is determined by the 'ca' parameter.
-                """
-
-                rstore = self.get_pub_rstore(pub)
-
-                hshs = []
-                for p in cert_paths:
-                        try:
-                                # Get the hash of the cert file and then add it.
-                                hsh, s = misc.get_data_digest(p,
-                                    return_content=True)
-
-                                # The cert must be compressed first before
-                                # adding it to the repository.  The temporary
-                                # file created to do this is moved into place
-                                # by the insert.
-                                fd, pth = tempfile.mkstemp()
-                                gfh = PkgGzipFile(filename=pth, mode="wb")
-                                gfh.write(s)
-                                gfh.close()
-                                rstore.cache_store.insert(hsh, pth)
-                                hshs.append(hsh)
-                        except EnvironmentError, e:
-                                if e.errno == errno.EACCES:
-                                        raise apx.PermissionsException(
-                                            e.filename)
-                                if e.errno == errno.ENOENT:
-                                        raise RepositoryNoSuchFileError(
-                                            e.filename)
-                                raise
-
-                prop_name = "intermediate_certs"
-                if ca:
-                        prop_name = "signing_ca_certs"
-
-                if self.version < 4:
-                        # For older repositories, the information is stored
-                        # in the repository configuration.
-                        t = set(self.cfg.get_property("publisher", prop_name))
-                        t.update(hshs)
-                        self.cfg.set_property("publisher", prop_name, sorted(t))
-                        self.write_config()
-                        return
-
-                # For newer repositories, the certs are stored as part of the
-                # publisher's metadata.
-                pub_obj = rstore.get_publisher()
-                t = set(getattr(pub_obj, prop_name))
-                t.update(hshs)
-                setattr(pub_obj, prop_name, sorted(t))
-                rstore.update_publisher(pub_obj)
 
         def rebuild(self, build_catalog=True, build_index=False, pub=None):
                 """Rebuilds the repository catalog and search indexes using the
@@ -2417,35 +2755,6 @@ class Repository(object):
                 self.__lock_repository()
                 self.__init_state()
                 self.__unlock_repository()
-
-        def remove_signing_certs(self, hshs, ca, pub=None):
-                """Remove the given hashes from the certificates configured
-                for the publisher.  Whether the hashes are removed from the
-                list of CA certificates or the list of intermediate certificates
-                is determined by the 'ca' parameter. """
-
-                rstore = self.get_pub_rstore(pub)
-
-                prop_name = "intermediate_certs"
-                if ca:
-                        prop_name = "signing_ca_certs"
-
-                if self.version < 4:
-                        # For older repositories, the information is stored
-                        # in the repository configuration.
-                        t = set(self.cfg.get_property("publisher", prop_name))
-                        t.difference_update(hshs)
-                        self.cfg.set_property("publisher", prop_name, sorted(t))
-                        self.write_config()
-                        return
-
-                # For newer repositories, the certs are stored as part of the
-                # publisher's metadata.
-                pub_obj = rstore.get_publisher()
-                t = set(getattr(pub_obj, prop_name))
-                t.difference_update(hshs)
-                setattr(pub_obj, prop_name, sorted(t))
-                rstore.update_publisher(pub_obj)
 
         def replace_package(self, pfmri):
                 """Replaces the information for the specified FMRI in the
@@ -2602,8 +2911,6 @@ class RepositoryConfig(object):
                 cfg.PropertySection("publisher", [
                     cfg.PropPublisher("alias"),
                     cfg.PropPublisher("prefix"),
-                    cfg.PropList("signing_ca_certs"),
-                    cfg.PropList("intermediate_certs"),
                 ]),
                 cfg.PropertySection("repository", [
                     cfg.PropDefined("collection_type", ["core",

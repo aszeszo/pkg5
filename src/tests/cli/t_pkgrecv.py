@@ -21,7 +21,7 @@
 #
 
 #
-# Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2008, 2011, Oracle and/or its affiliates. All rights reserved.
 #
 
 import testutils
@@ -35,6 +35,7 @@ import pkg.config as cfg
 import pkg.fmri as fmri
 import pkg.manifest as manifest
 import pkg.misc as misc
+import pkg.p5p as p5p
 import pkg.server.repository as repo
 import shutil
 import tempfile
@@ -55,7 +56,18 @@ class TestPkgrecvMulti(pkg5unittest.ManyDepotTestCase):
 
         tree10 = """
             open tree@1.0,5.11-0
+            add depend type=require-any fmri=leaf@1.0 fmri=branch@1.0
             close 
+        """
+
+        leaf10 = """
+            open leaf@1.0,5.11-0
+            close
+        """
+
+        branch10 = """
+            open branch@1.0,5.11-0
+            close
         """
 
         amber10 = """
@@ -128,7 +140,7 @@ class TestPkgrecvMulti(pkg5unittest.ManyDepotTestCase):
                 # and scheme after that.
                 time.sleep(1)
                 self.published.extend(self.pkgsend_bulk(self.durl1,
-                    (self.bronze20, self.tree10, self.scheme10)))
+                    (self.bronze20, self.tree10, self.branch10, self.leaf10, self.scheme10)))
 
                 self.dpath2 = self.dcs[2].get_repodir()
                 self.durl2 = self.dcs[2].get_depot_url()
@@ -159,10 +171,14 @@ class TestPkgrecvMulti(pkg5unittest.ManyDepotTestCase):
                 self.pkgrecv(self.durl1, "-p foo", exit=2)
                 self.pkgrecv(self.durl1, "-d %s gold@1.0-1" % self.tempdir,
                     exit=1)
-                self.pkgrecv(self.durl1, "invalid.fmri@1.0.a", exit=1)
+                self.pkgrecv(self.durl1, "-d %s invalid.fmri@1.0.a" %
+                    self.tempdir, exit=1)
 
                 # Test help.
                 self.pkgrecv(command="-h", exit=0)
+
+                # Verify that pkgrecv requires a destination repository.
+                self.pkgrecv(self.durl1, "'*'", exit=2)
 
                 # Verify that a non-existent repository results in failure.
                 npath = os.path.join(self.test_root, "nochance")
@@ -175,10 +191,13 @@ class TestPkgrecvMulti(pkg5unittest.ManyDepotTestCase):
                 # The latest version of amber and bronze should be listed
                 # (sans publisher prefix currently).
                 amber = self.published[1]
-                scheme = self.published[6]
+                scheme = self.published[8]
                 bronze = self.published[4]
                 tree = self.published[5]
-                expected = "\n".join((amber, scheme, tree, bronze)) + "\n"
+                branch = self.published[6]
+                leaf = self.published[7]
+
+                expected = "\n".join((amber, branch, bronze, leaf, scheme, tree)) + "\n"
                 self.assertEqualDiff(expected, output)
 
         def test_1_recv_pkgsend(self):
@@ -378,7 +397,7 @@ class TestPkgrecvMulti(pkg5unittest.ManyDepotTestCase):
                 # Retrieve bronze using -m all-timestamps and a version pattern.
                 # This should only retrieve bronze20_1 and bronze20_2.
                 self.pkgrecv(self.durl1, "--raw -m all-timestamps -r -k "
-                    "-d %s %s" % (self.tempdir, "bronze@2.0"))
+                    "-d %s %s" % (self.tempdir, "/bronze@2.0"))
 
                 # Verify that only expected packages were retrieved.
                 expected = [
@@ -493,7 +512,7 @@ class TestPkgrecvMulti(pkg5unittest.ManyDepotTestCase):
                 expected."""
 
                 # Setup a repository with packages from multiple publishers.
-                amber = self.amber10.replace("open ", "open pkg://test2/")
+                amber = self.amber10.replace("open ", "open //test2/")
                 self.pkgsend_bulk(self.durl3, amber)
                 self.pkgrecv(self.durl1, "-d %s amber@1.0 bronze@1.0" %
                     self.durl3)
@@ -517,6 +536,106 @@ class TestPkgrecvMulti(pkg5unittest.ManyDepotTestCase):
                 # for a multi-publisher repository.
                 self.pkgrecv(self.durl3, "-d %s nosuchpackage" % self.durl4,
                     exit=1)
+
+        def test_8_archive(self):
+                """Verify that pkgrecv handles package archives as expected."""
+
+                # Setup a repository with packages from multiple publishers.
+                amber = self.amber10.replace("open ", "open pkg://test2/")
+                t2_amber10 = self.pkgsend_bulk(self.durl3, amber)[0]
+                self.pkgrecv(self.durl1, "-d %s amber@1.0 bronze@1.0" %
+                    self.durl3)
+
+                # Now attempt to receive from a repository to a package archive.
+                arc_path = os.path.join(self.test_root, "test.p5p")
+                self.pkgrecv(self.durl3, "-a -d %s \*" % arc_path)
+
+                #
+                # Verify that the archive can be opened and the expected
+                # packages are inside.
+                #
+                amber10 = self.published[0]
+                bronze10 = self.published[2]
+                arc = p5p.Archive(arc_path, mode="r")
+
+                # Check for expected publishers.
+                expected = set(["test1", "test2"])
+                pubs = set(p.prefix for p in arc.get_publishers())
+                self.assertEqualDiff(expected, pubs)
+
+                # Check for expected package FMRIs.
+                expected = set([amber10, t2_amber10, bronze10])
+                tmpdir = tempfile.mkdtemp(dir=self.test_root)
+                returned = []
+                for pfx in pubs:
+                        catdir = os.path.join(tmpdir, pfx)
+                        os.mkdir(catdir)
+                        for part in ("catalog.attrs", "catalog.base.C"):
+                                arc.extract_catalog1(part, catdir, pfx)
+
+                        cat = catalog.Catalog(meta_root=catdir, read_only=True)
+                        returned.extend(str(f) for f in cat.fmris())
+                self.assertEqualDiff(expected, set(returned))
+                arc.close()
+                shutil.rmtree(tmpdir)
+
+                #
+                # Verify that packages can be received from an archive to an
+                # archive.
+                #
+                arc2_path = os.path.join(self.test_root, "test2.p5p")
+                self.pkgrecv(arc_path, "-a -d %s pkg://test2/amber" % arc2_path)
+
+                # Check for expected publishers.
+                arc = p5p.Archive(arc2_path, mode="r")
+                expected = set(["test2"])
+                pubs = set(p.prefix for p in arc.get_publishers())
+                self.assertEqualDiff(expected, pubs)
+
+                # Check for expected package FMRIs.
+                expected = set([t2_amber10])
+                tmpdir = tempfile.mkdtemp(dir=self.test_root)
+                returned = []
+                for pfx in pubs:
+                        catdir = os.path.join(tmpdir, pfx)
+                        os.mkdir(catdir)
+                        for part in ("catalog.attrs", "catalog.base.C"):
+                                arc.extract_catalog1(part, catdir, pfx)
+
+                        cat = catalog.Catalog(meta_root=catdir, read_only=True)
+                        returned.extend(str(f) for f in cat.fmris())
+                self.assertEqualDiff(expected, set(returned))
+                arc.close()
+
+                #
+                # Verify that pkgrecv gracefully fails if archive already
+                # exists.
+                #
+                self.pkgrecv(arc_path, "-d %s \*" % arc2_path, exit=1)
+
+                #
+                # Verify that packages can be received from an archive to
+                # a repository.
+                #
+                self.pkgrecv(arc_path, "--newest")
+                self.pkgrecv(arc_path, "-d %s pkg://test2/amber bronze" %
+                    self.durl4)
+                self.wait_repo(self.dcs[4].get_repodir())
+                repo = self.dcs[4].get_repo()
+                self.pkgrecv(repo.root, "--newest")
+
+                # Check for expected publishers.
+                expected = set(["test1", "test2"])
+                pubs = repo.publishers
+                self.assertEqualDiff(expected, pubs)
+
+                # Check for expected package FMRIs.
+                expected = sorted([t2_amber10, bronze10])
+                returned = []
+                for pfx in repo.publishers:
+                        cat = repo.get_catalog(pub=pfx)
+                        returned.extend(str(f) for f in cat.fmris())
+                self.assertEqualDiff(expected, sorted(returned))
 
 
 if __name__ == "__main__":

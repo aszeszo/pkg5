@@ -21,14 +21,17 @@
 #
 
 #
-# Copyright (c) 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2010, 2011, Oracle and/or its affiliates. All rights reserved.
 #
 
 from pkg.lint.engine import lint_fmri_successor
 
 import collections
+import copy
 import pkg.fmri
 import pkg.lint.base as base
+from pkg.actions import ActionError
+from pkg.actions.file import FileAction
 import stat
 import string
 
@@ -85,6 +88,7 @@ class PkgDupActionChecker(base.ActionChecker):
                 self.processed_gids = {}
 
                 self.processed_refcount_paths = {}
+                self.processed_overlays = {}
 
                 # mark which paths we've done duplicate-type checking on
                 self.seen_dup_types = {}
@@ -117,9 +121,6 @@ class PkgDupActionChecker(base.ActionChecker):
                                         continue
                                 if attr not in action.attrs:
                                         continue
-                                if "pkg.linted" in action.attrs and \
-                                    action.attrs["pkg.linted"].lower() == "true":
-                                        continue
 
                                 variants = action.get_variant_template()
                                 variants.merge_unknown(pkg_vars)
@@ -131,21 +132,44 @@ class PkgDupActionChecker(base.ActionChecker):
                                 else:
                                         dic[p].append((mf.fmri, action))
 
+                # construct a set of FMRIs being presented for linting, and
+                # avoid seeding the reference dictionary for any packages
+                # that have new versions available in the lint repository, or
+                # lint manifests given on the command line.
+                lint_fmris = {}
+                for m in engine.gen_manifests(engine.lint_api_inst,
+                    release=engine.release, pattern=engine.pattern):
+                        lint_fmris.setdefault(
+                            m.fmri.get_name(), []).append(m.fmri)
+                for m in engine.lint_manifests:
+                        lint_fmris.setdefault(
+                            m.fmri.get_name(), []).append(m.fmri)
+
                 engine.logger.debug(
                     _("Seeding reference action duplicates dictionaries."))
 
                 for manifest in engine.gen_manifests(engine.ref_api_inst,
                     release=engine.release):
-                        seed_dict(manifest, "path", self.ref_paths)
-                        seed_dict(manifest, "name", self.ref_drivers,
-                            atype="driver")
-                        seed_dict(manifest, "username", self.ref_usernames,
-                            atype="user")
-                        seed_dict(manifest, "uid", self.ref_uids,
-                            atype="user")
-                        seed_dict(manifest, "groupname", self.ref_groupnames,
-                            atype="group")
-                        seed_dict(manifest, "gid", self.ref_gids, atype="group")
+                        # Only put this manifest into the reference dictionary
+                        # if it's not an older version of the same package.
+                        if any(
+                            lint_fmri_successor(fmri, manifest.fmri)
+                            for fmri
+                            in lint_fmris.get(manifest.fmri.get_name(), [])
+                        ):
+                                continue
+                        else:
+                                seed_dict(manifest, "path", self.ref_paths)
+                                seed_dict(manifest, "name", self.ref_drivers,
+                                    atype="driver")
+                                seed_dict(manifest, "username",
+                                    self.ref_usernames, atype="user")
+                                seed_dict(manifest, "uid", self.ref_uids,
+                                    atype="user")
+                                seed_dict(manifest, "groupname",
+                                    self.ref_groupnames, atype="group")
+                                seed_dict(manifest, "gid", self.ref_gids,
+                                    atype="group")
 
                 engine.logger.debug(
                     _("Seeding lint action duplicates dictionaries."))
@@ -180,19 +204,17 @@ class PkgDupActionChecker(base.ActionChecker):
                         seed_dict(manifest, "gid", self.lint_gids,
                             atype="group")
 
-                self._merge_dict(self.lint_paths, self.ref_paths)
-                self._merge_dict(self.lint_drivers, self.ref_drivers)
-                self._merge_dict(self.lint_usernames, self.ref_usernames)
-                self._merge_dict(self.lint_uids, self.ref_uids)
-                self._merge_dict(self.lint_groupnames, self.ref_groupnames)
-                self._merge_dict(self.lint_gids, self.ref_gids)
+                dup_dictionaries = [(self.lint_paths, self.ref_paths),
+                    (self.lint_drivers, self.ref_drivers),
+                    (self.lint_usernames, self.ref_usernames),
+                    (self.lint_uids, self.ref_uids),
+                    (self.lint_groupnames, self.ref_groupnames),
+                    (self.lint_gids, self.ref_gids)]
 
-                self.lint_paths = {}
-                self.lint_drivers = {}
-                self.lint_usernames = {}
-                self.lint_uids = {}
-                self.lint_groupnames = {}
-                self.lint_gids = {}
+                for lint_dic, ref_dic in dup_dictionaries:
+                        self._merge_dict(lint_dic, ref_dic,
+                            ignore_pubs=engine.ignore_pubs)
+                        self.lint_dic = {}
 
         def duplicate_paths(self, action, manifest, engine, pkglint_id="001"):
                 """Checks for duplicate paths on non-ref-counted actions."""
@@ -269,57 +291,66 @@ class PkgDupActionChecker(base.ActionChecker):
                 if p in self.processed_refcount_paths:
                         return
 
+                lint_id = "%s%s" % (self.name, pkglint_id)
+
                 fmris = set()
                 target = action
                 differences = set()
                 for (pfmri, a) in self.ref_paths[p]:
+                        if engine.linted(action=a, manifest=manifest,
+                            lint_id=lint_id):
+                                continue
                         fmris.add(pfmri)
                         for key in a.differences(target):
-                                # target, used in link actions often differs
-                                # between variants of those actions.
+                                # we allow certain attribute values to differ.
                                 if key.startswith("variant") or \
                                     key.startswith("facet") or \
-                                    key.startswith("target"):
+                                    key.startswith("target") or \
+                                    key.startswith("pkg.linted"):
                                         continue
-                                conflicting_vars, variants = \
+                                conflicting_vars, conflicting_actions = \
                                     self.conflicting_variants([a, target],
                                         manifest.get_all_variants())
-                                if not conflicting_vars:
+                                if not conflicting_actions:
                                         continue
                                 differences.add(key)
                 suspects = []
                 if differences:
-                        for key in differences:
+                        for key in sorted(differences):
                                 # a dictionary to map unique values for this key
                                 # the fmris that deliver them
                                 attr = {}
                                 for (pfmri, a) in self.ref_paths[p]:
+                                        if engine.linted(action=a,
+                                            manifest=manifest, lint_id=lint_id):
+                                                continue
                                         if key in a.attrs:
                                                 val = a.attrs[key]
                                                 if val in attr:
                                                         attr[val].append(pfmri)
                                                 else:
                                                         attr[val] = [pfmri]
-                                for val in attr:
+                                for val in sorted(attr):
                                         suspects.append("%s: %s -> %s" %
                                             (key, val,
                                             " ".join([pfmri.get_name()
-                                            for pfmri in attr[val]])))
-
+                                            for pfmri in sorted(attr[val])
+                                            ])))
                         engine.error(_("path %(path)s is reference-counted "
                             "but has different attributes across %(count)s "
                             "duplicates: %(suspects)s") %
                             {"path": p,
                             "count": len(fmris) + 1,
                             "suspects": " ".join([key for key in suspects])},
-                            msgid="%s%s" % (self.name, pkglint_id))
+                            msgid=lint_id, ignore_linted=True)
                 self.processed_refcount_paths[p] = True
 
         duplicate_refcount_path_attrs.pkglint_desc = _(
             "Duplicated reference counted actions should have the same attrs.")
 
         def dup_attr_check(self, action_names, attr_name, ref_dic,
-            processed_dic, action, engine, pkg_vars, msgid=""):
+            processed_dic, action, engine, pkg_vars, msgid="",
+            only_overlays=False):
                 """This method does generic duplicate action checking where
                 we know the type of action and name of an action attributes
                 across actions/manifests that should not be duplicated.
@@ -339,7 +370,10 @@ class PkgDupActionChecker(base.ActionChecker):
 
                 'engine' The LintEngine calling this method
 
-                'id' The pkglint_id to use when logging messages."""
+                'msgid' The pkglint_id to use when logging messages.
+
+                'only_overlays' Only report about misuse of the 'overlay'
+                attribute for file actions."""
 
                 if attr_name not in action.attrs:
                         return
@@ -361,17 +395,34 @@ class PkgDupActionChecker(base.ActionChecker):
                         actions.add(a)
                         fmris.add(pfmri)
 
-                has_conflict, conflict_vars = self.conflicting_variants(actions,
-                    pkg_vars)
-                if has_conflict:
+                conflict_vars, conflict_actions = \
+                    self.conflicting_variants(actions, pkg_vars)
+
+                # prune out any valid overlay file action-pairs.
+                if attr_name == "path" and action.name == "file":
+                        conflict_actions, errors = _prune_overlays(
+                            self, conflict_actions, ref_dic, pkg_vars)
+                        if only_overlays:
+                                for error, sub_id in errors:
+                                        engine.error(error, msgid="%s%s.%s" %
+                                            (self.name, msgid, sub_id))
+                                processed_dic[name] = True
+                                return
+
+                        if conflict_actions:
+                                 conflict_vars, conflict_actions = \
+                                        self.conflicting_variants(actions,
+                                            pkg_vars)
+                if conflict_actions:
+                        plist = [f.get_fmri() for f in sorted(fmris)]
+
                         if not conflict_vars:
                                 engine.error(_("%(attr_name)s %(name)s is "
                                     "a duplicate delivered by %(pkgs)s "
                                     "under all variant combinations") %
                                     {"attr_name": attr_name,
                                     "name": name,
-                                    "pkgs":
-                                    " ".join([f.get_fmri() for f in fmris])},
+                                    "pkgs": " ".join(plist)},
                                     msgid="%s%s.1" % (self.name, msgid))
                         else:
                                 for fz in conflict_vars:
@@ -381,9 +432,7 @@ class PkgDupActionChecker(base.ActionChecker):
                                             "variants %(vars)s") %
                                             {"attr_name": attr_name,
                                             "name": name,
-                                            "pkgs":
-                                            " ".join([f.get_fmri() for f
-                                                in fmris]),
+                                            "pkgs": " ".join(plist),
                                             "vars":
                                             " ".join(["%s=%s" % (k, v)
                                                 for (k, v)
@@ -404,31 +453,59 @@ class PkgDupActionChecker(base.ActionChecker):
                 if p in self.seen_dup_types:
                         return
 
+                # we could have a linted action, which would have prevented
+                # us from adding this path to the dictionary.
+                if p not in self.ref_paths:
+                        return
+
+                lint_id = "%s%s" % (self.name, pkglint_id)
                 types = set()
                 fmris = set()
                 actions = set()
                 for (pfmri, a) in self.ref_paths[p]:
+                        if engine.linted(action=a, manifest=manifest,
+                            lint_id=lint_id):
+                                continue
                         actions.add(a)
                         types.add(a.name)
                         fmris.add(pfmri)
                 if len(types) > 1:
-                        has_conflict, conflict_vars = \
+                        conflict_vars, conflict_actions = \
                             self.conflicting_variants(actions,
                                 manifest.get_all_variants())
-                        if has_conflict:
+                        if conflict_actions:
+                                plist = [f.get_fmri() for f in sorted(fmris)]
+                                plist.sort()
                                 engine.error(
                                     _("path %(path)s is delivered by multiple "
                                     "action types across %(pkgs)s") %
                                     {"path": p,
                                     "pkgs":
-                                    " ".join([f.get_fmri() for f in fmris])},
-                                    msgid="%s%s" % (self.name, pkglint_id))
+                                    " ".join(plist)},
+                                    msgid=lint_id, ignore_linted=True)
                 self.seen_dup_types[p] = True
 
         duplicate_path_types.pkglint_desc = _(
             "Paths should be delivered by one action type only.")
 
-        def _merge_dict(self, src, target):
+        def overlays(self, action, manifest, engine, pkglint_id="009"):
+                """Checks that any duplicate file actions which specify overlay
+                attributes do so according to the rules.
+
+                Much of the implementation here is done by _prune_overlays(..),
+                called by dup_attr_check."""
+
+                if action.name != "file":
+                        return
+
+                self.dup_attr_check(["file"], "path", self.ref_paths,
+                    self.processed_overlays, action, engine,
+                    manifest.get_all_variants(), msgid=pkglint_id,
+                    only_overlays=True)
+
+        overlays.pkglint_desc = _("Overlaying actions should be valid.")
+
+        def _merge_dict(self, src, target, ignore_pubs=True):
                 """Merges the given src dictionary into the target
                 dictionary, giving us the target content as it would appear,
                 were the packages in src to get published to the
@@ -464,7 +541,9 @@ class PkgDupActionChecker(base.ActionChecker):
                                 for targ_pfmri in targ_dic.copy():
                                         sname = src_pfmri.get_name()
                                         tname = targ_pfmri.get_name()
-                                        if lint_fmri_successor(src_pfmri, targ_pfmri):
+                                        if lint_fmri_successor(src_pfmri,
+                                            targ_pfmri,
+                                            ignore_pubs=ignore_pubs):
                                                 targ_dic.pop(targ_pfmri)
                         targ_dic.update(src_dic)
                         l = []
@@ -472,6 +551,187 @@ class PkgDupActionChecker(base.ActionChecker):
                                 for action in targ_dic[pfmri]:
                                         l.append((pfmri, action))
                         target[p] = l
+
+def _prune_overlays(self, actions, ref_dic, pkg_vars):
+        """Given a list of file actions that all deliver to the same path,
+        return that list minus any actions that are attempting to use overlays.
+        Also  return a list of tuples containing any overlay-related errors
+        encountered, in the the format [ (<error msg>, <id>), ... ]
+        """
+
+        if not actions:
+                return [], []
+
+        path = actions[0].attrs["path"]
+        # action_fmris is a list of (fmri, action) tuples
+        action_fmris = ref_dic[path]
+        # When printing errors, we emit all FMRIs that are taking part in the
+        # duplication of this path.
+        fmris = sorted(set([str(fmri) for fmri, action in action_fmris]))
+
+        def _remove_attrs(action):
+                """returns a string representation of the given action with
+                all non-variant attributes other than path and overlay removed.
+                Used for comparison of overlay actions.
+                """
+                action_copy = copy.deepcopy(action)
+                for key in action_copy.attrs.keys():
+                        if key in ["path", "overlay"]:
+                                continue
+                        elif key.startswith("variant"):
+                                continue
+                        else:
+                                del action_copy.attrs[key]
+                return str(action_copy)
+
+        def _get_fmri(action, action_fmris):
+                """return the fmri for a given action."""
+                for fmri, ac in action_fmris:
+                        if action == ac:
+                                return fmri
+
+        # buckets for actions according to their overlay attribute value
+        # any actions that do not specify overlay attributes, or use them
+        # incorrectly get put into ret_actions, and returned for our
+        # generic duplicate-attribute code to deal with.
+        allow_overlay = []
+        overlay = []
+        ret_actions = []
+
+        errors = set()
+
+        # sort our list of actions into the corresponding bucket
+        for action in actions:
+                overlay_attr = action.attrs.get("overlay", None)
+                if overlay_attr and overlay_attr == "allow":
+                        if not action.attrs.get("preserve", None):
+                                errors.add(
+                                    (_("path %(path)s missing 'preserve' "
+                                    "attribute for 'overlay=allow' action "
+                                    "in %(fmri)s") % {"path": path,
+                                    "fmri": _get_fmri(action, action_fmris)},
+                                    "1"))
+                        else:
+                                allow_overlay.append(action)
+
+                elif overlay_attr and overlay_attr == "true":
+                        overlay.append(action)
+                else:
+                        ret_actions.append(action)
+
+        if not (overlay or allow_overlay):
+                return actions, []
+
+        def _render_variants(conflict_vars):
+                """pretty print a group of variants"""
+                vars = set()
+                for group in conflict_vars:
+                        for key, val in group:
+                                vars.add("%s=%s" % (key, val))
+                return ", ".join(list(vars))
+
+        def _unique_attrs(action):
+                """return a dictionary containing only attrs that must be
+                unique across overlay actions."""
+                attrs = {}
+                for key in FileAction.unique_attrs:
+                        if key == "preserve":
+                                continue
+                        attrs[key] = action.attrs.get(key, None)
+                return attrs
+
+        # Ensure none of the groups of overlay actions have
+        # conflicting variants within them.
+        conflict_vars, conflict_overlays = self.conflicting_variants(overlay,
+            pkg_vars)
+        if conflict_vars:
+                errors.add(
+                    (_("path %(path)s has duplicate 'overlay=true' actions for "
+                    "the following variants across across %(fmris)s: %(var)s") %
+                    {"path": path, "fmris": ", ".join(list(fmris)),
+                    "var": _render_variants(conflict_vars)}, "2"))
+
+        # verify that if we're only delivering overlay=allow actions, none of
+        # them conflict with each other (we check corresponding overlay=true
+        # actions, if any, later)
+        if not overlay:
+                conflict_vars, conflict_overlays = self.conflicting_variants(
+                allow_overlay, pkg_vars)
+                if conflict_vars:
+                        errors.add(
+                            (_("path %(path)s has duplicate 'overlay=allow' "
+                            "actions for the following variants across across "
+                            "%(fmris)s: %(var)s") %
+                            {"path": path, "fmris": ", ".join(list(fmris)),
+                            "var": _render_variants(conflict_vars)}, "3"))
+
+        # Check for valid, complimentary sets of overlay and allow_overlay
+        # actions.
+        seen_mismatch = False
+        for a1 in overlay:
+                # Our assertions on how to detect clashing overlay +
+                # allow_overlay actions:
+                #
+                # 1. each overlay action must have at least one conflict from
+                #    the set of allow_overlay actions.
+                #
+                # 2. from that set of conflicts, when we remove the overlay
+                #    action itself, there must be no conflicts within that set
+                #    of overlay=allow actions.
+                #
+                # 3. all attributes required to be the same between
+                #    complimentary sets of allow_overlay and overlay actions
+                #    are the same.
+
+                conflict_vars, conflict_actions = self.conflicting_variants(
+                    [a1] + allow_overlay, pkg_vars)
+
+                if conflict_actions:
+                        conflict_actions.remove(a1)
+                        conflict_vars_sub, conflict_actions_allow = \
+                            self.conflicting_variants(conflict_actions,
+                            pkg_vars)
+
+                        if conflict_actions_allow:
+                                errors.add(
+                                    (_("path %(path)s uses overlay='true' "
+                                    "actions but has duplicate 'overlay=allow' "
+                                    "actions for the following variants across "
+                                    "%(fmris)s: %(vars)s") %
+                                    {"path": path,
+                                    "fmris": ", ".join(list(fmris)),
+                                    "vars": _render_variants(
+                                    conflict_vars_sub)}, "4"))
+                        else:
+                                # check that none of the attributes required to
+                                # be the same between overlay and allow actions
+                                # differ.
+                                a1_attrs = _unique_attrs(a1)
+                                for a2 in conflict_actions:
+                                        if a1_attrs != _unique_attrs(a2):
+                                                seen_mismatch = True
+                else:
+                        errors.add(
+                            (_("path %(path)s uses 'overlay=true' actions"
+                            " but has no corresponding 'overlay=allow' actions "
+                            "across %(fmris)s") %
+                            {"path": path, "fmris": ", ".join(list(fmris))},
+                            "5"))
+
+        if seen_mismatch:
+                errors.add(
+                    (_("path %(path)s has mismatching attributes for "
+                    "'overlay=true' and 'overlay=allow' action-pairs across "
+                    "%(fmris)s") % {"path": path,
+                    "fmris": ", ".join(list(fmris))}, "6"))
+
+        if (overlay or allow_overlay) and ret_actions:
+                errors.add(
+                    (_("path %(path)s has both overlay and non-overlay actions "
+                    "across %(fmris)s") %
+                    {"path": path, "fmris": ", ".join(list(fmris))}, "7"))
+
+        return ret_actions, errors
 
 
 class PkgActionChecker(base.ActionChecker):
@@ -504,7 +764,11 @@ class PkgActionChecker(base.ActionChecker):
                         if "pkg.obsolete" in mf and \
                             mf["pkg.obsolete"].lower() == "true":
                                 dic[name] = ObsoleteFmri(True, mf.fmri)
-                        else:
+                        elif "pkg.renamed" not in mf or \
+                            mf["pkg.renamed"].lower() == "false":
+                                # we can't yet tell if a renamed
+                                # package gets obsoleted further down
+                                # its rename chain, so don't decide now
                                 dic[name] = ObsoleteFmri(False, mf.fmri)
 
                 engine.logger.debug(_("Seeding reference action dictionaries."))
@@ -531,14 +795,52 @@ class PkgActionChecker(base.ActionChecker):
                         if "_" in key:
                                 if key in ["original_name", "refresh_fmri",
                                     "restart_fmri", "suspend_fmri",
-                                    "disable_fmri", "clone_perms"]:
+                                    "disable_fmri", "clone_perms",
+                                    "reboot_needed"] or \
+                                        key.startswith("facet.locale.") or \
+                                        key.startswith("facet.version-lock."):
                                         continue
                                 engine.warning(
                                     _("underscore in attribute name %(key)s in "
                                     "%(fmri)s") %
                                     {"key": key,
                                     "fmri": manifest.fmri},
-                                    msgid="%s%s" % (self.name, pkglint_id))
+                                    msgid="%s%s.1" % (self.name, pkglint_id))
+
+                if action.name != "set":
+                        return
+
+                name = action.attrs["name"]
+
+                if "_" not in name:
+                        return
+
+                obs_map = {
+                    "info.maintainer_url": "info.maintainer-url",
+                    "info.upstream_url": "info.upstream-url",
+                    "info.source_url": "info.source-url",
+                    "info.repository_url": "info.repository-url",
+                    "info.repository_changeset": "info.repository-changeset",
+                    "info.defect_tracker.url": "info.defect-tracker.url",
+                    "opensolaris.arc_url": "org.opensolaris.caseid"
+                }
+
+                # These names are deprecated, and so we warn, but we're a tiny
+                # bit nicer about it.
+                if name in obs_map:
+                        engine.warning(_("underscore in obsolete 'set' action "
+                            "name %(name)s should be %(new)s in %(fmri)s") % {
+                                "name": name,
+                                "new": obs_map[name],
+                                "fmri": manifest.fmri
+                            },
+                            msgid="%s%s.3" % (self.name, pkglint_id))
+                        return
+
+                engine.warning(_("underscore in 'set' action name %(name)s in "
+                    "%(fmri)s") % {"name": name,
+                    "fmri": manifest.fmri},
+                    msgid="%s%s.2" % (self.name, pkglint_id))
 
         underscores.pkglint_desc = _(
             "Underscores are discouraged in action attributes.")
@@ -548,54 +850,66 @@ class PkgActionChecker(base.ActionChecker):
 
                 if "mode" in action.attrs:
                         mode = action.attrs["mode"]
-                        unusual = False
-                        filemodes = ["0644", "0755", "0555", "4755", "0664",
-                                    "0444", "4555", "0600", "2555" ]
-                        if action.name == "file":
-                                if mode not in filemodes:
-                                        unusual = True
+                        path = action.attrs["path"]
+                        st = None
+                        try:
+                                st = stat.S_IMODE(string.atoi(mode, 8))
+                        except ValueError:
+                                pass
 
-                        elif action.name == "dir":
-                                if mode not in ["0700", "0755", "0744", "0555",
-                                    "2555", "6555"]:
-                                        unusual = True
-                                # check it's executable
-                                st = None
-                                broken = False
-                                try:
-                                        st = stat.S_IMODE(string.atoi(mode, 8))
-                                except ValueError:
-                                        broken = True
-
-                                if not broken and \
+                        if action.name == "dir":
+                                # check for at least one executable bit
+                                if st and \
                                     (stat.S_IXUSR & st or stat.S_IXGRP & st
                                     or stat.S_IXOTH & st):
                                         pass
-                                else:
+                                elif st:
                                         engine.warning(_("directory action for "
-                                            "%(dir)s delivered in %(pkg)s with "
+                                            "%(path)s delivered in %(pkg)s with "
                                             "mode=%(mode)s "
                                             "that has no executable bits") %
-                                            {"dir": action.attrs["path"],
+                                            {"path": path,
                                             "pkg": manifest.fmri,
                                             "mode": mode},
                                             msgid="%s%s.1" %
                                             (self.name, pkglint_id))
 
-                        elif mode not in ["0644", "0755", "0700", "0444"]:
-                                unusual = True
-
-                        if unusual:
-                                engine.warning(
-                                    _("unusual mode %(mode)s in %(path)s "
-                                    "delivered by %(pkg)s") %
-                                    {"mode": mode,
-                                    "path": action.attrs["path"],
-                                    "pkg": manifest.fmri},
+                        if not st:
+                                engine.error(_("broken mode mode=%(mode)s "
+                                    "delivered in action for %(path)s in "
+                                    "%(pkg)s") %
+                                    {"path": path,
+                                    "pkg": manifest.fmri,
+                                    "mode": mode},
                                     msgid="%s%s.2" % (self.name, pkglint_id))
 
+                        if len(mode) < 3:
+                                engine.error(_("mode=%(mode)s is too short in "
+                                    "action for %(path)s in %(pkg)s") %
+                                    {"path": path,
+                                    "pkg": manifest.fmri,
+                                    "mode": mode},
+                                    msgid="%s%s.3" % (self.name, pkglint_id))
+                                return
+
+                        # now check for individual access permissions
+                        user = mode[-3]
+                        group = mode[-2]
+                        other = mode[-1]
+
+                        if (other > group or
+                            group > user or
+                            other > user):
+                                engine.warning(_("unusual mode mode=%(mode)s "
+                                    "delivered in action for %(path)s in "
+                                    "%(pkg)s") %
+                                    {"path": path,
+                                    "pkg": manifest.fmri,
+                                    "mode": mode},
+                                    msgid="%s%s.4" % (self.name, pkglint_id))
+
         unusual_perms.pkglint_desc = _(
-            "UNIX file modes should be sensible.")
+            "Paths should not have unusual permissions.")
 
         def legacy(self, action, manifest, engine, pkglint_id="003"):
                 """Cross-check that the 'pkg' attribute points to a package
@@ -610,47 +924,23 @@ class PkgActionChecker(base.ActionChecker):
 
                 for required in [ "category", "desc", "hotline", "name",
                     "pkg", "vendor", "version" ]:
-                            if required not in action.attrs:
-                                    engine.error(
-                                        _("%(attr)s missing from legacy "
-                                        "action in %(pkg)s") %
-                                        {"attr": required,
-                                        "pkg": manifest.fmri},
-                                        msgid="%s%s.1" %
-                                        (self.name, pkglint_id))
+                        if required not in action.attrs:
+                                engine.error(
+                                    _("%(attr)s missing from legacy "
+                                    "action in %(pkg)s") %
+                                    {"attr": required,
+                                    "pkg": manifest.fmri},
+                                    msgid="%s%s.1" % (self.name, pkglint_id))
 
                 if "pkg" in action.attrs:
-                        mf = None
-                        try:
-                                mf = engine.get_manifest(action.attrs["pkg"],
-                                    search_type=engine.LATEST_SUCCESSOR)
-                        except base.LintException:
-                                # it's common to find a legacy package that
-                                # simply never existed as an IPS package eg.
-                                # arch-specific SVR4 packages combined into a
-                                # single IPS package.
-                                # We don't care about these.
-                                pass
-                        if mf:
-                                found_depend = False
-                                # check that the manifest we found depends on
-                                # the package containing this legacy action
-                                for depend in mf.gen_actions_by_type("depend"):
-                                        if depend.attrs["type"] != "require":
-                                                continue
-                                        fmri = depend.attrs["fmri"]
-                                        dep_name = \
-                                            pkg.fmri.extract_pkg_name(fmri)
-                                        if dep_name == name:
-                                                found_depend = True
-                                if not found_depend:
-                                        engine.error(
-                                        _("ancestor %(ancestor)s did not "
-                                        "declare a dependency on %(pkg)s") %
-                                        {"ancestor": mf.fmri,
-                                        "pkg": manifest.fmri},
-                                        msgid="%s%s.2" %
-                                        (self.name, pkglint_id))
+
+                        legacy = engine.get_manifest(action.attrs["pkg"],
+                            search_type=engine.LATEST_SUCCESSOR)
+                        # Some legacy ancestor packages never existed as pkg(5)
+                        # stubs
+                        if legacy:
+                                self.check_legacy_rename(legacy, action,
+                                    manifest, engine, pkglint_id)
 
                 if "version" in action.attrs:
                         # this could be refined
@@ -659,6 +949,44 @@ class PkgActionChecker(base.ActionChecker):
                                     _("legacy action in %s does not "
                                     "contain a REV= string") % manifest.fmri,
                                     msgid="%s%s.3" % (self.name, pkglint_id))
+
+        def check_legacy_rename(self, legacy, action, manifest, engine,
+            lint_id):
+                """Part of the legacy(..) check, not an individual check,
+                determines that the renaming of a package manifest, "legacy",
+                referred to by a legacy action, "action", was done correctly
+                and ultimately results on a dependency on the package,
+                "manifest"."""
+
+                if "pkg.renamed" in legacy and \
+                    legacy["pkg.renamed"].lower() == "true":
+                        mf = None
+                        try:
+                                mf = engine.follow_renames(action.attrs["pkg"],
+                                    target=manifest.fmri, old_mfs=[])
+                        except base.LintException, e:
+                                # we've tried to rename to ourselves
+                                engine.error(_("legacy renaming: %s") % str(e),
+                                    msgid="%s%s.5" % (self.name, lint_id))
+                                return
+
+                        if mf is None:
+                                engine.error(_("legacy package %(legacy)s did "
+                                    "not result in a dependency on %(pkg)s when"
+                                    " following package renames") %
+                                    {"legacy": legacy.fmri,
+                                    "pkg": manifest.fmri},
+                                    msgid="%s%s.4" %
+                                    (self.name, lint_id))
+
+                        elif not lint_fmri_successor(manifest.fmri, mf.fmri,
+                            ignore_pubs=engine.ignore_pubs):
+                                engine.error(_("legacy package %(legacy)s did "
+                                    "not result in a dependency on %(pkg)s") %
+                                    {"legacy": legacy.fmri,
+                                    "pkg": manifest.fmri},
+                                    msgid="%s%s.2" %
+                                    (self.name, lint_id))
 
         legacy.pkglint_desc = _(
             "'legacy' actions should have valid attributes.")
@@ -673,19 +1001,6 @@ class PkgActionChecker(base.ActionChecker):
 
         unknown.pkglint_desc = _("'unknown' actions should never occur.")
 
-        def license(self, action, manifest, engine, pkglint_id="005"):
-                """License actions should not have path attributes."""
-
-                if action.name is "license" and "path" in action.attrs:
-                        engine.error(
-                            _("license action in %(pkg)s has a path attribute, "
-                            "%(path)s") %
-                            {"pkg": manifest.fmri,
-                            "path": action.attrs["path"]},
-                            msgid="%s%s" % (self.name, pkglint_id))
-
-        license.pkglint_desc = _("'license' actions should not have paths.")
-
         def dep_obsolete(self, action, manifest, engine, pkglint_id="005"):
                 """We should not have a require dependency on a package that has
                 been marked as obsolete.
@@ -695,9 +1010,15 @@ class PkgActionChecker(base.ActionChecker):
                 to check for their obsoletion.  This can help to detect errors
                 in the fmri attribute field of the depend action, though can be
                 noisy if all dependencies are intentionally not present in the
-                repository being linted or referenced."""
+                repository being linted or referenced.
 
-                msg = _("dependency in %(pkg)s on obsolete pkg %(obs)s")
+                The pkglint paramter pkglint.action005.1.missing-deps can be
+                used to declare which fmris we know could be missing, and for
+                which we should not emit a warning message if those manifests
+                are not available.
+                """
+
+                msg = _("dependency on obsolete package in %s:")
 
                 if action.name != "depend":
                         return
@@ -705,9 +1026,11 @@ class PkgActionChecker(base.ActionChecker):
                 if action.attrs["type"] != "require":
                         return
 
-                # There's a good chance that dependencies can be satisfied from
-                # the manifests we cached during startup() Check there before
-                # doing the more expensive engine.get_manifest() call.
+                # it's ok for renamed packages to eventually be obsoleted
+                if "pkg.renamed" in manifest and \
+                    manifest["pkg.renamed"].lower() == "true":
+                        return
+
                 name = None
                 declared_fmri = None
                 dep_fmri = action.attrs["fmri"]
@@ -734,6 +1057,8 @@ class PkgActionChecker(base.ActionChecker):
                 if dep_fmri in self.missing_deps:
                         return
 
+                # There's a good chance that dependencies can be satisfied from
+                # the manifests we cached during startup() Check there first.
                 if name and name in self.obsolete_pkgs:
 
                         if not self.obsolete_pkgs[name].is_obsolete:
@@ -743,7 +1068,8 @@ class PkgActionChecker(base.ActionChecker):
                                 if not declared_fmri.has_version():
                                         return
                                 elif lint_fmri_successor(found_fmri,
-                                    declared_fmri):
+                                    declared_fmri,
+                                    ignore_pubs=engine.ignore_pubs):
                                         return
 
                 # A non-obsolete dependency wasn't found in the local cache,
@@ -751,13 +1077,38 @@ class PkgActionChecker(base.ActionChecker):
                 # the fmri in the depend action.
                 lint_id = "%s%s" % (self.name, pkglint_id)
 
-                mf = engine.get_manifest(dep_fmri,
-                    search_type=engine.LATEST_SUCCESSOR)
-                if mf and "pkg.obsolete" in mf:
-                        engine.error(msg %  {"pkg": manifest.fmri,
-                            "obs": mf["pkg.fmri"]}, msgid=lint_id)
-                elif not mf:
+                mf = None
+                found_obsolete = False
+                try:
+                        mf = engine.follow_renames(
+                            dep_fmri, old_mfs=[], warn_on_obsolete=True)
+                except base.LintException, err:
+                        found_obsolete = True
+                        engine.error("%s %s" % (msg % manifest.fmri, err),
+                            msgid=lint_id)
+
+                # We maintain a whitelist of dependencies which may be missing
+                # during this lint run (eg. packages that are present in a
+                # different repository)  Consult that list before complaining
+                # about each fmri being missing.
+
+                # If unversioned FMRIs are present in the list, versioned
+                # dependencies will match those if their package name and
+                # publisher match.
+                known_missing_deps = engine.get_param("%s.1.missing-deps" %
+                    lint_id, action=action, manifest=manifest)
+                if known_missing_deps:
+                        known_missing_deps = known_missing_deps.split(" ")
+                else:
+                        known_missing_deps = []
+
+                if not mf and not found_obsolete:
                         self.missing_deps.append(dep_fmri)
+                        if dep_fmri in known_missing_deps:
+                                return
+                        if "@" in dep_fmri and \
+                            dep_fmri.split("@")[0] in known_missing_deps:
+                                return
                         engine.warning(_("obsolete dependency check "
                             "skipped: unable to find dependency %(dep)s"
                             " for %(pkg)s") %
@@ -774,19 +1125,82 @@ class PkgActionChecker(base.ActionChecker):
 
                 if "fmri" not in action.attrs:
                         return
-                try:
-                        pfmri = pkg.fmri.PkgFmri(action.attrs["fmri"])
-                except pkg.fmri.IllegalFmri:
-                        # we also need to just verify that the fmri isn't
-                        # just missing a build_release value
+                fmris = action.attrs["fmri"]
+                if isinstance(fmris, basestring):
+                        fmris = [fmris]
+
+                for fmri in fmris:
                         try:
-                                pfmri = pkg.fmri.PkgFmri(action.attrs["fmri"],
-                                    build_release="5.11")
+                                pfmri = pkg.fmri.PkgFmri(fmri)
                         except pkg.fmri.IllegalFmri:
-                                engine.error("invalid FMRI in action %(action)s"
-                                    " in %(pkg)s" %
-                                    {"pkg": manifest.fmri,
-                                    "action": action},
-                                    msgid="%s%s" % (self.name, pkglint_id))
+                                # we also need to just verify that the fmri
+                                # isn't just missing a build_release value
+                                try:
+                                        pfmri = pkg.fmri.PkgFmri(fmri,
+                                            build_release="5.11")
+                                except pkg.fmri.IllegalFmri:
+                                        engine.error("invalid FMRI in action "
+                                            "%(action)s in %(pkg)s" %
+                                            {"pkg": manifest.fmri,
+                                            "action": action},
+                                            msgid="%s%s" %
+                                            (self.name, pkglint_id))
 
         valid_fmri.pkglint_desc = _("pkg(5) FMRIs should be valid.")
+
+        def license(self, action, manifest, engine, pkglint_id="007"):
+                """License actions should not have path attributes."""
+
+                if action.name is "license" and "path" in action.attrs:
+                        engine.error(
+                            _("license action in %(pkg)s has a path attribute, "
+                            "%(path)s") %
+                            {"pkg": manifest.fmri,
+                            "path": action.attrs["path"]},
+                            msgid="%s%s" % (self.name, pkglint_id))
+
+        license.pkglint_desc = _("'license' actions should not have paths.")
+
+        def linted(self, action, manifest, engine, pkglint_id="008"):
+                """Log an INFO message with the key/value pairs of all
+                pkg.linted* attributes set on this action.
+
+                Essentially this exists to prevent users from adding
+                pkg.linted values to manifests that don't really need them."""
+
+                linted_attrs = [(key, action.attrs[key])
+                    for key in sorted(action.attrs.keys())
+                    if key.startswith("pkg.linted")]
+
+                if linted_attrs:
+                        engine.info(_("pkg.linted attributes detected for "
+                            "%(pkg)s %(action)s: %(linted)s") %
+                            {"pkg": manifest.fmri,
+                            "action": str(action),
+                            "linted": ", ".join(["%s=%s" % (key, val)
+                             for key,val in linted_attrs])},
+                             msgid="%s%s" % (self.name, pkglint_id),
+                             ignore_linted=True)
+
+        linted.pkglint_desc = _("Show actions with pkg.linted attributes.")
+
+        def validate(self, action, manifest, engine, pkglint_id="009"):
+                """Validate all actions."""
+                if not engine.do_pub_checks:
+                        return
+                try:
+                        action.validate()
+                except ActionError, err:
+                        # we want the details all on one line to
+                        # stay consistent with the rest of the pkglint
+                        # error messaging
+                        details = "; ".join([val.lstrip()
+                            for val in str(err).split("\n")])
+                        engine.error(
+                            _("Publication error with action in %(pkg)s: "
+                            "%(details)s") %
+                            {"pkg": manifest.fmri, "details": details},
+                            msgid="%s%s" % (self.name, pkglint_id))
+
+        validate.pkglint_desc = _("Publication checks for actions.")
+

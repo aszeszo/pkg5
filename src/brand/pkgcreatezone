@@ -57,11 +57,10 @@ m_image=$(gettext       "       Image: Preparing at %s.")
 m_incorp=$(gettext      "Sanity Check: Looking for 'entire' incorporation.\n")
 m_key_prop=$(gettext    " Credentials: Propagating %s\n")
 m_cert_prop=$(gettext   " Credentials: Propagating %s\n")
-m_core=$(gettext	"  Installing: Core System (output follows)\n")
-m_more=$(gettext	"  Installing: Additional Packages (output follows)\n")
+m_core=$(gettext	"  Installing: Packages (output follows)\n")
 m_smf=$(gettext		" Postinstall: Copying SMF seed repository ...")
 m_more_brokenness=$(gettext " Postinstall: Applying workarounds.")
-m_mannote=$(gettext     "        Note: Man pages can be obtained by installing SUNWman")
+m_mannote=$(gettext     "        Note: Man pages can be obtained by installing pkg:/system/manual")
 
 m_usage=$(gettext "\n        install [-h]\n        install [-c certificate_file] [-k key_file] [-P publisher=uri]\n                [-e extrapkg [...]]\n        install {-a archive|-d path} {-p|-u} [-s|-v]")
 
@@ -221,16 +220,20 @@ if [[ -n $propagate_extra ]]; then
 	# mirror level, then this will have to be changed.
 	get_publisher_urls non-preferred origin | \
 	    while IFS="=" read pub pub_urls; do
-		# skip extra publishers that need a key/cert
-		[[ "`get_pub_secinfo $pub`" != "None None" ]] && \
-		    continue
+		if [[ "$pub_urls" != "None" ]]; then
+			# skip extra publishers that need a key/cert
+			[[ "`get_pub_secinfo $pub`" != "None None" ]] && \
+			    continue
+		else
+			pub_urls=""
+		fi
 
 		if [[ -z "$publishers_extra_origins" ]]; then
 			publishers_extra_origins="$pub=$pub_urls"
 		else
-			publishers_extra_origins=`printf "%s\n%s" \
-			    "$pub=$pub_urls" \
-			    "$publishers_extra_origins"`
+			publishers_extra_origins=$(printf "%s\n%s" \
+			    "$publishers_extra_origins" \
+			    "$pub=$pub_urls")
 		fi
 	done
 
@@ -243,9 +246,9 @@ if [[ -n $propagate_extra ]]; then
 		if [[ -z "$publishers_extra_mirrors" ]]; then
 			publishers_extra_mirrors="$pub=$pub_urls"
 		else
-			publishers_extra_mirrors=`printf "%s\n%s" \
-			    "$pub=$pub_urls" \
-			    "$publishers_extra_mirrors"`
+			publishers_extra_mirrors=$(printf "%s\n%s" \
+			    "$publishers_extra_mirrors" \
+			    "$pub=$pub_urls")
 		fi
 	done
 fi
@@ -457,10 +460,10 @@ fi
 # If this fails, assume the image is incomplete.
 LC_ALL=C $PKG refresh || fail_incomplete "$f_img"
 
-if [ -d /var/pkg/download ]; then
-	PKG_CACHEDIR=/var/pkg/download
-	export PKG_CACHEDIR
-	printf "$m_cache\n" $PKG_CACHEDIR
+if [[ -f /var/pkg/pkg5.image && -d /var/pkg/publisher ]]; then
+	PKG_CACHEROOT=/var/pkg/publisher
+	export PKG_CACHEROOT
+	printf "$m_cache\n" $PKG_CACHEROOT
 fi
 
 #
@@ -484,71 +487,79 @@ if [[ -n $entire_fmri ]]; then
 fi
 
 printf "$m_core\n"
-#
-# We have to take baby steps here: first, by installing entire (if
-# it's present in the current image), to constrain everything.  Then,
-# SUNWcsd, to lay down device files which are subsequently needed by
-# driver actions.  Then SUNWcs to lay down /etc/passwd, /etc/group,
-# etc so that subsequent user and group actions work.  This can all
-# hopefully go away once "primordial" actions arrive.
-#
-if [[ -n $entire_fmri ]]; then
-	LC_ALL=C $PKG install -q --accept --no-refresh --no-index \
-	    $entire_fmri || pkg_err_check "$f_pkg"
-fi
-LC_ALL=C $PKG install --accept --no-refresh --no-index SUNWcsd || \
-    pkg_err_check "$f_pkg"
-LC_ALL=C $PKG install --accept --no-refresh --no-index SUNWcs || \
-    pkg_err_check "$f_pkg"
-
-printf "$m_more\n"
 pkglist=""
-pkglist="$pkglist SUNWcnetr SUNWesu SUNWadmr SUNWadmap SUNWbzip SUNWgzip"
+if [[ -n $entire_fmri ]]; then
+	pkglist="$pkglist $entire_fmri"
+fi
 
-#
-# Workaround: For now, SUNWipkg has no dependency on python, so we supply it.
-#
-pkglist="$pkglist SUNWPython26 SUNWipkg"
+pkglist="$pkglist
+	pkg:///SUNWcs
+	pkg:///SUNWcsd
+	pkg:///system/network
+	pkg:///system/extended-system-utilities
+	pkg:///service/management/sysidtool
+	pkg:///system/management/sysidtool
+	pkg:///compress/bzip2
+	pkg:///compress/gzip
+	pkg:///compress/zip
+	pkg:///compress/unzip
+	pkg:///package/pkg"
 
 #
 # Get some diagnostic tools, truss, dtrace, etc.
 #
-pkglist="$pkglist SUNWtoo SUNWdtrc SUNWrcmdc SUNWbip"
+pkglist="$pkglist
+	pkg:///developer/linker
+	pkg:///developer/dtrace"
 
 #
-# Get at least one sensible shell, and vi
+# Needed for 'whois', 'snoop' I think; also provides rup, rmt, rsh etc.
 #
-pkglist="$pkglist SUNWbash SUNWvim"
+pkglist="$pkglist
+	pkg:///service/network/network-clients
+	pkg:///network/ftp"
 
 #
-# Get ssh and sshd.
+# Get at least one sensible shell, vim, ssh, ssh key utils, sshd.
 #
-pkglist="$pkglist SUNWsshcu SUNWssh SUNWsshd"
+pkglist="$pkglist
+	pkg:///shell/bash
+	pkg:///editor/vim
+	pkg:///network/ssh
+	pkg:///network/ssh/ssh-key
+	pkg:///service/network/ssh"
 
 #
-# Get some name services.
+# Get some name services and DNS.
 #
-pkglist="$pkglist SUNWnis SUNWlldap"
+pkglist="$pkglist
+	pkg:///system/network/nis
+	pkg:///network/dns/bind
+	pkg:///naming/ldap"
 
 #
 # Get nfs client and autofs; it's a pain not to have them.
 #
-pkglist="$pkglist SUNWnfsc SUNWatfs"
+pkglist="$pkglist
+	pkg:///system/file-system/autofs
+	pkg:///system/file-system/nfs"
 
 #
 # Get routing daemons.  They're required for useful exclusive stack zones.
 #
-pkglist="$pkglist SUNWroute"
+pkglist="$pkglist
+	pkg:///system/network/routing"
 
 #
 # Get packages for TX zones if appropriate.
 #
-(( $brand_labeled == 1 )) && pkglist="$pkglist system/trusted/trusted-nonglobal"
+(( $brand_labeled == 1 )) && pkglist="$pkglist pkg:///system/trusted/trusted-nonglobal"
 
 #
 # Get man(1) but not the man pages
 #
-pkglist="$pkglist SUNWdoc"
+pkglist="$pkglist \
+	pkg:///text/doctools"
 
 #
 # Add in any extra packages requested by the user.
@@ -556,7 +567,7 @@ pkglist="$pkglist SUNWdoc"
 pkglist="$pkglist $extra_packages"
 
 #
-# Do the install; we just refreshed on image-create, so skip that.  We
+# Do the install; we just refreshed after image-create, so skip that.  We
 # also skip indexing here, as that is also what the LiveCD does.
 #
 LC_ALL=C $PKG install --accept --no-index --no-refresh $pkglist || \
@@ -565,10 +576,11 @@ LC_ALL=C $PKG install --accept --no-index --no-refresh $pkglist || \
 printf "\n$m_mannote\n"
 
 printf "$m_smf"
-ln -s ns_files.xml $ZONEROOT/var/svc/profile/name_service.xml
-ln -s generic_limited_net.xml $ZONEROOT/var/svc/profile/generic.xml
-ln -s inetd_generic.xml $ZONEROOT/var/svc/profile/inetd_services.xml
-ln -s platform_none.xml $ZONEROOT/var/svc/profile/platform.xml
+PROFILEDIR=etc/svc/profile
+ln -s ns_files.xml $ZONEROOT/$PROFILEDIR/name_service.xml
+ln -s generic_limited_net.xml $ZONEROOT/$PROFILEDIR/generic.xml
+ln -s inetd_generic.xml $ZONEROOT/$PROFILEDIR/inetd_services.xml
+ln -s platform_none.xml $ZONEROOT/$PROFILEDIR/platform.xml
 
 # This was formerly done in i.manifest
 repfile=$ZONEROOT/etc/svc/repository.db

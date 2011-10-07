@@ -21,7 +21,7 @@
 #
 
 #
-# Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2008, 2011, Oracle and/or its affiliates. All rights reserved.
 #
 
 import testutils
@@ -31,6 +31,7 @@ import pkg5unittest
 
 import os
 import pkg.client.image as image
+import pkg.misc
 import shutil
 import tempfile
 import unittest
@@ -39,6 +40,8 @@ import unittest
 class TestPkgPublisherBasics(pkg5unittest.SingleDepotTestCase):
         # Only start/stop the depot once (instead of for every test)
         persistent_setup = True
+        # Tests in this suite use the read only data directory.
+        need_ro_data = True
 
         def test_pkg_publisher_bogus_opts(self):
                 """ pkg bogus option checks """
@@ -91,17 +94,9 @@ class TestPkgPublisherBasics(pkg5unittest.SingleDepotTestCase):
                     self.bogus_url)
                 self.pkg("unset-publisher test3 test4", exit=3)
 
-                # ...when one of two provided is preferred (test2).
-                self.pkg("set-publisher --no-refresh -O http://%s2 test3" %
-                    self.bogus_url)
-                self.pkg("unset-publisher test2 test3", exit=3)
-
                 # ...when all provided are unknown.
                 self.pkg("unset-publisher test3 test4", exit=1)
                 self.pkg("unset-publisher test3", exit=1)
-
-                # ...when all provided are preferred.
-                self.pkg("unset-publisher test2", exit=1)
 
                 # Now verify that success occurs when attempting to remove
                 # one or more publishers:
@@ -136,8 +131,8 @@ class TestPkgPublisherBasics(pkg5unittest.SingleDepotTestCase):
 
                 self.image_create(self.rurl)
 
-                key_fh, key_path = tempfile.mkstemp()
-                cert_fh, cert_path = tempfile.mkstemp()
+                key_path = os.path.join(self.keys_dir, "cs1_ch1_ta3_key.pem")
+                cert_path = os.path.join(self.cs_dir, "cs1_ch1_ta3_cert.pem")
 
                 self.pkg(
                     "set-publisher -O http://%s1 test1 -O http://%s2 test2" %
@@ -152,19 +147,59 @@ class TestPkgPublisherBasics(pkg5unittest.SingleDepotTestCase):
                 self.pkg("set-publisher --no-refresh -O http://%s2 test2" %
                     self.bogus_url)
 
+                # Set key for test1.
                 self.pkg("set-publisher --no-refresh -k %s test1" % key_path)
-                os.close(key_fh)
-                os.unlink(key_path)
+
+                # This should fail since test2 doesn't have any SSL origins or
+                # mirrors.
                 self.pkg("set-publisher --no-refresh -k %s test2" % key_path,
-                    exit=1)
+                    exit=2)
 
-                self.pkg("set-publisher --no-refresh -c %s test1" % cert_path)
-                os.close(cert_fh)
-                os.unlink(cert_path)
-                self.pkg("set-publisher --no-refresh -c %s test2" % cert_path,
-                    exit=1)
-
+                # Listing publishers should succeed even if key file is gone.
+                img_key_path = os.path.join(self.img_path(), "var", "pkg",
+                    "ssl", pkg.misc.get_data_digest(key_path)[0])
+                os.unlink(img_key_path)
                 self.pkg("publisher test1")
+
+                # This should fail since key has been removed even though test2
+                # has an https origin.
+                self.pkg("set-publisher --no-refresh -O https://%s2 test2" %
+                    self.bogus_url)
+                self.pkg("set-publisher --no-refresh -k %s test2" %
+                    img_key_path, exit=1)
+
+                # Reset for next test.
+                self.pkg("set-publisher --no-refresh -k '' test1")
+                self.pkg("set-publisher --no-refresh -O http://%s2 test2" %
+                    self.bogus_url)
+
+                # Set cert for test1.
+                self.pkg("set-publisher --no-refresh -c %s test1" % cert_path)
+
+                # This should fail since test2 doesn't have any SSL origins or
+                # mirrors.
+                self.pkg("set-publisher --no-refresh -c %s test2" % cert_path,
+                    exit=2)
+
+                # Listing publishers should be possible if cert file is gone.
+                img_cert_path = os.path.join(self.img_path(), "var", "pkg",
+                    "ssl", pkg.misc.get_data_digest(cert_path)[0])
+                os.unlink(img_cert_path)
+                self.pkg("publisher test1", exit=3)
+
+                # This should fail since cert has been removed even though test2
+                # has an https origin.
+                self.pkg("set-publisher --no-refresh -O https://%s2 test2" %
+                    self.bogus_url)
+                self.pkg("set-publisher --no-refresh -c %s test2" %
+                    img_cert_path, exit=1)
+
+                # Reset for next test.
+                self.pkg("set-publisher --no-refresh -O http://%s2 test2" %
+                    self.bogus_url)
+
+                # Expect partial failure since cert file is gone for test1.
+                self.pkg("publisher test1", exit=3)
                 self.pkg("publisher test3", exit=1)
                 self.pkg("publisher -H | grep URI", exit=1)
 
@@ -187,7 +222,6 @@ class TestPkgPublisherBasics(pkg5unittest.SingleDepotTestCase):
                 key_fh, key_path = tempfile.mkstemp()
                 self.pkg("set-publisher --approve-ca-cert %s test1" % key_path,
                     exit=1, su_wrap=True)
-                os.close(key_fh)
                 os.unlink(key_path)
 
                 self.pkg("set-publisher --no-refresh --set-property "
@@ -200,6 +234,12 @@ class TestPkgPublisherBasics(pkg5unittest.SingleDepotTestCase):
                     "signature-policy=require-names test1", exit=1)
                 self.pkg("set-publisher --no-refresh --remove-property-value "
                     "bar=baz test1", exit=1)
+
+                self.pkg("publisher")
+                self.pkg("set-publisher --no-refresh --search-after foo test1",
+                    exit=1)
+                self.pkg("set-publisher --no-refresh --search-before foo test1",
+                    exit=1)
 
         def test_publisher_validation(self):
                 """Verify that we catch poorly formed auth prefixes and URL"""
@@ -248,25 +288,32 @@ class TestPkgPublisherBasics(pkg5unittest.SingleDepotTestCase):
 
                 # Now change the first publisher to a https URL so that
                 # certificate failure cases can be tested.
-                key_fh, key_path = tempfile.mkstemp(dir=self.test_root)
-                cert_fh, cert_path = tempfile.mkstemp(dir=self.test_root)
+                key_path = os.path.join(self.keys_dir, "cs1_ch1_ta3_key.pem")
+                cert_path = os.path.join(self.cs_dir, "cs1_ch1_ta3_cert.pem")
 
                 self.pkg("set-publisher --no-refresh -O https://%s1 test1" %
                     self.bogus_url)
                 self.pkg("set-publisher --no-refresh -c %s test1" % cert_path)
                 self.pkg("set-publisher --no-refresh -k %s test1" % key_path)
 
-                os.close(key_fh)
-                os.close(cert_fh)
+                img_key_path = os.path.join(self.img_path(), "var", "pkg",
+                    "ssl", pkg.misc.get_data_digest(key_path)[0])
+                img_cert_path = os.path.join(self.img_path(), "var", "pkg",
+                    "ssl", pkg.misc.get_data_digest(cert_path)[0])
 
                 # Make the cert/key unreadable by unprivileged users.
-                os.chmod(key_path, 0000)
-                os.chmod(cert_path, 0000)
+                os.chmod(img_key_path, 0000)
+                os.chmod(img_cert_path, 0000)
 
-                # Verify that an unreadable/invalid certificate results in a
+                # Verify that an unreadable certificate results in a
                 # partial failure when displaying publisher information.
-                self.pkg("publisher test1", exit=3)
                 self.pkg("publisher test1", su_wrap=True, exit=3)
+
+                # Corrupt key/cert and verify invalid cert/key results in a
+                # partial failure when displaying publisher information.
+                open(img_key_path, "wb").close()
+                open(img_cert_path, "wb").close()
+                self.pkg("publisher test1", exit=3)
 
         def test_publisher_tsv_format(self):
                 """Ensure tsv formatted output is correct."""
@@ -281,9 +328,10 @@ class TestPkgPublisherBasics(pkg5unittest.SingleDepotTestCase):
                 base_string = ("test\ttrue\ttrue\ttrue\torigin\tonline\t"
                     "%s/\n"
                     "test1\ttrue\tfalse\ttrue\torigin\tonline\t"
-                    "https://test.invalid1/\n"
+                    "https://%s1/\n"
                     "test2\ttrue\tfalse\ttrue\torigin\tonline\t"
-                    "http://test.invalid2/\n" % self.rurl)
+                    "http://%s2/\n" % (self.rurl, self.bogus_url,
+                    self.bogus_url))
                 # With headers
                 self.pkg("publisher -F tsv")
                 expected = "PUBLISHER\tSTICKY\tPREFERRED\tENABLED" \
@@ -303,16 +351,16 @@ class TestPkgPublisherBasics(pkg5unittest.SingleDepotTestCase):
                 setting an existing publisher works correctly."""
 
                 cert_dir = os.path.join(self.ro_data_root,
-                    "signing_certs", "produced", "publisher_cas")
+                    "signing_certs", "produced", "chain_certs")
 
-                app1 = os.path.join(cert_dir, "pubCA1_ta1_cert.pem")
-                app2 = os.path.join(cert_dir, "pubCA1_ta3_cert.pem")
-                rev1 = os.path.join(cert_dir, "pubCA1_ta4_cert.pem")
-                rev2 = os.path.join(cert_dir, "pubCA1_ta5_cert.pem")
-                app1_h = self.calc_file_hash(app1)
-                app2_h = self.calc_file_hash(app2)
-                rev1_h = self.calc_file_hash(rev1)
-                rev2_h = self.calc_file_hash(rev2)
+                app1 = os.path.join(cert_dir, "ch1_ta1_cert.pem")
+                app2 = os.path.join(cert_dir, "ch1_ta3_cert.pem")
+                rev1 = os.path.join(cert_dir, "ch1_ta4_cert.pem")
+                rev2 = os.path.join(cert_dir, "ch1_ta5_cert.pem")
+                app1_h = self.calc_pem_hash(app1)
+                app2_h = self.calc_pem_hash(app2)
+                rev1_h = self.calc_pem_hash(rev1)
+                rev2_h = self.calc_pem_hash(rev2)
                 self.image_create(self.rurl)
                 self.pkg("set-publisher "
                     "--approve-ca-cert %s "
@@ -352,6 +400,8 @@ class TestPkgPublisherBasics(pkg5unittest.SingleDepotTestCase):
 class TestPkgPublisherMany(pkg5unittest.ManyDepotTestCase):
         # Only start/stop the depot once (instead of for every test)
         persistent_setup = True
+        # Tests in this suite use the read only data directory.
+        need_ro_data = True
 
         foo1 = """
             open foo@1,5.11-0
@@ -394,49 +444,56 @@ class TestPkgPublisherMany(pkg5unittest.ManyDepotTestCase):
                 pkg5unittest.ManyDepotTestCase.setUp(self, ["test1", "test2",
                     "test3",  "test1", "test1", "test3"], start_depots=True)
 
-                durl1 = self.dcs[1].get_depot_url()
-                self.pkgsend_bulk(durl1, self.foo1)
+                self.durl1 = self.dcs[1].get_depot_url()
+                self.pkgsend_bulk(self.durl1, self.foo1)
 
-                durl2 = self.dcs[2].get_depot_url()
-                self.pkgsend_bulk(durl2, self.bar1)
+                self.durl2 = self.dcs[2].get_depot_url()
+                self.pkgsend_bulk(self.durl2, self.bar1)
 
-                durl3 = self.dcs[3].get_depot_url()
-                self.pkgsend_bulk(durl3, self.baz1)
+                self.durl3 = self.dcs[3].get_depot_url()
+                self.pkgsend_bulk(self.durl3, self.baz1)
 
-                self.image_create(durl1, prefix="test1")
-                self.pkg("set-publisher -O " + durl2 + " test2")
-                self.pkg("set-publisher -O " + durl3 + " test3")
+                self.image_create(self.durl1, prefix="test1")
+                self.pkg("set-publisher -O " + self.durl2 + " test2")
+                self.pkg("set-publisher -O " + self.durl3 + " test3")
 
         def __test_mirror_origin(self, etype, add_opt, remove_opt):
                 durl1 = self.dcs[1].get_depot_url()
                 durl4 = self.dcs[4].get_depot_url()
                 durl5 = self.dcs[5].get_depot_url()
 
-                # Test single add.
-                self.pkg("set-publisher %s http://%s1 test1" % (add_opt,
-                    self.bogus_url))
-                self.pkg("set-publisher %s http://%s2 test1" % (add_opt,
-                    self.bogus_url))
-                self.pkg("set-publisher %s http://%s5" % (add_opt,
+                # Test single add; --no-refresh must be used here since the URI
+                # being added is for a non-existent repository.
+                self.pkg("set-publisher --no-refresh %s http://%s1 test1" %
+                    (add_opt, self.bogus_url))
+                self.pkg("set-publisher --no-refresh %s http://%s2 test1" %
+                    (add_opt, self.bogus_url))
+                self.pkg("set-publisher --no-refresh %s http://%s5" % (add_opt,
                     self.bogus_url), exit=2)
                 self.pkg("set-publisher %s test1" % add_opt, exit=2)
-                self.pkg("set-publisher %s http://%s1 test1" % (add_opt,
-                    self.bogus_url), exit=1)
+                self.pkg("set-publisher --no-refresh %s http://%s1 test1" %
+                    (add_opt, self.bogus_url), exit=1)
                 self.pkg("set-publisher %s http://%s5 test11" % (add_opt,
                     self.bogus_url), exit=1)
-                self.pkg("set-publisher %s %s7 test1" % (add_opt,
-                    self.bogus_url), exit=1)
+                if etype == "origin":
+                        self.pkg("set-publisher %s %s7 test1" %
+                            (add_opt, self.bogus_url), exit=1)
 
                 # Test single remove.
-                self.pkg("set-publisher %s http://%s1 test1" % (remove_opt,
-                    self.bogus_url))
-                self.pkg("set-publisher %s http://%s2 test1" % (remove_opt,
-                    self.bogus_url))
+                self.pkg("set-publisher --no-refresh %s http://%s1 test1" %
+                    (remove_opt, self.bogus_url))
+                self.pkg("set-publisher --no-refresh %s http://%s2 test1" %
+                    (remove_opt, self.bogus_url))
+                # URIs to remove not specified using options, so they are seen
+                # as publisher names -- only one publisher name may be
+                # specified at a time.
                 self.pkg("set-publisher %s test11 http://%s2 http://%s4" % (
                     remove_opt, self.bogus_url, self.bogus_url), exit=2)
                 self.pkg("set-publisher %s http://%s5" % (remove_opt,
                     self.bogus_url), exit=2)
+                # publisher name specified to remove as URI.
                 self.pkg("set-publisher %s test1" % remove_opt, exit=2)
+                # URI already removed or never existed.
                 self.pkg("set-publisher %s http://%s5 test11" % (remove_opt,
                     self.bogus_url), exit=1)
                 self.pkg("set-publisher %s http://%s6 test1" % (remove_opt,
@@ -451,6 +508,15 @@ class TestPkgPublisherMany(pkg5unittest.ManyDepotTestCase):
                 self.pkg("publisher | grep %s.*%s" % (etype, durl5))
                 self.pkg("publisher | grep %s.*%s" % (etype, durl4), exit=1)
                 self.pkg("set-publisher %s %s test1" % (remove_opt, durl5))
+                self.pkg("set-publisher %s %s %s %s %s \* test1" % (add_opt,
+                    durl4, add_opt, durl5, remove_opt))
+                self.pkg("publisher | grep %s.*%s" % (etype, durl4))
+                self.pkg("publisher | grep %s.*%s" % (etype, durl5))
+                self.pkg("set-publisher %s \* test1" % remove_opt)
+                if etype == "origin":
+                        self.pkg("set-publisher %s %s test1" % (add_opt, durl1))
+                self.pkg("publisher | grep %s.*%s" % (etype, durl4), exit=1)
+                self.pkg("publisher | grep %s.*%s" % (etype, durl5), exit=1)
 
                 # Verify that if one of multiple URLs is not a valid URL, pkg
                 # will exit with an error, and does not add the valid one.
@@ -473,7 +539,12 @@ class TestPkgPublisherMany(pkg5unittest.ManyDepotTestCase):
         def __verify_pub_cfg(self, prefix, pub_cfg):
                 """Private helper method to verify publisher configuration."""
 
-                img = image.Image(self.get_img_path(), should_exist=True)
+                # pretend like the Image object is being allocated from
+                # a pkg command run from within the target image.
+                cmdpath = os.path.join(self.get_img_path(), "pkg")
+
+                img = image.Image(self.get_img_path(), should_exist=True,
+                    user_provided_dir=True, cmdpath=cmdpath)
                 pub = img.get_publisher(prefix=prefix)
                 for section in pub_cfg:
                         for prop, val in pub_cfg[section].iteritems():
@@ -481,7 +552,7 @@ class TestPkgPublisherMany(pkg5unittest.ManyDepotTestCase):
                                         pub_val = getattr(pub, prop)
                                 else:
                                         pub_val = getattr(
-                                            pub.selected_repository, prop)
+                                            pub.repository, prop)
 
                                 if prop in ("legal_uris", "mirrors", "origins",
                                     "related_uris"):
@@ -620,14 +691,81 @@ class TestPkgPublisherMany(pkg5unittest.ManyDepotTestCase):
                     self.dcs[6].get_repodir())
                 self.pkg("unset-publisher test3")
                 self.dcs[6].refresh()
-                self.pkg("set-publisher -p %s" % durl6)
-                self.pkg("publisher test3 test2")
+                self.pkg("set-publisher -P -p %s" % durl6)
+
+                # Determine publisher order from output and then verify it
+                # matches expected.
+                def get_pubs():
+                        self.pkg("publisher -HF tsv")
+                        pubs = []
+                        for l in self.output.splitlines():
+                                pub, ignored = l.split("\t", 1)
+                                if pub not in pubs:
+                                        pubs.append(pub)
+                        return pubs
+
+                # Since -P was used, new publishers should be set first in
+                # search order alphabetically.
+                self.assertEqual(get_pubs(), ["test2", "test3", "test1"])
+
+                # Now change search order and verify that using -P and -p again
+                # won't change it since publishers already exist.
+                self.pkg("set-publisher --search-after=test1 test2")
+                self.pkg("set-publisher --search-after=test2 test3")
+                self.assertEqual(get_pubs(), ["test1", "test2", "test3"])
+                self.pkg("set-publisher -P -p %s" % durl6)
+                self.assertEqual(get_pubs(), ["test1", "test2", "test3"])
 
         def test_set_mirrors_origins(self):
                 """Test set-publisher functionality for mirrors and origins."""
 
                 durl1 = self.dcs[1].get_depot_url()
+                rurl1 = self.dcs[1].get_repo_url()
                 self.image_create(durl1, prefix="test1")
+
+                # Verify that https origins can be mixed with other types
+                # of origins.
+                self.pkg("set-publisher -g %s test1" % rurl1)
+                self.pkg("set-publisher --no-refresh -g https://test.invalid1 "
+                    "test1")
+
+                # Verify that a cert and key can be set even when non-https
+                # origins are present.
+                key_path = os.path.join(self.keys_dir, "cs1_ch1_ta3_key.pem")
+                cert_path = os.path.join(self.cs_dir, "cs1_ch1_ta3_cert.pem")
+
+                self.pkg("set-publisher --no-refresh -k %s -c %s test1" %
+                    (key_path, cert_path))
+                self.pkg("publisher test1")
+
+                img_key_path = os.path.join(self.img_path(), "var", "pkg",
+                    "ssl", pkg.misc.get_data_digest(key_path)[0])
+                img_cert_path = os.path.join(self.img_path(), "var", "pkg",
+                    "ssl", pkg.misc.get_data_digest(cert_path)[0])
+                self.assert_(img_key_path in self.output)
+                self.assert_(img_cert_path in self.output)
+
+                # Verify that removing all SSL origins does not leave key
+                # and cert information intact.
+                self.pkg("set-publisher -G '*' -g %s test1" % durl1)
+                self.pkg("publisher test1")
+                self.assert_(img_key_path not in self.output)
+                self.assert_(img_cert_path not in self.output)
+
+                # Verify that https mirrors can be mixed with other types of
+                # origins.
+                self.pkg("set-publisher -m %s test1" % rurl1)
+                self.pkg("set-publisher --no-refresh -m https://test.invalid1 "
+                    "test1")
+                self.pkg("set-publisher --no-refresh -k %s -c %s test1" %
+                    (key_path, cert_path))
+
+                # Verify that removing all SSL mirrors does not leave key
+                # and cert information intact.
+                self.pkg("set-publisher -M '*' -m %s test1" % durl1)
+                self.pkg("publisher test1")
+                self.assert_(img_key_path not in self.output)
+                self.assert_(img_cert_path not in self.output)
 
                 # Test short options for mirrors.
                 self.__test_mirror_origin("mirror", "-m", "-M")
@@ -667,6 +805,25 @@ class TestPkgPublisherMany(pkg5unittest.ManyDepotTestCase):
                 self.pkg("set-publisher -O %s test1" %
                     self.dcs[1].get_repo_url())
 
+                # Now verify that publishers using origins or mirrors that have
+                # IPv6 addresses can be added and removed.
+                self.pkg("set-publisher -g http://[::1] "
+                    "-m http://[::FFFF:129.144.52.38]:80 "
+                    "-m http://[2010:836B:4179::836B:4179] "
+                    "-g http://[FEDC:BA98:7654:3210:FEDC:BA98:7654:3210]:80 "
+                    "--no-refresh testipv6")
+                self.pkg("publisher | "
+                    "grep 'http://\[::FFFF:129.144.52.38\]:80/'")
+                self.pkg("set-publisher -G http://[::1] "
+                    "-M http://[::FFFF:129.144.52.38]:80 "
+                    "-M http://[2010:836B:4179::836B:4179] "
+                    "-G http://[FEDC:BA98:7654:3210:FEDC:BA98:7654:3210]:80 "
+                    "-g http://[::192.9.5.5]/dev "
+                    "--no-refresh testipv6")
+                self.pkg("publisher | "
+                    "grep 'http://\[::FFFF:129.144.52.38\]:80/'", exit=1)
+                self.pkg("unset-publisher testipv6")
+
         def test_enable_disable(self):
                 """Test enable and disable."""
 
@@ -680,10 +837,10 @@ class TestPkgPublisherMany(pkg5unittest.ManyDepotTestCase):
 
                 self.pkg("list -a bar", exit=1)
                 self.pkg("publisher -a | grep test2")
-                self.pkg("set-publisher -P test2", exit=1)
+                self.pkg("set-publisher -P test2")
                 self.pkg("publisher test2")
                 self.pkg("set-publisher -e test2")
-                self.pkg("publisher | grep test2")
+                self.pkg("publisher -n | grep test2")
                 self.pkg("list -a bar")
 
                 self.pkg("set-publisher --disable test2")
@@ -692,21 +849,22 @@ class TestPkgPublisherMany(pkg5unittest.ManyDepotTestCase):
                 self.pkg("list -a bar", exit=1)
                 self.pkg("publisher -a | grep test2")
                 self.pkg("set-publisher --enable test2")
-                self.pkg("publisher | grep test2")
+                self.pkg("publisher -n | grep test2")
                 self.pkg("list -a bar")
-
-                # should fail because test is the preferred publisher
-                self.pkg("set-publisher -d test1", exit=1)
-                self.pkg("set-publisher --disable test1", exit=1)
 
         def test_search_order(self):
                 """Test moving search order around"""
-                # following should be order from above test
+
+                # The expected publisher order is test1, test2, test3, with all
+                # publishers enabled and sticky.
+                self.pkg("set-publisher -e -P test1")
+                self.pkg("set-publisher -e --search-after test1 test2")
+                self.pkg("set-publisher -e --search-after test2 test3")
                 self.pkg("publisher") # ease debugging
                 self.pkg("publisher -H | head -1 | egrep test1")
                 self.pkg("publisher -H | head -2 | egrep test2")
                 self.pkg("publisher -H | head -3 | egrep test3")
-                # make test2 disabled, make sure order is preserved                
+                # make test2 disabled, make sure order is preserved
                 self.pkg("set-publisher --disable test2")
                 self.pkg("publisher") # ease debugging
                 self.pkg("publisher -H | head -1 | egrep test1")
@@ -721,13 +879,13 @@ class TestPkgPublisherMany(pkg5unittest.ManyDepotTestCase):
                 self.pkg("publisher -H | head -3 | egrep test2")
                 # move test3 after test1
                 self.pkg("set-publisher --search-after=test1 test3")
-                self.pkg("publisher") # ease debugging              
+                self.pkg("publisher") # ease debugging
                 self.pkg("publisher -H | head -1 | egrep test1")
                 self.pkg("publisher -H | head -2 | egrep test3")
                 self.pkg("publisher -H | head -3 | egrep test2")
                 # move test2 before test3
                 self.pkg("set-publisher --search-before=test3 test2")
-                self.pkg("publisher") # ease debugging              
+                self.pkg("publisher") # ease debugging
                 self.pkg("publisher -H | head -1 | egrep test1")
                 self.pkg("publisher -H | head -2 | egrep test2")
                 self.pkg("publisher -H | head -3 | egrep test3")
@@ -735,7 +893,55 @@ class TestPkgPublisherMany(pkg5unittest.ManyDepotTestCase):
                 self.pkg("set-publisher --search-before=test3 test3", exit=1)
                 self.pkg("set-publisher --search-after=test3 test3", exit=1)
 
+                # make sure that setting search order while adding a publisher
+                # works
+                self.pkg("unset-publisher test2")
+                self.pkg("unset-publisher test3")
+                self.pkg("set-publisher --search-before=test1 test2")
+                self.pkg("set-publisher --search-after=test2 test3")
+                self.pkg("publisher") # ease debugging
+                self.pkg("publisher -H | head -1 | egrep test2")
+                self.pkg("publisher -H | head -2 | egrep test3")
+                self.pkg("publisher -H | head -3 | egrep test1")
+
+        def test_publishers_only_from_installed_packages(self):
+                """Test that get_highest_rank_publisher works when there are
+                installed packages but no configured publishers."""
+
+                self.pkg("install foo bar baz")
+                self.pkg("unset-publisher test1")
+                self.pkg("unset-publisher test2")
+                self.pkg("unset-publisher test3")
+                self.pkg("publisher")
+
+                # set publishers to expected configuration
+                self.pkg("set-publisher -p %s" % self.durl1)
+                self.pkg("set-publisher -p %s" % self.durl2)
+                self.pkg("set-publisher -p %s" % self.durl3)
+
+        def test_bug_18283(self):
+                """Test that having a unset publisher with packages installed
+                doesn't break adding a publisher with the -P option."""
+
+                # Test what happens when another publisher is configured.
+                self.pkg("unset-publisher test2")
+                self.pkg("install foo")
+                self.pkg("unset-publisher test1")
+                self.pkg("set-publisher -P -p %s" % self.durl2)
+
+                # Test what happens when no publishers are configured
+                self.pkg("unset-publisher test2")
+                self.pkg("unset-publisher test3")
+                self.pkg("set-publisher -P -p %s" % self.durl2)
+
+                # set publishers to expected configuration
+                self.pkg("set-publisher -P -p %s" % self.durl1)
+                self.pkg("set-publisher -p %s" % self.durl3)
+
+
 class TestPkgPublisherCACerts(pkg5unittest.ManyDepotTestCase):
+        # Tests in this suite use the read only data directory.
+        need_ro_data = True
 
         def setUp(self):
                 # This test suite needs actual depots.
@@ -744,23 +950,23 @@ class TestPkgPublisherCACerts(pkg5unittest.ManyDepotTestCase):
                 self.rurl1 = self.dcs[1].get_repo_url()
                 self.rurl2 = self.dcs[2].get_repo_url()
                 self.image_create(self.rurl1, prefix="test1")
-                
+
         def test_new_publisher_ca_certs_with_refresh(self):
                 """Check that approving and revoking CA certs is reflected in
                 the output of pkg publisher and that setting the CA certs when
                 setting a new publisher works correctly."""
 
                 cert_dir = os.path.join(self.ro_data_root,
-                    "signing_certs", "produced", "publisher_cas")
+                    "signing_certs", "produced", "chain_certs")
 
-                app1 = os.path.join(cert_dir, "pubCA1_ta1_cert.pem")
-                app2 = os.path.join(cert_dir, "pubCA1_ta3_cert.pem")
-                rev1 = os.path.join(cert_dir, "pubCA1_ta4_cert.pem")
-                rev2 = os.path.join(cert_dir, "pubCA1_ta5_cert.pem")
-                app1_h = self.calc_file_hash(app1)
-                app2_h = self.calc_file_hash(app2)
-                rev1_h = self.calc_file_hash(rev1)
-                rev2_h = self.calc_file_hash(rev2)
+                app1 = os.path.join(cert_dir, "ch4_ta1_cert.pem")
+                app2 = os.path.join(cert_dir, "ch1_ta3_cert.pem")
+                rev1 = os.path.join(cert_dir, "ch1_ta4_cert.pem")
+                rev2 = os.path.join(cert_dir, "ch1_ta5_cert.pem")
+                app1_h = self.calc_pem_hash(app1)
+                app2_h = self.calc_pem_hash(app2)
+                rev1_h = self.calc_pem_hash(rev1)
+                rev2_h = self.calc_pem_hash(rev2)
                 self.pkg("set-publisher -O %s "
                     "--approve-ca-cert %s "
                     "--approve-ca-cert %s --revoke-ca-cert %s "
@@ -801,16 +1007,16 @@ class TestPkgPublisherCACerts(pkg5unittest.ManyDepotTestCase):
                 setting a new publisher works correctly."""
 
                 cert_dir = os.path.join(self.ro_data_root,
-                    "signing_certs", "produced", "publisher_cas")
+                    "signing_certs", "produced", "chain_certs")
 
-                app1 = os.path.join(cert_dir, "pubCA1_ta1_cert.pem")
-                app2 = os.path.join(cert_dir, "pubCA1_ta3_cert.pem")
-                rev1 = os.path.join(cert_dir, "pubCA1_ta4_cert.pem")
-                rev2 = os.path.join(cert_dir, "pubCA1_ta5_cert.pem")
-                app1_h = self.calc_file_hash(app1)
-                app2_h = self.calc_file_hash(app2)
-                rev1_h = self.calc_file_hash(rev1)
-                rev2_h = self.calc_file_hash(rev2)
+                app1 = os.path.join(cert_dir, "ch3_ta1_cert.pem")
+                app2 = os.path.join(cert_dir, "ch1_ta3_cert.pem")
+                rev1 = os.path.join(cert_dir, "ch1_ta4_cert.pem")
+                rev2 = os.path.join(cert_dir, "ch1_ta5_cert.pem")
+                app1_h = self.calc_pem_hash(app1)
+                app2_h = self.calc_pem_hash(app2)
+                rev1_h = self.calc_pem_hash(rev1)
+                rev2_h = self.calc_pem_hash(rev2)
                 self.pkg("set-publisher -O %s --no-refresh "
                     "--approve-ca-cert %s "
                     "--approve-ca-cert %s --revoke-ca-cert %s "
@@ -844,6 +1050,7 @@ class TestPkgPublisherCACerts(pkg5unittest.ManyDepotTestCase):
                                             "%s and %s as revoked certs. "
                                             "Output was:\n%s" % (rev1_h,
                                             rev2_h, self.output))
+
 
 if __name__ == "__main__":
         unittest.main()

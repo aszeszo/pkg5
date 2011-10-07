@@ -21,8 +21,7 @@
 #
 
 #
-# Copyright 2010 Sun Microsystems, Inc.  All rights reserved.
-# Use is subject to license terms.
+# Copyright (c) 2007, 2011, Oracle and/or its affiliates. All rights reserved.
 #
 
 """module describing a (hard) link packaging object
@@ -36,9 +35,7 @@ import os
 import stat
 
 from pkg import misc
-import pkg.actions
 from pkg.client.api_errors import ActionExecutionError
-
 
 class HardLinkAction(link.LinkAction):
         """Class representing a hardlink-type packaging object."""
@@ -46,10 +43,10 @@ class HardLinkAction(link.LinkAction):
         __slots__ = []
 
         name = "hardlink"
-        globally_unique = True
 
-        def __init__(self, data=None, **attrs):
-                link.LinkAction.__init__(self, data, **attrs)
+        # Tells parent class that leading slash should not be stripped
+        # from "path" attribute.
+        _strip_path = False
 
         def get_target_path(self):
                 """ return a path for target that is relative to image"""

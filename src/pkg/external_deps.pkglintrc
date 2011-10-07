@@ -1,0 +1,110 @@
+#
+# This is a fragment of a pkglintrc file used for the pkg(5) build
+# to acknowledge that some dependencies will be missing at lint
+# runtime.  When used with a reference repository, we expect that
+# these dependencies would be available.
+#
+# If version numbers are missing from the dependencies below, we
+# match all versions of that particular package.  If version
+# numbers are specified, we only match the given version.
+#
+pkglint.action005.1.missing-deps =
+    pkg:/SUNWcs
+    pkg:/archiver/gnu-tar
+    pkg:/communication/im/pidgin
+    pkg:/crypto/ca-certificates
+    pkg:/desktop/gksu
+    pkg:/desktop/administration/gnome-system-tools
+    pkg:/desktop/archive-manager/file-roller
+    pkg:/desktop/calculator/gcalctool
+    pkg:/desktop/pdf-viewer/evince
+    pkg:/desktop/system-monitor/gnome-system-monitor
+    pkg:/desktop/xdg/menu-editor/alacarte
+    pkg:/developer/build/make
+    pkg:/developer/build/onbld
+    pkg:/developer/gnome/gettext
+    pkg:/developer/gnome/gnome-doc-utils
+    pkg:/developer/linker
+    pkg:/developer/object-file
+    pkg:/developer/python/pylint
+    pkg:/developer/versioning/mercurial
+    pkg:/documentation/gnome/gnome-user-docs
+    pkg:/editor/gedit
+    pkg:/games/gnome-games
+    pkg:/gnome/config/gconf
+    pkg:/gnome/file-manager/nautilus
+    pkg:/gnome/ggv
+    pkg:/gnome/gnome-audio
+    pkg:/gnome/gnome-dictionary
+    pkg:/gnome/gnome-search-tool
+    pkg:/gnome/help-viewer/yelp
+    pkg:/gnome/media/gnome-media
+    pkg:/gnome/media/gnome-media-player
+    pkg:/gnome/theme/background/os-backgrounds
+    pkg:/gnome/theme/background/os-backgrounds-extra
+    pkg:/gnome/theme/blueprint
+    pkg:/gnome/theme/cursor/dmz-cursor
+    pkg:/gnome/theme/cursor/dmz-cursor-aa
+    pkg:/gnome/theme/gnome-icon-theme
+    pkg:/gnome/theme/gnome-themes
+    pkg:/gnome/theme/gnome-themes-extra
+    pkg:/gnome/theme/gtk2-engines
+    pkg:/gnome/theme/gtk2-engines-extra
+    pkg:/gnome/theme/hicolor-icon-theme
+    pkg:/gnome/theme/nimbus
+    pkg:/gnome/theme/nimbus-hires
+    pkg:/gnome/theme/tango-icon-theme
+    pkg:/gnome/trusted/trusted-stripe
+    pkg:/gnome/trusted/xagent
+    pkg:/gnome/zenity
+    pkg:/image/gnome-backgrounds
+    pkg:/image/viewer/eog
+    pkg:/image/viewer/gthumb
+    pkg:/library/gnome/gnome-component
+    pkg:/library/gnome/print/gnome-print
+    pkg:/library/python-2/cherrypy
+    pkg:/library/python-2/coverage
+    pkg:/library/python-2/m2crypto
+    pkg:/library/python-2/mako
+    pkg:/library/python-2/ply
+    pkg:/library/python-2/pybonjour
+    pkg:/library/python-2/pycurl
+    pkg:/library/python-2/pyopenssl-26
+    pkg:/library/python-2/python-gnome-desktop-26
+    pkg:/library/python-2/python-gnome-extras-26
+    pkg:/library/python-2/python-gnome-libs-26
+    pkg:/library/python-2/python-notify-26
+    pkg:/library/python-2/simplejson-26
+    pkg:/library/spell-checking/enchant
+    pkg:/mail/thunderbird
+    pkg:/mail/thunderbird/plugin/thunderbird-lightning
+    pkg:/package/svr4
+    pkg:/runtime/python-26
+    pkg:/service/network/dns/mdns
+    pkg:/shell/ksh
+    pkg:/system/extended-system-utilities
+    pkg:/system/font/isas-misc
+    pkg:/system/font/truetype/bh-luxi
+    pkg:/system/font/truetype/dejavu
+    pkg:/system/font/truetype/liberation
+    pkg:/system/font/xorg/iso8859-1
+    pkg:/system/font/xorg/iso8859-15
+    pkg:/system/font/xorg/xorg-core
+    pkg:/system/header
+    pkg:/system/library
+    pkg:/system/library/gcc-3-runtime
+    pkg:/system/library/dbus
+    pkg:/system/library/math
+    pkg:/system/linker
+    pkg:/system/locale/en_us
+    pkg:/system/network
+    pkg:/system/trusted
+    pkg:/system/zones
+    pkg:/system/zones/brand/solaris
+    pkg:/system/zones/internal
+    pkg:/terminal/gnome-terminal
+    pkg:/text/gnu-grep
+    pkg:/text/tidy
+    pkg:/web/server/apache-22
+    pkg:/web/wget
+    pkg:/x11/trusted/libxtsol

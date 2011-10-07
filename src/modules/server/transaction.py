@@ -21,7 +21,7 @@
 #
 
 #
-# Copyright (c) 2007, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2007, 2011, Oracle and/or its affiliates. All rights reserved.
 #
 
 import calendar
@@ -401,6 +401,10 @@ class Transaction(object):
                 self.types_found = set((
                     action.name for action in m.gen_actions()
                 ))
+                self.has_reqdeps = any(
+                    a.attrs["type"] == "require"
+                    for a in m.gen_actions_by_type("depend")
+                )
 
         def close(self, add_to_catalog=True):
                 """Closes an open transaction, returning the published FMRI for
@@ -518,18 +522,20 @@ class Transaction(object):
                     action.attrs["name"] == "pkg.obsolete" and \
                     action.attrs["value"] == "true":
                         self.obsolete = True
-                        if self.types_found.difference(set(("set",))):
+                        if self.types_found.difference(
+                            set(("set", "signature"))):
                                 raise TransactionOperationError(_("An obsolete "
                                     "package cannot contain actions other than "
-                                    "'set'."))
+                                    "'set' and 'signature'."))
                 elif action.name == "set" and \
                     action.attrs["name"] == "pkg.renamed" and \
                     action.attrs["value"] == "true":
                         self.renamed = True
-                        if self.types_found.difference(set(("set", "depend"))):
+                        if self.types_found.difference(
+                            set(("depend", "set", "signature"))):
                                 raise TransactionOperationError(_("A renamed "
                                     "package cannot contain actions other than "
-                                    "'set' and 'depend'."))
+                                    "'set', 'depend', and 'signature'."))
 
                 if not self.has_reqdeps and action.name == "depend" and \
                     action.attrs["type"] == "require":
@@ -544,11 +550,12 @@ class Transaction(object):
                                 self.renamed = False
                         raise TransactionOperationError(_("A package may not "
                             " be marked for both obsoletion and renaming."))
-                elif self.obsolete and action.name != "set":
+                elif self.obsolete and action.name not in ("set", "signature"):
                         raise TransactionOperationError(_("A '%s' action cannot"
                             " be present in an obsolete package: %s") %
                             (action.name, action))
-                elif self.renamed and action.name not in ("set", "depend"):
+                elif self.renamed and action.name not in \
+                    ("depend", "set", "signature"):
                         raise TransactionOperationError(_("A '%s' action cannot"
                             " be present in a renamed package: %s") %
                             (action.name, action))
@@ -651,5 +658,7 @@ class Transaction(object):
                 # Move each file to file_root, with appropriate directory
                 # structure.
                 for f in os.listdir(self.dir):
+                        if f == "append":
+                                continue
                         src_path = os.path.join(self.dir, f)
                         self.rstore.cache_store.insert(f, src_path)

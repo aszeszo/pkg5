@@ -20,7 +20,7 @@
 # CDDL HEADER END
 #
 
-# Copyright (c) 2009, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2009, 2011, Oracle and/or its affiliates. All rights reserved.
 
 import testutils
 if __name__ == "__main__":
@@ -57,6 +57,7 @@ class TestApiSearchBasics(pkg5unittest.SingleDepotTestCase):
             add dir mode=0755 owner=root group=bin path=/bin/example_dir
             add dir mode=0755 owner=root group=bin path=/usr/lib/python2.6/vendor-packages/OpenSSL
             add file tmp/example_file mode=0555 owner=root group=bin path=/bin/example_path
+            add link path=/bin/exlink target=/bin/example_path mediator=example mediator-version=7.0 mediator-implementation=unladen-swallow
             add set name=com.sun.service.incorporated_changes value="6556919 6627937"
             add set name=com.sun.service.random_test value=42 value=79
             add set name=com.sun.service.bug_ids value=4641790 value=4725245 value=4817791 value=4851433 value=4897491 value=4913776 value=6178339 value=6556919 value=6627937
@@ -64,7 +65,7 @@ class TestApiSearchBasics(pkg5unittest.SingleDepotTestCase):
             add set name=com.sun.service.info_url value=http://service.opensolaris.com/xml/pkg/SUNWcsu@0.5.11,5.11-1:20080514I120000Z
             add set name=description value='FOOO bAr O OO OOO' value="whee fun"
             add set name='weirdness' value='] [ * ?'
-            add set name=opensolaris.smf.fmri value=svc:/milestone/multi-user-server:default
+            add set name=org.opensolaris.smf.fmri value=svc:/milestone/multi-user-server:default
             close """
 
         example_pkg11 = """
@@ -154,9 +155,15 @@ open b2@1.0,5.11-0
 add set description="Image Packaging System"
 close """
 
+        require_any_manf = """
+open ra@1.0,5.11-0
+add depend type=require-any fmri=another_pkg@1.0,5.11-0 fmri=pkg:/space_pkg@1.0,5.11-0
+close
+"""
+
         res_8492_1 = set([('pkg:/b1@1.0-0', 'Image Packaging System', 'set name=description value="Image Packaging System"')])
         res_8492_2 = set([('pkg:/b2@1.0-0', 'Image Packaging System', 'set name=description value="Image Packaging System"')])
-        
+
         remote_fmri_string = ('pkg:/example_pkg@1.0-0', 'test/example_pkg',
             'set name=pkg.fmri value=pkg://test/example_pkg@1.0,5.11-0:')
 
@@ -165,7 +172,7 @@ close """
         ])
 
         res_remote_path = set([
-            ("pkg:/example_pkg@1.0-0", "basename","file a686473102ba73bd7920fc0ab1d97e00a24ed704 chash=f88920ce1f61db185d127ccb32dc8cf401ae7a83 group=bin mode=0555 owner=root path=bin/example_path pkg.csize=30 pkg.size=12")
+            ("pkg:/example_pkg@1.0-0", "basename","file a686473102ba73bd7920fc0ab1d97e00a24ed704 chash=f88920ce1f61db185d127ccb32dc8cf401ae7a83 group=bin mode=0555 owner=root path=bin/example_path pkg.csize=30 pkg.size=12"),
         ])
 
         res_remote_path_of_example_path = set([
@@ -194,6 +201,24 @@ close """
             ("pkg:/example_pkg@1.0-0", "6556919", 'set name=com.sun.service.bug_ids value=4641790 value=4725245 value=4817791 value=4851433 value=4897491 value=4913776 value=6178339 value=6556919 value=6627937')
         ])
 
+        res_remote_mediator = set([
+            ("pkg:/example_pkg@1.0-0", "mediator", "link mediator=example mediator-implementation=unladen-swallow mediator-version=7.0 path=bin/exlink target=/bin/example_path")
+        ])
+
+        res_remote_mediator_version = set([
+            ("pkg:/example_pkg@1.0-0", "mediator-version", "link mediator=example mediator-implementation=unladen-swallow mediator-version=7.0 path=bin/exlink target=/bin/example_path")
+        ])
+
+        res_remote_mediator_impl = set([
+            ("pkg:/example_pkg@1.0-0", "mediator-implementation", "link mediator=example mediator-implementation=unladen-swallow mediator-version=7.0 path=bin/exlink target=/bin/example_path")
+        ])
+
+        res_remote_mediator_and_ver = res_remote_mediator.union(
+            res_remote_mediator_version)
+
+        res_remote_mediator_and_ver_impl = res_remote_mediator.union(
+            res_remote_mediator_version).union(res_remote_mediator_impl)
+
         res_remote_random_test = set([
             ("pkg:/example_pkg@1.0-0", "42", "set name=com.sun.service.random_test value=42 value=79")
         ])
@@ -208,14 +233,16 @@ close """
 
         res_remote_wildcard = res_remote_path.union(set([
             remote_fmri_string,
-            ('pkg:/example_pkg@1.0-0', 'basename', 'dir group=bin mode=0755 owner=root path=bin/example_dir')
+            ('pkg:/example_pkg@1.0-0', 'basename', 'dir group=bin mode=0755 owner=root path=bin/example_dir'),
+            ("pkg:/example_pkg@1.0-0", "mediator", "link mediator=example mediator-implementation=unladen-swallow mediator-version=7.0 path=bin/exlink target=/bin/example_path")
         ]))
 
         res_remote_glob = set([
             remote_fmri_string,
             ('pkg:/example_pkg@1.0-0', 'path', 'dir group=bin mode=0755 owner=root path=bin/example_dir'),
             ('pkg:/example_pkg@1.0-0', 'basename', 'dir group=bin mode=0755 owner=root path=bin/example_dir'),
-            ('pkg:/example_pkg@1.0-0', 'path', 'file a686473102ba73bd7920fc0ab1d97e00a24ed704 chash=f88920ce1f61db185d127ccb32dc8cf401ae7a83 group=bin mode=0555 owner=root path=bin/example_path pkg.csize=30 pkg.size=12')
+            ('pkg:/example_pkg@1.0-0', 'path', 'file a686473102ba73bd7920fc0ab1d97e00a24ed704 chash=f88920ce1f61db185d127ccb32dc8cf401ae7a83 group=bin mode=0555 owner=root path=bin/example_path pkg.csize=30 pkg.size=12'),
+            ("pkg:/example_pkg@1.0-0", "mediator", "link mediator=example mediator-implementation=unladen-swallow mediator-version=7.0 path=bin/exlink target=/bin/example_path")
         ]) | res_remote_path
 
         res_remote_foo = set([
@@ -244,6 +271,13 @@ close """
         res_local_random_test = copy.copy(res_remote_random_test)
 
         res_local_keywords = copy.copy(res_remote_keywords)
+
+        res_local_mediator = copy.copy(res_remote_mediator)
+        res_local_mediator_version = copy.copy(res_remote_mediator_version)
+        res_local_mediator_impl = copy.copy(res_remote_mediator_impl)
+        res_local_mediator_and_ver = copy.copy(res_remote_mediator_and_ver)
+        res_local_mediator_and_ver_impl = copy.copy(
+            res_remote_mediator_and_ver_impl)
 
         res_local_wildcard = copy.copy(res_remote_wildcard)
         res_local_wildcard.add(local_fmri_string)
@@ -454,8 +488,12 @@ close
         res_smf_svc = set([
             ('pkg:/example_pkg@1.0-0',
             'svc:/milestone/multi-user-server:default',
-            'set name=opensolaris.smf.fmri value=svc:/milestone/multi-user-server:default')
+            'set name=org.opensolaris.smf.fmri value=svc:/milestone/multi-user-server:default')
         ])
+
+        res_dir = set([
+            ('pkg:/example_pkg@1.0-0', 'path',
+            'dir group=bin mode=0755 owner=root path=bin/example_dir')])
 
         fast_add_after_second_update = set(["VERSION: 2\n"])
 
@@ -489,7 +527,7 @@ close
                                     str(correct_answer - proposed_answer))
                                 self.debug("Extra  : " +
                                     str(proposed_answer - correct_answer))
-                        self.assertEqual(correct_answer, proposed_answer)
+                        self.assertEqualDiff(correct_answer, proposed_answer)
 
         def _get_repo_index_dir(self):
                 depotpath = self.dc.get_repodir()
@@ -648,6 +686,20 @@ close
                     self.res_remote_path_extra)
                 self._search_op(api_obj, True, "example*",
                     self.res_remote_wildcard)
+                self._search_op(api_obj, True, "example",
+                    self.res_remote_mediator)
+                self._search_op(api_obj, True, "7.0",
+                    self.res_remote_mediator_version)
+                self._search_op(api_obj, True, "unladen-swallow",
+                    self.res_remote_mediator_impl)
+                self._search_op(api_obj, True, "::mediator-implementation:unladen*",
+                    self.res_remote_mediator_impl)
+                self._search_op(api_obj, True, ":link:mediator:example",
+                    self.res_remote_mediator)
+                self._search_op(api_obj, True, ":link:mediator:example OR :link:mediator-version:7.0",
+                    self.res_remote_mediator_and_ver)
+                self._search_op(api_obj, True, ":link:mediator:example OR :link:mediator-version:7.0 OR :link:mediator-implementation:unladen-swallow",
+                    self.res_remote_mediator_and_ver_impl)
                 self._search_op(api_obj, True, "/bin", self.res_remote_bin)
                 self._search_op(api_obj, True, "4851433",
                     self.res_remote_bug_id)
@@ -719,34 +771,39 @@ close
                     svc_name,
                     self.res_smf_svc)
                 self._search_op(api_obj, True,
-                    "example_pkg:set:opensolaris.smf.fmri:%s" % svc_name,
+                    "example_pkg:set:org.opensolaris.smf.fmri:%s" % svc_name,
                     self.res_smf_svc)
                 self._search_op(api_obj, True,
-                    "set:opensolaris.smf.fmri:%s" % svc_name,
+                    "set:org.opensolaris.smf.fmri:%s" % svc_name,
                     self.res_smf_svc)
                 self._search_op(api_obj, True,
-                    "opensolaris.smf.fmri:%s" %svc_name,
+                    "org.opensolaris.smf.fmri:%s" %svc_name,
                     self.res_smf_svc)
                 self._search_op(api_obj, True,
-                    ":set:opensolaris.smf.fmri:%s" % svc_name,
+                    ":set:org.opensolaris.smf.fmri:%s" % svc_name,
                     self.res_smf_svc)
                 self._search_op(api_obj, True,
                     "%s *milestone*" % svc_name,
                     self.res_smf_svc)
                 self._search_op(api_obj, True,
-                    "example_pkg:set:opensolaris.smf.fmri:%s %s" % (svc_name, svc_name),
+                    "example_pkg:set:org.opensolaris.smf.fmri:%s %s" % (svc_name, svc_name),
                     self.res_smf_svc)
                 self._search_op(api_obj, True,
-                    "example_pkg:set:opensolaris.smf.fmri:%s example_pkg:set:opensolaris.smf.fmri:%s" %
+                    "example_pkg:set:org.opensolaris.smf.fmri:%s example_pkg:set:org.opensolaris.smf.fmri:%s" %
                     (svc_name, svc_name),
                     self.res_smf_svc)
                 self._search_op(api_obj, True,
-                    "%s example_pkg:set:opensolaris.smf.fmri:%s" %
+                    "%s example_pkg:set:org.opensolaris.smf.fmri:%s" %
                     (svc_name, svc_name),
                     self.res_smf_svc)
                 # Test that a single escaped colon doesn't cause a traceback.
                 self._search_op(api_obj, True, "\:", set())
-                
+
+                # Test that doing a search restricted to dir actions works
+                # correctly.  This is a test for bug 17645.
+                self._search_op(api_obj, True, "dir::/bin/example_dir",
+                    self.res_dir)
+
         def _run_remote_tests(self, api_obj):
                 self._search_op(api_obj, True, "example_pkg",
                     self.res_remote_pkg)
@@ -826,6 +883,20 @@ close
                     self.res_remote_path_extra)
                 self._search_op(api_obj, False, "example*",
                     self.res_local_wildcard)
+                self._search_op(api_obj, True, "example",
+                    self.res_local_mediator)
+                self._search_op(api_obj, True, "7.0",
+                    self.res_local_mediator_version)
+                self._search_op(api_obj, True, "unladen-swallow",
+                    self.res_local_mediator_impl)
+                self._search_op(api_obj, True, "::mediator-implementation:unladen*",
+                    self.res_local_mediator_impl)
+                self._search_op(api_obj, True, ":link:mediator:example",
+                    self.res_local_mediator)
+                self._search_op(api_obj, True, ":link:mediator:example OR :link:mediator-version:7.0",
+                    self.res_local_mediator_and_ver)
+                self._search_op(api_obj, True, ":link:mediator:example OR :link:mediator-version:7.0 OR :link:mediator-implementation:unladen-swallow",
+                    self.res_local_mediator_and_ver_impl)
                 self._search_op(api_obj, False, "/bin", self.res_local_bin)
                 self._search_op(api_obj, False, "4851433",
                     self.res_local_bug_id)
@@ -895,29 +966,29 @@ close
                     svc_name,
                     self.res_smf_svc)
                 self._search_op(api_obj, False,
-                    "example_pkg:set:opensolaris.smf.fmri:%s" % svc_name,
+                    "example_pkg:set:org.opensolaris.smf.fmri:%s" % svc_name,
                     self.res_smf_svc)
                 self._search_op(api_obj, False,
-                    "set:opensolaris.smf.fmri:%s" % svc_name,
+                    "set:org.opensolaris.smf.fmri:%s" % svc_name,
                     self.res_smf_svc)
                 self._search_op(api_obj, False,
-                    "opensolaris.smf.fmri:%s" %svc_name,
+                    "org.opensolaris.smf.fmri:%s" %svc_name,
                     self.res_smf_svc)
                 self._search_op(api_obj, False,
-                    ":set:opensolaris.smf.fmri:%s" % svc_name,
+                    ":set:org.opensolaris.smf.fmri:%s" % svc_name,
                     self.res_smf_svc)
                 self._search_op(api_obj, False,
                     "%s *milestone*" % svc_name,
                     self.res_smf_svc)
                 self._search_op(api_obj, False,
-                    "example_pkg:set:opensolaris.smf.fmri:%s %s" % (svc_name, svc_name),
+                    "example_pkg:set:org.opensolaris.smf.fmri:%s %s" % (svc_name, svc_name),
                     self.res_smf_svc)
                 self._search_op(api_obj, False,
-                    "example_pkg:set:opensolaris.smf.fmri:%s example_pkg:set:opensolaris.smf.fmri:%s" %
+                    "example_pkg:set:org.opensolaris.smf.fmri:%s example_pkg:set:org.opensolaris.smf.fmri:%s" %
                     (svc_name, svc_name),
                     self.res_smf_svc)
                 self._search_op(api_obj, False,
-                    "%s example_pkg:set:opensolaris.smf.fmri:%s" %
+                    "%s example_pkg:set:org.opensolaris.smf.fmri:%s" %
                     (svc_name, svc_name),
                     self.res_smf_svc)
                 # Test that a single escaped colon doesn't cause a traceback.
@@ -970,6 +1041,11 @@ close
                 # back to that bug.
                 self._search_op(api_obj, False, "a_non_existent_token", set())
 
+                # Test that doing a search restricted to dir actions works
+                # correctly.  This is a test for bug 17645.
+                self._search_op(api_obj, False, "dir::/bin/example_dir",
+                    self.res_dir)
+
         def _run_degraded_local_tests(self, api_obj):
                 outfile = os.path.join(self.testdata_dir, "res")
 
@@ -1008,6 +1084,23 @@ close
                     self.res_remote_path_extra)
                 self._search_op_slow(api_obj, False, "example*",
                     self.res_local_wildcard)
+                self._search_op_slow(api_obj, True, "example",
+                    self.res_local_mediator)
+                self._search_op_slow(api_obj, True, "7.0",
+                    self.res_local_mediator_version)
+                self._search_op_slow(api_obj, True, "unladen-swallow",
+                    self.res_local_mediator_impl)
+                self._search_op_slow(api_obj, True,
+                    "::mediator-implementation:unladen*",
+                    self.res_local_mediator_impl)
+                self._search_op_slow(api_obj, True, ":link:mediator:example",
+                    self.res_local_mediator)
+                self._search_op_slow(api_obj, True,
+                    ":link:mediator:example OR :link:mediator-version:7.0",
+                    self.res_local_mediator_and_ver)
+                self._search_op_slow(api_obj, True,
+                    ":link:mediator:example OR :link:mediator-version:7.0 OR :link:mediator-implementation:unladen-swallow",
+                    self.res_local_mediator_and_ver_impl)
                 self._search_op_slow(api_obj, False, "/bin", self.res_local_bin)
                 self._search_op_slow(api_obj, False, "4851433",
                     self.res_local_bug_id)
@@ -1161,7 +1254,8 @@ close
                 shutil.move(index_dir_tmp, index_dir)
 
         def _get_index_dirs(self):
-                index_dir = os.path.join(self.img_path, "var","pkg","index")
+                index_dir = os.path.join(self.img_path(), "var", "pkg",
+                    "cache", "index")
                 index_dir_tmp = index_dir + "TMP"
                 return index_dir, index_dir_tmp
 
@@ -1291,7 +1385,8 @@ class TestApiSearchBasicsP(TestApiSearchBasics):
 
                 self._api_install(api_obj, ["example_pkg@1.0"])
 
-                index_dir = os.path.join(self.img_path, "var","pkg","index")
+                index_dir = os.path.join(self.img_path(), "var", "pkg",
+                    "cache", "index")
                 shutil.rmtree(index_dir)
 
                 self._run_degraded_local_tests(api_obj)
@@ -1338,7 +1433,8 @@ class TestApiSearchBasicsP(TestApiSearchBasics):
 
                 self._api_install(api_obj, ["example_pkg@1.0"])
 
-                index_dir = os.path.join(self.img_path, "var","pkg","index")
+                index_dir = os.path.join(self.img_path(), "var", "pkg",
+                    "cache", "index")
 
                 first = True
 
@@ -1368,7 +1464,8 @@ class TestApiSearchBasicsP(TestApiSearchBasics):
                 api_obj = self.image_create(durl)
                 self._api_install(api_obj, ["example_pkg@1.0"])
 
-                index_dir = os.path.join(self.img_path, "var","pkg","index")
+                index_dir = os.path.join(self.img_path(), "var", "pkg",
+                    "cache", "index")
 
                 first = True
 
@@ -1395,13 +1492,15 @@ class TestApiSearchBasicsP(TestApiSearchBasics):
                         self._overwrite_version_number(orig_path)
                         self.assertRaises(
                             api_errors.WrapSuccessfulIndexingException,
-                            self._api_uninstall, api_obj, ["example_pkg"])
+                            self._api_uninstall, api_obj, ["example_pkg"],
+                            catch_wsie=False)
                         api_obj.reset()
                         self._search_op(api_obj, False, "example_pkg", set())
                         self._overwrite_version_number(orig_path)
                         self.assertRaises(
                             api_errors.WrapSuccessfulIndexingException,
-                            self._api_install, api_obj, ["example_pkg"])
+                            self._api_install, api_obj, ["example_pkg"],
+                            catch_wsie=False)
                         api_obj.reset()
                         self._search_op(api_obj, False, "example_pkg",
                             self.res_local_pkg)
@@ -1420,7 +1519,8 @@ class TestApiSearchBasicsP(TestApiSearchBasics):
                     self.res_local_pkg)
                 self._overwrite_hash(ffh_path)
                 self.assertRaises(api_errors.WrapSuccessfulIndexingException,
-                    self._api_uninstall, api_obj, ["example_pkg"])
+                    self._api_uninstall, api_obj, ["example_pkg"],
+                    catch_wsie=False)
                 self._search_op(api_obj, False, "example_pkg", set())
 
         def test_080_weird_patterns(self):
@@ -1443,8 +1543,8 @@ class TestApiSearchBasicsP(TestApiSearchBasics):
                 durl = self.dc.get_depot_url()
                 api_obj = self.image_create(durl)
 
-                tmp_dir = os.path.join(self.img_path, "var", "pkg", "index",
-                    "TMP")
+                tmp_dir = os.path.join(self.img_path(), "var", "pkg",
+                    "cache", "index", "TMP")
                 self._api_install(api_obj, ["example_pkg"])
                 api_obj.rebuild_search_index()
                 self._api_install(api_obj, ["fat"])
@@ -1510,7 +1610,8 @@ class TestApiSearchBasicsP(TestApiSearchBasics):
                 self._run_remove_root_search(self._search_op_multi, False,
                     api_obj, ip)
 
-                index_dir = os.path.join(self.img_path, "var","pkg","index")
+                index_dir = os.path.join(self.img_path(), "var", "pkg",
+                    "cache", "index")
                 shutil.rmtree(index_dir)
                 # Do slow local searches
                 self._run_remove_root_search(self._search_op_slow_multi, False,
@@ -1578,7 +1679,7 @@ class TestApiSearchBasicsP(TestApiSearchBasics):
                 self._run_local_tests(api_obj)
                 self.pkgsend_bulk(durl, self.example_pkg11)
                 api_obj.refresh(immediate=True)
-                self._api_image_update(api_obj, update_index=False)
+                self._api_update(api_obj, update_index=False)
                 # Running empty test because search will notice the index
                 # does not match the installed packages and complain.
                 self.assertRaises(api_errors.IncorrectIndexFileHash,
@@ -1612,7 +1713,8 @@ class TestApiSearchBasicsP(TestApiSearchBasics):
 
                         self.assertRaises(
                             api_errors.WrapSuccessfulIndexingException,
-                            self._api_uninstall, api_obj, ["example_pkg"])
+                            self._api_uninstall, api_obj, ["example_pkg"],
+                            catch_wsie=False)
 
                         self.image_destroy()
 
@@ -1634,7 +1736,8 @@ class TestApiSearchBasicsP(TestApiSearchBasics):
 
                         self.assertRaises(
                             api_errors.WrapSuccessfulIndexingException,
-                            self._api_uninstall, api_obj, ["another_pkg"])
+                            self._api_uninstall, api_obj, ["another_pkg"],
+                            catch_wsie=False)
 
                         self.image_destroy()
 
@@ -1657,7 +1760,8 @@ class TestApiSearchBasicsP(TestApiSearchBasics):
 
                         self.assertRaises(
                             api_errors.WrapSuccessfulIndexingException,
-                            self._api_uninstall, api_obj, ["example_pkg"])
+                            self._api_uninstall, api_obj, ["example_pkg"],
+                            catch_wsie=False)
 
                         self.image_destroy()
 
@@ -1680,7 +1784,7 @@ class TestApiSearchBasicsP(TestApiSearchBasics):
 
                         self.assertRaises(
                             api_errors.WrapSuccessfulIndexingException,
-                            self._api_image_update, api_obj)
+                            self._api_update, api_obj, catch_wsie=False)
 
                         self.image_destroy()
 
@@ -1834,7 +1938,8 @@ class TestApiSearchBasicsP(TestApiSearchBasics):
                 self.pkgsend_bulk(durl, self.example_pkg10)
                 api_obj = self.image_create(durl)
 
-                index_dir = os.path.join(self.img_path, "var","pkg","index")
+                index_dir = os.path.join(self.img_path(), "var", "pkg",
+                    "cache", "index")
 
                 orig_fn = os.path.join(index_dir,
                     query_parser.TermQuery._get_gdd(index_dir).values()[0].\
@@ -1846,7 +1951,8 @@ class TestApiSearchBasicsP(TestApiSearchBasics):
 
                 portable.rename(orig_fn, dest_fn)
                 self.assertRaises(api_errors.WrapSuccessfulIndexingException,
-                    self._api_uninstall, api_obj, ["example_pkg"])
+                    self._api_uninstall, api_obj, ["example_pkg"],
+                    catch_wsie=False)
 
         def test_bug_8492(self):
                 """Tests that field queries and phrase queries work together.
@@ -2093,7 +2199,7 @@ class TestApiSearchBasics_nonP(TestApiSearchBasics):
                 self.pkgsend_bulk(durl, self.example_pkg11)
                 api_obj.refresh(immediate=True)
 
-                self._api_image_update(api_obj)
+                self._api_update(api_obj)
 
                 self._run_local_tests_example11_installed(api_obj)
 
@@ -2298,7 +2404,7 @@ class TestApiSearchBasics_nonP(TestApiSearchBasics):
                     self.res_remote_path, servers=[{"origin": durl}])
                 lfh = file(self.dc.get_logpath(), "rb")
                 found = 0
-                num_expected = 6
+                num_expected = 7
                 for line in lfh:
                         if "X-IPKG-UUID:" in line:
                                 tmp = line.split()
@@ -2364,7 +2470,7 @@ class TestApiSearchBasics_nonP(TestApiSearchBasics):
                             "open pkg%s@2.0,5.11-0\nclose\n" % i)
                         pkg_list.append("pkg%s" % i)
                 api_obj.refresh(immediate=True)
-                self._api_image_update(api_obj)
+                self._api_update(api_obj)
                 self._check(set((
                     _remove_extra_info(v)
                     for v in self._get_lines(fast_add_loc)
@@ -2381,7 +2487,7 @@ class TestApiSearchBasics_nonP(TestApiSearchBasics):
                             "open pkg%s@2.0,5.11-0\nclose\n" % i)
                         pkg_list.append("pkg%s" % i)
                 api_obj.refresh(immediate=True)
-                self._api_image_update(api_obj)
+                self._api_update(api_obj)
                 self._check(set((
                     _remove_extra_info(v)
                     for v in self._get_lines(fast_add_loc)
@@ -2429,6 +2535,28 @@ class TestApiSearchBasics_nonP(TestApiSearchBasics):
                 fmris = indexer.Indexer.check_for_updates(back_dir,
                     self._get_repo_catalog())
                 self.assertEqual(len(fmris), 1)
+
+        def test_bug_17672(self):
+                durl = self.dc.get_depot_url()
+                self.pkgsend_bulk(durl, (self.another_pkg10, self.space_pkg10,
+                    self.require_any_manf))
+                repo = self.dc.get_repo()
+                repo.rebuild(build_catalog=False, build_index=True)
+                api_obj = self.image_create(durl)
+                expected_result = set([
+                    ('pkg:/ra@1.0-0', 'require-any',
+                    'depend fmri=another_pkg@1.0,5.11-0 ' +
+                    'fmri=pkg:/space_pkg@1.0,5.11-0 type=require-any')
+                ])
+                self._search_op(api_obj, True, "depend::", expected_result)
+                self._api_install(api_obj, ["ra"])
+                self._search_op(api_obj, False, "depend::", expected_result)
+                api_obj.rebuild_search_index()
+                self._search_op(api_obj, False, "depend::", expected_result)
+                self._search_op(api_obj, False, "depend::another_pkg",
+                    expected_result)
+                self._search_op(api_obj, False, "depend::space_pkg",
+                    expected_result)
 
 
 class TestApiSearchMulti(pkg5unittest.ManyDepotTestCase):

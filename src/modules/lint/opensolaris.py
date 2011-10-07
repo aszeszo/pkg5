@@ -21,7 +21,7 @@
 #
 
 #
-# Copyright (c) 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2010, 2011, Oracle and/or its affiliates. All rights reserved.
 #
 
 # Some opensolaris distribution specific lint checks
@@ -117,7 +117,6 @@ class OpenSolarisManifestChecker(base.ManifestChecker):
 
         def missing_attrs(self, manifest, engine, pkglint_id="001"):
                 """Various checks for missing attributes
-                * warn when a package doesn't have a pkg.description
                 * error when a package doesn't have a pkg.summary
                 * warn when a package doesn't have an org.opensolaris.consolidation
                 * warn when a package doesn't have an info.classification'
@@ -128,22 +127,23 @@ class OpenSolarisManifestChecker(base.ManifestChecker):
                 if "pkg.obsolete" in manifest:
                         return
 
-                for key in ["pkg.description", "org.opensolaris.consolidation",
+                for key in ["org.opensolaris.consolidation",
                     "info.classification"]:
                         if key not in manifest:
                                 engine.warning(
-                                    _("Missing key %(key)s from %(pkg)s") %
-                                    {"key": key,
-                                    "pkg": manifest.fmri},
+                                    _("Missing attribute '%(key)s' in %(pkg)s") %
+                                    {"key": key, "pkg": manifest.fmri},
                                     msgid="%s%s.1" % (self.name, pkglint_id))
 
                 if "pkg.summary" not in manifest:
-                        engine.error(_("Missing key pkg.summary from %s") %
+                        engine.error(_("Missing attribute 'pkg.summary' in %s") %
                             manifest.fmri,
                             msgid="%s%s.2" % (self.name, pkglint_id))
 
         missing_attrs.pkglint_desc = _(
             "Standard package attributes should be present.")
+
+        # opensolaris.manifest002 is obsolete and should not be reused.
 
         def info_classification(self, manifest, engine, pkglint_id="003"):
                 """Checks that the info.classification attribute is valid."""
@@ -162,6 +162,8 @@ class OpenSolarisManifestChecker(base.ManifestChecker):
                         return
 
                 value = manifest["info.classification"]
+                action = engine.get_attr_action("info.classification", manifest)
+                engine.advise_loggers(action=action, manifest=manifest)
 
                 # we allow multiple values for info.classification
                 if isinstance(value, list):
@@ -198,7 +200,7 @@ class OpenSolarisManifestChecker(base.ManifestChecker):
 
                 # the data file looks like:
                 # [Section]
-                # categtory = Cat1,Cat2,Cat3
+                # category = Cat1,Cat2,Cat3
                 #
                 # We expect the info.classification action to look like:
                 # org.opensolaris.category.2008:Section/Cat2
@@ -212,12 +214,12 @@ class OpenSolarisManifestChecker(base.ManifestChecker):
                         if category not in ref_categories:
                                 valid_value = False
                 except ConfigParser.NoSectionError:
+                        sections = self.classification_data.sections()
                         engine.error(_("info.classification value %(value)s "
                             "does not contain one of the valid sections "
                             "%(ref_sections)s for %(fmri)s.") %
                             {"value": value,
-                            "ref_sections":
-                            ", ".join(self.classification_data.sections()),
+                            "ref_sections": ", ".join(sorted(sections)),
                             "fmri": fmri},
                             msgid="%s.4" % msgid)
                         return
@@ -235,7 +237,7 @@ class OpenSolarisManifestChecker(base.ManifestChecker):
                 if valid_value:
                         return
 
-                ref_cats = self.classification_data.get(section,"category")
+                ref_cats = self.classification_data.get(section, "category")
                 engine.error(_("info.classification attribute in %(fmri)s "
                     "does not contain one of the values defined for the "
                     "section %(section)s: %(ref_cats)s from %(path)s") %
@@ -244,3 +246,28 @@ class OpenSolarisManifestChecker(base.ManifestChecker):
                     "path": self.classification_path,
                     "ref_cats": ref_cats },
                     msgid="%s.6" % msgid)
+
+        def bogus_description(self, manifest, engine, pkglint_id="004"):
+                """Warns when a package has an empty description or one which is
+                identical to the summary."""
+
+                desc = manifest.get("pkg.description", None)
+                summ = manifest.get("pkg.summary", None)
+
+                if desc == "":
+                        action = engine.get_attr_action("pkg.description",
+                            manifest)
+                        engine.advise_loggers(action=action, manifest=manifest)
+                        engine.warning(_("Empty description in %s") %
+                            manifest.fmri,
+                            msgid="%s%s.1" % (self.name, pkglint_id))
+
+                elif desc == summ and desc is not None:
+                        action = engine.get_attr_action("pkg.summary", manifest)
+                        engine.advise_loggers(action=action, manifest=manifest)
+                        engine.warning(_("Description matches summary in %s") %
+                            manifest.fmri,
+                            msgid="%s%s.2" % (self.name, pkglint_id))
+
+        bogus_description.pkglint_desc = _(
+            "A package's description should not match its summary.")

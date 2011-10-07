@@ -21,20 +21,8 @@
 #
 
 #
-# Copyright (c) 2007, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2007, 2011, Oracle and/or its affiliates. All rights reserved.
 #
-
-# pkgsend - publish package transactions
-#
-# Typical usage is
-#
-#       pkgsend open
-#       [pkgsend summary]
-#       pkgsend close
-#
-# A failed transaction can be cleared using
-#
-#       pkgsend close -A
 
 import fnmatch
 import getopt
@@ -56,17 +44,15 @@ import pkg.client.transport.transport as transport
 import pkg.client.publisher as publisher
 from pkg.misc import msg, emsg, PipeError
 from pkg.client import global_settings
+from pkg.client.debugvalues import DebugValues
 
 nopub_actions = [ "unknown" ]
 
 def error(text, cmd=None):
         """Emit an error message prefixed by the command name """
 
-        if cmd:
-                text = "%s: %s" % (cmd, text)
-        else:
-                # If we get passed something like an Exception, we can convert
-                # it down to a string.
+        if not isinstance(text, basestring):
+                # Assume it's an object that can be stringified.
                 text = str(text)
 
         # If the message starts with whitespace, assume that it should come
@@ -74,9 +60,15 @@ def error(text, cmd=None):
         text_nows = text.lstrip()
         ws = text[:len(text) - len(text_nows)]
 
+        if cmd:
+                text_nows = "%s: %s" % (cmd, text_nows)
+                pkg_cmd = "pkgsend "
+        else:
+                pkg_cmd = "pkgsend: "
+
         # This has to be a constant value as we can't reliably get our actual
         # program name on all platforms.
-        emsg(ws + "pkgsend: " + text_nows)
+        emsg(ws + pkg_cmd + text_nows)
 
 def usage(usage_error=None, cmd=None, retcode=2):
         """Emit a usage message and optionally prefix it with a more specific
@@ -90,26 +82,63 @@ Usage:
         pkgsend [options] command [cmd_options] [operands]
 
 Packager subcommands:
-        pkgsend open [-en] pkg_fmri
-        pkgsend add action arguments
-        pkgsend import [-T pattern] [--target file] bundlefile ...
-        pkgsend include [-d basedir] ... [-T pattern] [manifest] ...
-        pkgsend close [-A | [--no-index] [--no-catalog]]
-        pkgsend publish [-d basedir] ... [-T pattern] [--no-index]
-          [--fmri-in-manifest | pkg_fmri] [--no-catalog] [manifest] ...
-        pkgsend generate [-T pattern] [--target file] bundlefile ...
-        pkgsend refresh-index
+        pkgsend generate [-T pattern] [--target file] source ...
+        pkgsend publish [-b bundle ...] [-d source ...] [-s repo_uri_or_path]
+            [-T pattern] [--no-catalog] [manifest ...]
 
 Options:
-        -s repo_uri     target repository URI
         --help or -?    display usage message
 
 Environment:
-        PKG_REPO""")
+        PKG_REPO        The path or URI of the destination repository.""")
         sys.exit(retcode)
 
+class SolarisBundleVisitor(object):
+        """Used to gather information about the SVR4 packages we visit"""
+
+        def __init__(self):
+                # a list of classes for which we do not report warnings
+                self.known_classes = ["none", "manifest"]
+                self.errors = set()
+                self.warnings = set()
+                self.visited = False
+
+        def visit(self, bundle):
+                """visit a pkg.bundle.SolarisPackage*Bundle object"""
+
+                if not bundle.pkg:
+                        return
+
+                if self.visited:
+                        self.warnings.add(_(
+                            "WARNING: Several SVR4 packages detected. "
+                            "Multiple pkg.summary and pkg.description "
+                            "attributes may have been generated."))
+
+                for action in bundle:
+                        if "path" not in action.attrs:
+                                continue
+                        path = action.attrs["path"]
+                        if path in bundle.class_actions_dir:
+                                svr4_class = bundle.class_actions_dir[path]
+                                if svr4_class and \
+                                    svr4_class not in self.known_classes:
+                                        self.errors.add(
+                                            _("ERROR: class action script "
+                                            "used in %(pkg)s: %(path)s belongs "
+                                            "to \"%(class)s\" class") %
+                                            {"pkg": bundle.pkgname,
+                                             "path": path, "class": svr4_class})
+                for script in bundle.scripts:
+                        self.errors.add(
+                            _("ERROR: script present in %(pkg)s: %(script)s") %
+                            {"pkg": bundle.pkgname, "script": script})
+
+                self.visited = True
+
+
 def trans_create_repository(repo_uri, args):
-        """Creates a new repository at the location indicated by repo_uri."""
+        """DEPRECATED"""
 
         repo_props = {}
         opts, pargs = getopt.getopt(args, "", ["set-property="])
@@ -142,6 +171,7 @@ def trans_create_repository(repo_uri, args):
         return 0
 
 def trans_open(repo_uri, args):
+        """DEPRECATED"""
 
         opts, pargs = getopt.getopt(args, "en")
 
@@ -171,6 +201,7 @@ def trans_open(repo_uri, args):
         return 0
 
 def trans_append(repo_uri, args):
+        """DEPRECATED"""
 
         opts, pargs = getopt.getopt(args, "en")
 
@@ -200,6 +231,8 @@ def trans_append(repo_uri, args):
         return 0
 
 def trans_close(repo_uri, args):
+        """DEPRECATED"""
+
         abandon = False
         trans_id = None
         add_to_catalog = True
@@ -232,6 +265,8 @@ def trans_close(repo_uri, args):
         return 0
 
 def trans_add(repo_uri, args):
+        """DEPRECATED"""
+
         try:
                 trans_id = os.environ["PKG_TRANS_ID"]
         except KeyError:
@@ -254,34 +289,36 @@ def trans_add(repo_uri, args):
         return 0
 
 def trans_publish(repo_uri, fargs):
-        opts, pargs = getopt.getopt(fargs, "d:T:", ["no-index",
-            "no-catalog", "fmri-in-manifest"])
-        basedirs = []
-        timestamp_files = []
+        """Publish packages in a single step using provided manifest data and
+        sources."""
+
+        # --no-index is now silently ignored as the publication process no
+        # longer builds search indexes automatically.
+        opts, pargs = getopt.getopt(fargs, "b:d:s:T:", ["fmri-in-manifest",
+            "no-index", "no-catalog"])
 
         add_to_catalog = True
-        embedded_fmri = False
-
+        basedirs = []
+        bundles = []
+        timestamp_files = []
         for opt, arg in opts:
-                if opt == "-d":
+                if opt == "-b":
+                        bundles.append(arg)
+                elif opt == "-d":
                         basedirs.append(arg)
+                elif opt == "-s":
+                        repo_uri = arg
+                        if repo_uri and not repo_uri.startswith("null:"):
+                                repo_uri = misc.parse_uri(repo_uri)
                 elif opt == "-T":
                         timestamp_files.append(arg)
-                elif opt == "--no-index":
-                        refresh_index = False
                 elif opt == "--no-catalog":
                         add_to_catalog = False
-                elif opt == "--fmri-in-manifest":
-                        embedded_fmri = True
 
-        if not pargs and not embedded_fmri:
-                usage(_("No fmri argument specified for subcommand"),
-                    cmd="publish")
-
-        if not embedded_fmri:
-                pkg_name = pargs[0]
-                del pargs[0]
-
+        if not repo_uri:
+                usage(_("A destination package repository must be provided "
+                    "using -s."), cmd="publish")
+ 
         if not pargs:
                 filelist = [("<stdin>", sys.stdin)]
         else:
@@ -325,25 +362,50 @@ def trans_publish(repo_uri, fargs):
                     cmd="publish")
                 return 1
 
-        if embedded_fmri:
-                if "pkg.fmri" not in m:
-                        error(_("Manifest does not set fmri and " +
-                            "--fmri-in-manifest specified"))
-                        return 1
-                pkg_name = pkg.fmri.PkgFmri(m["pkg.fmri"]).get_short_fmri()
+        try:
+                pfmri = pkg.fmri.PkgFmri(m["pkg.fmri"], "5.11")
+                if not DebugValues["allow-timestamp"]:
+                        # If not debugging, timestamps are ignored.
+                        pfmri.version.timestr = None
+                pkg_name = pfmri.get_fmri()
+        except KeyError:
+                error(_("Manifest does not set pkg.fmri"))
+                return 1
 
         xport, pub = setup_transport_and_pubs(repo_uri)
         t = trans.Transaction(repo_uri, pkg_name=pkg_name,
             xport=xport, pub=pub)
         t.open()
 
+        target_files = []
+        if bundles:
+                # Ensure hardlinks marked as files in the manifest are
+                # treated as files.  This necessary when sourcing files
+                # from some bundle types.
+                target_files.extend(
+                    a.attrs["path"]
+                    for a in m.gen_actions()
+                    if a.name == "file"
+                )
+
+        bundles = [
+            pkg.bundle.make_bundle(bundle, target_files)
+            for bundle in bundles
+        ]
+
         for a in m.gen_actions():
-                # don't publish this action
+                # don't publish these actions
+                if a.name == "signature":
+                        msg(_("WARNING: Omitting signature action '%s'" % a))
+                        continue
                 if a.name == "set" and a.attrs["name"] in ["pkg.fmri", "fmri"]:
                         continue
                 elif a.has_payload:
-                        path, bd = pkg.actions.set_action_data(a.hash, a,
-                            basedirs)
+                        # Don't trust values provided; forcibly discard these.
+                        a.attrs.pop("pkg.size", None)
+                        a.attrs.pop("pkg.csize", None)
+                        path = pkg.actions.set_action_data(a.hash, a,
+                            basedirs=basedirs, bundles=bundles)[0]
                 elif a.name in nopub_actions:
                         error(_("invalid action for publication: %s") % action,
                             cmd="publish")
@@ -353,7 +415,11 @@ def trans_publish(repo_uri, fargs):
                         basename = os.path.basename(a.attrs["path"])
                         for pattern in timestamp_files:
                                 if fnmatch.fnmatch(basename, pattern):
-                                        ts = pkg.misc.time_to_timestamp(
+                                        if not isinstance(path, basestring):
+                                                # Target is from bundle; can't
+                                                # apply timestamp now.
+                                                continue
+                                        ts = misc.time_to_timestamp(
                                             os.stat(path).st_mtime)
                                         a.attrs["timestamp"] = ts
                                         break
@@ -371,6 +437,8 @@ def trans_publish(repo_uri, fargs):
         return 0
 
 def trans_include(repo_uri, fargs, transaction=None):
+        """DEPRECATED"""
+
         basedirs = []
         timestamp_files = []
         error_occurred = False
@@ -450,7 +518,7 @@ def trans_include(repo_uri, fargs, transaction=None):
                         basename = os.path.basename(a.attrs["path"])
                         for pattern in timestamp_files:
                                 if fnmatch.fnmatch(basename, pattern):
-                                        ts = pkg.misc.time_to_timestamp(
+                                        ts = misc.time_to_timestamp(
                                             os.stat(path).st_mtime)
                                         a.attrs["timestamp"] = ts
                                         break
@@ -467,11 +535,14 @@ def trans_include(repo_uri, fargs, transaction=None):
         else:
                 return 0
 
-def gen_actions(files, timestamp_files, target_files):
+def gen_actions(files, timestamp_files, target_files, minimal=False, visitors=[]):
         for filename in files:
                 bundle = pkg.bundle.make_bundle(filename, target_files)
+                for visitor in visitors:
+                        visitor.visit(bundle)
+
                 for action in bundle:
-                        if action.name == "file":
+                        if action.name in ("file", "dir"):
                                 basename = os.path.basename(action.attrs["path"])
                                 for pattern in timestamp_files:
                                         if fnmatch.fnmatch(basename, pattern):
@@ -479,9 +550,27 @@ def gen_actions(files, timestamp_files, target_files):
                                 else:
                                         action.attrs.pop("timestamp", None)
 
+                        if action.name == "license":
+                                # The bundle code provides this for the importer,
+                                # but it is unnecessary in all other cases.
+                                action.attrs.pop("path", None)
+
+                        if minimal:
+                                # pkgsend import needs attributes such as size
+                                # retained so that the publication modules know
+                                # how many bytes to read from the .data prop.
+                                # However, pkgsend generate attempts to
+                                # minimize the attributes output for each
+                                # action to only those necessary for use
+                                # so that the resulting manifest remains valid
+                                # even after mogrification or changing content.
+                                action.attrs.pop("pkg.size", None)
+
                         yield action, action.name in nopub_actions
 
-def trans_import(repo_uri, args):
+def trans_import(repo_uri, args, visitors=[]):
+        """DEPRECATED"""
+
         try:
                 trans_id = os.environ["PKG_TRANS_ID"]
         except KeyError:
@@ -507,16 +596,18 @@ def trans_import(repo_uri, args):
         xport, pub = setup_transport_and_pubs(repo_uri)
         t = trans.Transaction(repo_uri, trans_id=trans_id, xport=xport, pub=pub)
 
+        ret = 0
+        abandon = False
         try:
                 for action, err in gen_actions(pargs, timestamp_files,
-                    target_files):
+                    target_files, visitors=visitors):
                         if err:
                                 error(_("invalid action for publication: %s") %
                                     action, cmd="import")
-                                t.close(abandon=True)
-                                return 1
+                                abandon = True
                         else:
-                                t.add(action)
+                                if not abandon:
+                                        t.add(action)
         except TypeError, e:
                 error(e, cmd="import")
                 return 1
@@ -528,9 +619,18 @@ def trans_import(repo_uri, args):
                 else:
                         raise
 
-        return 0
+        for visitor in visitors:
+                if visitor.errors:
+                        abandon = True
+                        ret = 1
+        if abandon:
+                error("Abandoning transaction due to errors.")
+                t.close(abandon=True)
+        return ret
 
-def trans_generate(args):
+def trans_generate(args, visitors=[]):
+        """Generate a package manifest based on the provided sources."""
+
         opts, pargs = getopt.getopt(args, "T:", ["target="])
 
         timestamp_files = []
@@ -548,7 +648,7 @@ def trans_generate(args):
 
         try:
                 for action, err in gen_actions(pargs, timestamp_files,
-                    target_files):
+                    target_files, minimal=True, visitors=visitors):
                         if "path" in action.attrs and hasattr(action, "hash") \
                             and action.hash == "NOHASH":
                                 action.hash = action.attrs["path"]
@@ -567,7 +667,7 @@ def trans_generate(args):
         return 0
 
 def trans_refresh_index(repo_uri, args):
-        """Refreshes the indices at the location indicated by repo_uri."""
+        """DEPRECATED"""
 
         if args:
                 usage(_("command does not take operands"),
@@ -596,22 +696,31 @@ def setup_transport_and_pubs(repo_uri, remote=True):
 def main_func():
         gettext.install("pkg", "/usr/share/locale")
 
-        try:
-                repo_uri = os.environ["PKG_REPO"]
-        except KeyError:
-                repo_uri = "http://localhost:10000"
+        repo_uri = os.getenv("PKG_REPO", None)
 
         show_usage = False
         global_settings.client_name = "pkgsend"
         try:
-                opts, pargs = getopt.getopt(sys.argv[1:], "s:?", ["help"])
+                opts, pargs = getopt.getopt(sys.argv[1:], "s:D:?", ["help"])
                 for opt, arg in opts:
                         if opt == "-s":
                                 repo_uri = arg
+                        elif opt == "-D":
+                                if arg == "allow-timestamp":
+                                        key = arg
+                                        value = True
+                                else:
+                                        try:
+                                                key, value = arg.split("=", 1)
+                                        except (AttributeError, ValueError):
+                                                usage(_("%(opt)s takes argument of form "
+                                                    "name=value, not %(arg)s") % {
+                                                    "opt":  opt, "arg": arg })
+                                DebugValues.set_value(key, value)
                         elif opt in ("--help", "-?"):
                                 show_usage = True
         except getopt.GetoptError, e:
-                usage(_("pkgsend: illegal global option -- %s") % e.opt)
+                usage(_("illegal global option -- %s") % e.opt)
 
         if repo_uri and not repo_uri.startswith("null:"):
                 repo_uri = misc.parse_uri(repo_uri)
@@ -627,6 +736,12 @@ def main_func():
         elif not subcommand:
                 usage()
 
+        if not repo_uri and subcommand not in ("create-repository", "generate",
+            "publish"):
+                usage(_("A destination package repository must be provided "
+                    "using -s."), cmd=subcommand)
+
+        visitors = [SolarisBundleVisitor()]
         ret = 0
         try:
                 if subcommand == "create-repository":
@@ -640,17 +755,37 @@ def main_func():
                 elif subcommand == "add":
                         ret = trans_add(repo_uri, pargs)
                 elif subcommand == "import":
-                        ret = trans_import(repo_uri, pargs)
+                        ret = trans_import(repo_uri, pargs,
+                            visitors=visitors)
                 elif subcommand == "include":
                         ret = trans_include(repo_uri, pargs)
                 elif subcommand == "publish":
                         ret = trans_publish(repo_uri, pargs)
                 elif subcommand == "generate":
-                        ret = trans_generate(pargs)
+                        ret = trans_generate(pargs,
+                            visitors=visitors)
                 elif subcommand == "refresh-index":
                         ret = trans_refresh_index(repo_uri, pargs)
                 else:
                         usage(_("unknown subcommand '%s'") % subcommand)
+
+                printed_space = False
+                for visitor in visitors:
+                        for warn in visitor.warnings:
+                                if not printed_space:
+                                        print ""
+                                        printed_space = True
+                                error(warn, cmd=subcommand)
+
+                        for err in visitor.errors:
+                                if not printed_space:
+                                        print ""
+                                        printed_space = True
+                                error(err, cmd=subcommand)
+                                ret = 1
+        except pkg.bundle.InvalidBundleException, e:
+                error(e, cmd=subcommand)
+                ret = 1
         except getopt.GetoptError, e:
                 usage(_("illegal %s option -- %s") % (subcommand, e.opt))
 
@@ -667,23 +802,22 @@ if __name__ == "__main__":
 
         try:
                 __ret = main_func()
-        except (pkg.actions.ActionError, trans.TransactionError,
-            RuntimeError, pkg.fmri.IllegalFmri, apx.ApiException), _e:
-                print >> sys.stderr, "pkgsend: %s" % _e
-                __ret = 1
         except (PipeError, KeyboardInterrupt):
                 # We don't want to display any messages here to prevent
                 # possible further broken pipe (EPIPE) errors.
+                __ret = 1
+        except (pkg.actions.ActionError, trans.TransactionError,
+            EnvironmentError, RuntimeError, pkg.fmri.FmriError,
+            apx.ApiException), _e:
+                if not (isinstance(_e, IOError) and _e.errno == errno.EPIPE):
+                        # Only print message if failure wasn't due to
+                        # broken pipe (EPIPE) error.
+                        print >> sys.stderr, "pkgsend: %s" % _e
                 __ret = 1
         except SystemExit, _e:
                 raise _e
         except:
                 traceback.print_exc()
-                error(
-                    _("\n\nThis is an internal error.  Please let the "
-                    "developers know about this\nproblem by filing a bug at "
-                    "http://defect.opensolaris.org and including the\nabove "
-                    "traceback and this message.  The version of pkg(5) is "
-                    "'%s'.") % pkg.VERSION)
+                error(misc.get_traceback_message())
                 __ret = 99
         sys.exit(__ret)

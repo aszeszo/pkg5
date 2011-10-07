@@ -20,7 +20,7 @@
 #
 
 #
-# Copyright (c) 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2008, 2011, Oracle and/or its affiliates. All rights reserved.
 #
 
 unset LD_LIBRARY_PATH
@@ -39,7 +39,7 @@ sanity_ok=$(gettext     "  Sanity Check: Passed.  Looks like an OpenSolaris syst
 sanity_fail=$(gettext   "  Sanity Check: FAILED (see log for details).")
 sanity_fail_vers=$(gettext  "  Sanity Check: the Solaris image (release %s) is not an OpenSolaris image and cannot be installed in this type of branded zone.")
 install_fail=$(gettext  "        Result: *** Installation FAILED ***")
-f_zfs_in_root=$(gettext "Installing a zone in the ROOT pool is unsupported.")
+f_zfs_in_root=$(gettext "Installing a zone inside of the root pool's 'ROOT' dataset is unsupported.")
 f_zfs_create=$(gettext "Unable to create the zone's ZFS dataset.")
 f_root_create=$(gettext "Unable to create the zone's ZFS dataset mountpoint.")
 f_no_gzbe=$(gettext "unable to determine global zone boot environment.")
@@ -71,7 +71,7 @@ fail_incomplete() {
 	printf "ERROR: " 1>&2
 	printf "$@" 1>&2
 	printf "\n" 1>&2
-	exit $ZONE_SUBPROC_INCOMPLETE
+	exit $ZONE_SUBPROC_NOTCOMPLETE
 }
 
 fail_usage() {
@@ -362,7 +362,9 @@ get_publisher_attrs() {
 	typeset utype=$2
 
 	LC_ALL=C $PKG publisher -HF tsv| \
-	    nawk '$5 == "'"$utype"'" && $1 == "'"$pname"'" \
+	    nawk '($5 == "'"$utype"'" || \
+	    ("'"$utype"'" == "origin" && $5 == "")) \
+	    && $1 == "'"$pname"'" \
 	    {printf "%s %s %s\n", $2, $3, $4;}'
 	return 0
 }
@@ -427,11 +429,17 @@ get_publisher_urls() {
 	fi
 
 	LC_ALL=C $PKG publisher -HF tsv | \
-		nawk '$5 == "'"$utype"'" && \
-		$6 == "online" && \
+		nawk '($5 == "'"$utype"'" || \
+		("'"$utype"'" == "origin" && $5 == "")) && \
 		( "'"$ptype_filter"'" == "" || $3 == "'"$ptype_filter"'" ) \
 		{printf "%s %s\n", $1, $7;}' |
 		while IFS=" " read __publisher __publisher_url; do
+			if [[ "$utype" == "origin" && \
+			    -z "$__publisher_url" ]]; then
+				# Publisher without origins.
+				__publisher_url="None"
+			fi
+
 			if [[ -n "$__pub_prefix" && \
 				"$__pub_prefix" != "$__publisher" ]]; then
 				# Different publisher so emit accumulation and

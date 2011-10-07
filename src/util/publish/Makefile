@@ -20,7 +20,7 @@
 #
 
 #
-# Copyright (c) 2009, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2009, 2011, Oracle and/or its affiliates. All rights reserved.
 #
 
 ARCH:sh=	uname -p
@@ -33,28 +33,57 @@ SPARC_REPO=http://localhost:10001
 i386_REPO=http://localhost:10002
 EXTRA_ARGS=
 JUST_THESE_PKGS=
+EXCLUDE_THESE_PKGS=
 
 ON_REPO=http://localhost:20000
 INSTALL_REPO=http://localhost:20001
 X_REPO=http://localhost:20002
 IPS_REPO=http://localhost:20003
 VPANELS_REPO=http://localhost:20004
+USERLAND_REPO=http://localhost:20005
+L10N_REPO=http://localhost:20006
+DESKTOP_REPO=http://localhost:20007
+CDE_REPO=http://localhost:20008
+CACAO_REPO=http://localhost:20010
+CNS_REPO=http://localhost:20011
+JDMK_REPO=http://localhost:20012
+NVIDIA_REPO=http://localhost:20013
+DEVPRO_REPO=http://localhost:20014
+SOLARIS_RE_REPO=http://localhost:20015
+MAN_REPO=http://localhost:20016
+LDOMS_REPO=http://localhost:20017
+SIC_TEAM_REPO=http://localhost:20018
+SUNVTS_REPO=http://localhost:20019
+JAVA_REPO=http://localhost:20020
 
 INPUT_REPOS = \
     $(ON_REPO) \
     $(INSTALL_REPO) \
     $(X_REPO) \
     $(IPS_REPO) \
-    $(VPANELS_REPO)
+    $(VPANELS_REPO) \
+    $(USERLAND_REPO) \
+    $(L10N_REPO) \
+    $(DESKTOP_REPO) \
+    $(CDE_REPO) \
+    $(CACAO_REPO) \
+    $(CNS_REPO) \
+    $(JDMK_REPO) \
+    $(NVIDIA_REPO) \
+    $(DEVPRO_REPO) \
+    $(SOLARIS_RE_REPO) \
+    $(MAN_REPO) \
+    $(LDOMS_REPO) \
+    $(SIC_TEAM_REPO) \
+    $(SUNVTS_REPO) \
+    $(JAVA_REPO)
 
 ON_EXTRA_REPO=http://localhost:30000
 
-EXTRA_CONTENT = \
+ON_EXTRA_CONTENT = \
     driver/management/bmc \
     driver/storage/ifp \
     driver/storage/isp \
-    driver/storage/qus \
-    system/header/header-ifp \
     shell/ksh88
 
 $(MERGEDIR):
@@ -88,10 +117,11 @@ publish: $(MERGEDIR)
 publish_setpublisher: $(SETPUBLISHERDIR)
 	PATH=$(PROTO)/usr/bin:${PATH} PYTHONPATH=$(PYTHONPATH) \
 	    ./set-publisher.sh $(BUILDID:%=-b %) -d $(SETPUBLISHERDIR) \
-	    $(JUST_THESE_PKGS:%=-j %) -p $(REPO) $(INPUT_REPOS)
+	    $(JUST_THESE_PKGS:%=-j %) $(EXCLUDE_THESE_PKGS:%=-x %) -p $(REPO) \
+	    $(INPUT_REPOS)
 
 publish_setpublisher-extra: $(SETPUBLISHERDIR)
-	INPUT_REPOS=$(ON_EXTRA_REPO) JUST_THESE_PKGS="$(EXTRA_CONTENT)" \
+	INPUT_REPOS="$(ON_EXTRA_REPO)" JUST_THESE_PKGS="$(ON_EXTRA_CONTENT)" \
 	    $(MAKE) publish_setpublisher
 
 clobber_setpublisher:

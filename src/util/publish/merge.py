@@ -21,7 +21,7 @@
 #
 
 #
-# Copyright (c) 2009, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2009, 2011, Oracle and/or its affiliates. All rights reserved.
 #
 
 import sys
@@ -117,7 +117,7 @@ def fetch_catalog(repouri):
 
         pub.transport = xport
         # Pull catalog only from this host
-        pub.selected_repository.origins = [repouri]
+        pub.repository.origins = [repouri]
         pub.refresh(True, True)
 
         cat = pub.catalog
@@ -317,7 +317,7 @@ def merge_fmris(server_list, fmri_list, variant_list, variant, basedir,
                         if a.name == "set" and a.attrs["name"] == variant:
                                 del m.actions[i]
 
-        action_lists = manifest.Manifest.comm(*tuple(manifest_list))
+        action_lists = manifest.Manifest.comm(manifest_list)
 
         # set fmri actions require special merge logic.
         set_fmris = []

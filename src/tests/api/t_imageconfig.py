@@ -21,7 +21,7 @@
 #
 
 #
-# Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2008, 2011, Oracle and/or its affiliates. All rights reserved.
 #
 
 import testutils
@@ -69,15 +69,14 @@ sort_policy: priority
                 pkg5unittest.Pkg5TestCase.setUp(self)
                 self.make_misc_files(self.misc_files)
                 self.ic = imageconfig.ImageConfig(os.path.join(self.test_root,
-                    "cfg_cache"), self.test_root, os.path.join(self.test_root,
-                    "publisher"))
+                    "cfg_cache"), self.test_root)
 
         def test_0_read(self):
                 """Verify that read works and that values are read properly."""
 
                 pub = self.ic.publishers["sfbay.sun.com"]
                 self.assertEqual(pub.alias, "zruty")
-                repo = pub.selected_repository
+                repo = pub.repository
                 origin = repo.origins[0]
                 self.assertEqual(origin.uri, "http://zruty.sfbay:10001/")
                 self.assertEqual(origin.ssl_key, None)
@@ -101,19 +100,15 @@ sort_policy: priority
                 """Verify that the uuid determined during the first read is the
                 same as the uuid in the second read."""
                 self.ic = imageconfig.ImageConfig(os.path.join(self.test_root,
-                    "cfg_cache"), self.test_root, os.path.join(self.test_root,
-                    "publisher"))
+                    "cfg_cache"), self.test_root)
                 pub = self.ic.publishers["sfbay.sun.com"]
                 uuid = pub.client_uuid
 
                 ic2 = imageconfig.ImageConfig(os.path.join(self.test_root,
-                    "cfg_cache"), self.test_root, os.path.join(self.test_root,
-                    "publisher"))
+                    "cfg_cache"), self.test_root)
                 pub2 = ic2.publishers["sfbay.sun.com"]
                 self.assertEqual(pub2.client_uuid, uuid)
 
-
-# XXX more test cases needed.
 
 if __name__ == "__main__":
         unittest.main()

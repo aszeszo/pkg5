@@ -23,7 +23,9 @@
 
 # Set some specific permissions
 <transform dir path=(etc|usr|var)$ -> set group sys>
-<transform dir path=etc/(brand|gconf|zones)$ -> set group sys>
+<transform dir path=etc/(brand|gconf|pkg|zones)$ -> set group sys>
+<transform dir path=var/log$ -> set group sys>
+<transform dir path=var/cache$ -> set group bin>
 <transform dir file path=etc/gconf/schemas -> set group sys>
 <transform dir file path=etc/(security|xdg) -> set group sys>
 <transform dir path=usr/share$ -> set group sys>
@@ -32,7 +34,9 @@
 <transform dir path=usr/share/lib -> set group sys>
 <transform file dir path=usr/share/mime -> default group root>
 <transform file path=usr/share/(package|update)-manager/icons -> default group other>
-<transform dir file path=var/svc -> default group sys>
+<transform dir path=lib/svc$ -> default group bin>
+<transform dir file path=lib/svc/manifest -> default group sys>
+<transform dir file path=lib/svc/method -> default group bin>
 <transform file path=(usr/bin|lib/svc/method) -> default mode 0755>
 <transform file path=$(PYDIR)/.*\.so -> default mode 0755>
 
@@ -51,9 +55,6 @@
 # propagated
 <transform set name=nopublish.after -> drop>
 
-set name=org.opensolaris.consolidation value=ips
-set name=variant.opensolaris.zone value=global value=nonglobal
-
 # Don't bother specifying each .py file.  Allow individual actions to
 # override this by setting pkg.tmp.autopyc to false.
 <transform file path=.*\.py$ -> default pkg.tmp.autopyc true>
@@ -68,6 +69,27 @@ set name=variant.opensolaris.zone value=global value=nonglobal
 <transform file path=usr/share/icons/.* -> add restart_fmri svc:/application/desktop-cache/icon-cache:default>
 <transform file path=usr/share/mime/packages/.*\.xml -> add restart_fmri svc:/application/desktop-cache/mime-types-cache:default>
 
+# Add locale facets
+<transform dir file \
+    path=usr/share/locale/([a-z]{2,3}(_[A-Z]{2,3})?)([.@][^/]+)?(/.+)?$ -> \
+    default facet.locale.%<1> true>
+<transform dir file \
+    path=usr/share/gnome/help/package-manager/([a-z]{2,3}(_[A-Z]{2,3})?)(/.*)?$ -> \
+    default facet.locale.%<1> true>
+<transform dir file \
+    path=usr/share/man/([a-z]{2,3}(_[A-Z]{2,3})?)([.@][^/]+)?(/.+)?$ -> \
+    default facet.locale.%<1> true>
+# locale dir, section dir, and manpages (add zh_SG to zh_CN)
+<transform dir file link path=usr/share/man/zh_CN([/.@].+)?$ -> \
+    default facet.locale.zh_SG true>
+<transform file \
+    path=usr/share/omf/package-manager/package-manager-([a-z]{2,3}(_[A-Z]{2,3})?)\.omf$ -> \
+    default facet.locale.%<1> true>
+
+# Add manpage facets
+<transform dir file link hardlink path=usr.*/man(/.+){0,1}$ -> \
+    default facet.doc.man true>
+
 # Default values for legacy actions
 <transform legacy -> default name %{pkg.summary}>
 <transform legacy -> default desc %{pkg.description}>
@@ -77,5 +99,18 @@ set name=variant.opensolaris.zone value=global value=nonglobal
 <transform legacy -> default arch $(ARCH)>
 # add a ,REV= string to any version attributes that don't have a REV=
 <transform legacy -> edit version (^(?!.*?,REV=).*) \\1,REV=$(REV)>
+
+# only set the info.repository-* values for packages we're responsible for
+<transform pkg pkg.fmri=pkg:/package/.* -> default info.repository-changeset $(CHANGESET)>
+<transform pkg pkg.fmri=pkg:/package/.* -> default info.repository-url ssh://hg.opensolaris.org/hg/pkg/gate>
+<transform pkg pkg.fmri=pkg:/system/zones.*-> default info.repository-changeset $(CHANGESET)>
+<transform pkg pkg.fmri=pkg:/system/zones.* -> default info.repository-url ssh://hg.opensolaris.org/hg/pkg/gate>
+<transform pkg pkg.fmri=pkg:/developer/opensolaris/pkg5 -> default info.repository-changeset $(CHANGESET)>
+<transform pkg pkg.fmri=pkg:/developer/opensolaris/pkg5 -> default info.repository-url ssh://hg.opensolaris.org/hg/pkg/gate>
+# now emit those values
+<transform pkg info.repository-changeset=(.*) -> emit set name=info.repository-changeset value=%<1>>
+<transform pkg info.repository-url=(.*) -> emit set name=info.repository-url value=%<1>>
+set name=org.opensolaris.consolidation value=ips
+set name=variant.opensolaris.zone value=global value=nonglobal
 
 # vim: ft=pkg5manifest

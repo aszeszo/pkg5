@@ -21,7 +21,7 @@
 #
 
 #
-# Copyright (c) 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2010, 2011, Oracle and/or its affiliates. All rights reserved.
 #
 
 import os.path
@@ -55,6 +55,17 @@ class SMFManifestDependency(base.PublishingDependency):
                 base.PublishingDependency.__init__(self, action,
                     base_names, paths, pkg_vars, proto_dir, "smf_manifest")
 
+        def __repr__(self):
+                return "SMFDep(%s, %s, %s, %s)" % (self.action,
+                    self.base_names[0], self.run_paths, self.pkg_vars)
+
+        @staticmethod
+        def _clear_cache():
+                """Clear our manifest caches.  This is primarily provided for
+                test code."""
+                SMFManifestDependency.instance_mf = None
+                SMFManifestDependency.instance_deps = None
+
         @staticmethod
         def populate_cache(proto_dirs, force_update=False):
                 """Build our instance_mf and instance_deps dictionaries
@@ -69,7 +80,6 @@ class SMFManifestDependency(base.PublishingDependency):
                 SMFManifestDependency.instance_mf = {}
                 SMFManifestDependency.instance_deps = {}
 
-                manifests = []
                 def find(manifests, dirname, fnames):
                          for file in fnames:
                                  path = os.path.join(dirname, file)
@@ -90,6 +100,7 @@ class SMFManifestDependency(base.PublishingDependency):
                                     location))
 
                 for location in manifest_paths:
+                        manifests = []
                         os.path.walk(location, find, manifests)
                         for manifest_file in manifests:
                                 SMFManifestDependency.__populate_smf_dics(
@@ -274,7 +285,7 @@ def process_smf_manifest_deps(action, pkg_vars, **kwargs):
                                 # local machine.
                                 elist.append(
                                     _("Unable to generate SMF dependency on "
-                                    "%(dep_fmri)s declared in %(proto_file)s by"
+                                    "%(dep_fmri)s declared in %(proto_file)s by "
                                     "%(fmri)s: %(err)s") % locals())
 
                         if manifest:
@@ -284,7 +295,7 @@ def process_smf_manifest_deps(action, pkg_vars, **kwargs):
                 deps.append(SMFManifestDependency(action, manifest, pkg_vars,
                     action.attrs[PD_PROTO_DIR]))
         pkg_attrs = {
-            "opensolaris.smf.fmri": instance_mf.keys()
+            "org.opensolaris.smf.fmri": instance_mf.keys()
         }
         return deps, elist, pkg_attrs
 
@@ -297,11 +308,13 @@ def __get_smf_dependencies(deps):
                 fmris = dependency.getElementsByTagName("service_fmri")
                 dep_type = dependency.getAttribute("type")
                 grouping = dependency.getAttribute("grouping")
+                delete = dependency.getAttribute("delete")
 
                 # we don't include SMF path dependencies as these are often
                 # not packaged files.
                 if fmris and dep_type == "service" and \
-                    grouping == "require_all":
+                    grouping == "require_all" and \
+                    delete != "true":
                         for service_fmri in fmris:
                                 dependency = service_fmri.getAttribute("value")
                                 if dependency:
@@ -362,7 +375,7 @@ def parse_smf_manifest(smf_file):
         manifest_path = None
 
         if isinstance(smf_file, str):
-                manifest_path = os.path.realpath(smf_file)
+                manifest_path = smf_file
 
         svcs = smf_doc.getElementsByTagName("service")
         for service in svcs:

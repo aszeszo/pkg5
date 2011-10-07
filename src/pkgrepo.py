@@ -21,7 +21,7 @@
 #
 
 #
-# Copyright (c) 2010 Oracle and/or its affiliates.  All rights reserved.
+# Copyright (c) 2010, 2011, Oracle and/or its affiliates.  All rights reserved.
 #
 
 PKG_CLIENT_NAME = "pkgrepo"
@@ -33,19 +33,19 @@ EXIT_BADOPT  = 2
 EXIT_PARTIAL = 3
 
 # listing constants
-LISTING_FORMATS = ("tsv", )
+LISTING_FORMATS = ("json", "json-formatted", "tsv")
 
 # globals
 tmpdirs = []
 
 import atexit
+import collections
 import copy
 import errno
 import getopt
 import gettext
 import locale
 import logging
-import os
 import shlex
 import shutil
 import sys
@@ -58,19 +58,20 @@ from pkg.misc import msg, PipeError
 import pkg
 import pkg.catalog
 import pkg.client.api_errors as apx
+import pkg.client.progress
 import pkg.client.publisher as publisher
 import pkg.client.transport.transport as transport
 import pkg.misc as misc
 import pkg.server.repository as sr
 
 logger = global_settings.logger
-orig_cwd = None
 
 @atexit.register
 def cleanup():
         """To be called at program finish."""
         for d in tmpdirs:
                 shutil.rmtree(d, True)
+
 
 def error(text, cmd=None):
         """Emit an error message prefixed by the command name """
@@ -95,6 +96,19 @@ def error(text, cmd=None):
         logger.error(ws + pkg_cmd + text_nows)
 
 
+def get_tracker(quiet=False):
+        if quiet:
+                progtrack = pkg.client.progress.QuietProgressTracker()
+        else:
+                try:
+                        progtrack = \
+                            pkg.client.progress.FancyUNIXProgressTracker()
+                except pkg.client.progress.ProgressTrackerException:
+                        progtrack = \
+                            pkg.client.progress.CommandLineProgressTracker()
+        return progtrack
+
+
 def usage(usage_error=None, cmd=None, retcode=2, full=False):
         """Emit a usage message and optionally prefix it with a more
         specific error message.  Causes program to exit.
@@ -114,33 +128,29 @@ Usage:
         pkgrepo [options] command [cmd_options] [operands]
 
 Subcommands:
-     pkgrepo create [--version] uri_or_path
+     pkgrepo create [--version ver] uri_or_path
 
-     pkgrepo add-signing-ca-cert [-p publisher ...]
-         [-s repo_uri_or_path] path ...
+     pkgrepo add-publisher -s repo_uri_or_path publisher ...
 
-     pkgrepo add-signing-intermediate-cert [-p publisher ...]
-         [-s repo_uri_or_path] path ...
-
-     pkgrepo get [-p publisher ...] [-s repo_uri_or_path]
+     pkgrepo get [-F format] [-p publisher ...] -s repo_uri_or_path
          [section/property ...]
 
      pkgrepo info [-F format] [-H] [-p publisher ...]
-         [-s repo_uri_or_path]
+         -s repo_uri_or_path
 
-     pkgrepo rebuild [-s repo_uri_or_path] [--no-catalog]
-         [--no-index]
+     pkgrepo list [-F format] [-H] [-p publisher ...] -s repo_uri_or_path
+         [pkg_fmri_pattern ...]
 
-     pkgrepo refresh [-s repo_uri_or_path] [--no-catalog]
-         [--no-index]
+     pkgrepo rebuild [-p publisher ...] -s repo_uri_or_path
+         [--no-catalog] [--no-index]
 
-     pkgrepo remove-signing-ca-cert [-p publisher ...]
-         [-s repo_uri_or_path] hash ...
+     pkgrepo refresh [-p publisher ...] -s repo_uri_or_path
+         [--no-catalog] [--no-index]
 
-     pkgrepo remove-signing-intermediate-cert [-p publisher ...]
-         [-s repo_uri_or_path] hash ...
+     pkgrepo remove [-n] [-p publisher ...] -s repo_uri_or_path
+         pkg_fmri_pattern ...
 
-     pkgrepo set [-p publisher ...] [-s repo_uri_or_path]
+     pkgrepo set [-p publisher ...] -s repo_uri_or_path
          section/property[+|-]=[value] ... or
          section/property[+|-]=([value]) ...
 
@@ -168,257 +178,66 @@ def parse_uri(uri):
         return publisher.RepositoryURI(misc.parse_uri(uri))
 
 
-def _add_certs(conf, subcommand, args, ca):
-        opts, pargs = getopt.getopt(args, "p:s:")
-        pubs = set()
+def subcmd_remove(conf, args):
+        subcommand = "remove"
 
+        opts, pargs = getopt.getopt(args, "np:s:")
+
+        dry_run = False
+        pubs = set()
         for opt, arg in opts:
-                if opt == "-p":
+                if opt == "-n":
+                        dry_run = True
+                elif opt == "-p":
                         pubs.add(arg)
                 elif opt == "-s":
                         conf["repo_uri"] = parse_uri(arg)
+
+        if not pargs:
+                usage(_("At least one package pattern must be provided."),
+                    cmd=subcommand)
 
         # Get repository object.
         if not conf.get("repo_uri", None):
                 usage(_("A package repository location must be provided "
                     "using -s."), cmd=subcommand)
-
         repo = get_repo(conf, read_only=False, subcommand=subcommand)
 
-        if len(pargs) < 1:
-                usage(_("At least one path to a certificate must be provided."))
-
-        failed = []
-        def add_certs(pfx=None):
-                if orig_cwd:
-                        certs = [os.path.join(orig_cwd, f) for f in pargs]
-                else:
-                        certs = [os.path.abspath(f) for f in pargs]
-
-                try:
-                        repo.add_signing_certs(certs, ca=ca, pub=pfx)
-                except (apx.ApiException, sr.RepositoryError), e:
-                        failed.append((pfx, e))
-
         if "all" in pubs:
-                # Default to list of all publishers.
-                pubs = repo.publishers
+                pubs = set()
 
-        if not pubs:
-                # Assume default publisher or older repository.
-                add_certs()
-        else:
-                # Add for each publisher specified.
-                map(add_certs, pubs)
-
-        return pubs, failed
-
-
-def subcmd_add_signing_ca_cert(conf, args):
-        """Add the provided signing ca certificates to the repository for
-        the given publisher."""
-
-        subcommand = "add-signing-ca-cert"
-        pubs, failed = _add_certs(conf, subcommand, args, True)
-        if failed:
-                for pfx, details in failed:
-                        error(_("Unable to add signing ca certificates for "
-                            "publisher '%(pfx)s':\n%(details)s") % locals(),
-                            cmd=subcommand)
-                if len(failed) < len(pubs):
-                        return EXIT_PARTIAL
+        # Find matching packages.
+        try:
+                matching, refs = repo.get_matching_fmris(pargs, pubs=pubs)
+        except apx.PackageMatchErrors, e:
+                error(str(e), cmd=subcommand)
                 return EXIT_OOPS
+
+        if dry_run:
+                # Don't make any changes; display list of packages to be
+                # removed and exit.
+                packages = set(f for m in matching.values() for f in m)
+                count = len(packages)
+                plist = "\n".join("\t%s" % p for p in sorted(packages))
+                logger.info(_("%(count)d package(s) will be removed:\n"
+                    "%(plist)s") % locals())
+                return EXIT_OK
+
+        progtrack = get_tracker()
+        packages = collections.defaultdict(list)
+        for m in matching.values():
+                for f in m:
+                        packages[f.publisher].append(f)
+
+        for pub in packages:
+                logger.info(_("Removing packages for publisher %s ...") % pub)
+                repo.remove_packages(packages[pub], progtrack=progtrack,
+                    pub=pub)
+                if len(packages) > 1:
+                        # Add a newline between each publisher.
+                        logger.info("")
+
         return EXIT_OK
-
-
-def subcmd_add_signing_intermediate_cert(conf, args):
-        subcommand = "add-signing-intermediate-cert"
-        pubs, failed = _add_certs(conf, subcommand, args, True)
-        if failed:
-                for pfx, details in failed:
-                        if pfx:
-                                error(_("Unable to add signing intermediate "
-                                    "certificates for publisher '%(pfx)s':\n"
-                                    "%(details)s") % locals(), cmd=subcommand)
-                        else:
-                                error(_("Unable to add signing intermediate "
-                                    "certificates:\n%(details)s") % locals(),
-                                    cmd=subcommand)
-                if len(failed) < len(pubs):
-                        return EXIT_PARTIAL
-                return EXIT_OOPS
-        return EXIT_OK
-
-
-def _remove_certs(conf, subcommand, args, ca):
-        opts, pargs = getopt.getopt(args, "p:s:")
-        pubs = set()
-
-        for opt, arg in opts:
-                if opt == "-p":
-                        pubs.add(arg)
-                elif opt == "-s":
-                        conf["repo_uri"] = parse_uri(arg)
-
-        # Get repository object.
-        if not conf.get("repo_uri", None):
-                usage(_("A package repository location must be provided "
-                    "using -s."), cmd=subcommand)
-
-        repo = get_repo(conf, read_only=False, subcommand=subcommand)
-
-        if len(pargs) < 1:
-                usage(_("At least one certificate hash must be provided."))
-
-        failed = []
-        def remove_certs(pfx=None):
-                try:
-                        repo.remove_signing_certs(pargs, ca=True, pub=pfx)
-                except (apx.ApiException, sr.RepositoryError), e:
-                        failed.append((pfx, e))
-
-        if "all" in pubs:
-                # Default to list of all publishers.
-                pubs = repo.publishers
-
-        if not pubs:
-                # Assume default publisher or older repository.
-                remove_certs()
-        else:
-                # Add for each publisher specified.
-                map(remove_certs, pubs)
-
-        return pubs, failed
-
-
-def subcmd_remove_signing_ca_cert(conf, args):
-        subcommand = "remove-signing-ca-cert"
-        pubs, failed = _remove_certs(conf, subcommand, args, True)
-        if failed:
-                for pfx, details in failed:
-                        error(_("Unable to remove signing ca certificates for "
-                            "publisher '%(pfx)s':\n%(details)s") % locals(),
-                            cmd=subcommand)
-                if len(failed) < len(pubs):
-                        return EXIT_PARTIAL
-                return EXIT_OOPS
-        return EXIT_OK
-
-
-def subcmd_remove_signing_intermediate_cert(conf, args):
-        subcommand = "remove-signing-intermediate-cert"
-        pubs, failed = _remove_certs(conf, subcommand, args, True)
-        if failed:
-                for pfx, details in failed:
-                        if pfx:
-                                error(_("Unable to remove signing intermediate "
-                                    "certificates for publisher '%(pfx)s':\n"
-                                    "%(details)s") % locals(), cmd=subcommand)
-                        else:
-                                error(_("Unable to remove signing intermediate "
-                                    "certificates:\n%(details)s") % locals(),
-                                    cmd=subcommand)
-                if len(failed) < len(pubs):
-                        return EXIT_PARTIAL
-                return EXIT_OOPS
-        return EXIT_OK
-
-
-def print_col_listing(desired_field_order, field_data, field_values, out_format,
-    def_fmt, omit_headers):
-        """Print a columnar listing defined by provided values."""
-
-        # Custom sort function for preserving field ordering
-        def sort_fields(one, two):
-                return desired_field_order.index(get_header(one)) - \
-                    desired_field_order.index(get_header(two))
-
-        # Functions for manipulating field_data records
-        def filter_default(record):
-                return "default" in record[0]
-
-        def filter_tsv(record):
-                return "tsv" in record[0]
-
-        def get_header(record):
-                return record[1]
-
-        def get_value(record):
-                return record[2]
-
-        def quote_value(val):
-                if out_format == "tsv":
-                        # Expand tabs if tsv output requested.
-                        val = val.replace("\t", " " * 8)
-                nval = val
-                # Escape bourne shell metacharacters.
-                for c in ("\\", " ", "\t", "\n", "'", "`", ";", "&", "(", ")",
-                    "|", "^", "<", ">"):
-                        nval = nval.replace(c, "\\" + c)
-                return nval
-
-        def set_value(entry):
-                val = entry[1]
-                multi_value = False
-                if isinstance(val, (list, set)):
-                        multi_value = True
-                elif val == "":
-                        entry[0][2] = '""'
-                        return
-                elif val is None:
-                        entry[0][2] = ''
-                        return
-                else:
-                        val = [val]
-
-                nval = []
-                for v in val:
-                        if v == "":
-                                # Indicate empty string value using "".
-                                nval.append('""')
-                        elif v is None:
-                                # Indicate no value using empty string.
-                                nval.append('')
-                        else:
-                                # Otherwise, escape the value to be displayed.
-                                nval.append(quote_value(str(v)))
-
-                val = " ".join(nval)
-                nval = None
-                if multi_value:
-                        val = "(%s)" % val
-                entry[0][2] = val
-
-        if out_format == "default":
-                # Create a formatting string for the default output
-                # format.
-                fmt = def_fmt
-                filter_func = filter_default
-        elif out_format == "tsv":
-                # Create a formatting string for the tsv output
-                # format.
-                num_fields = len(field_data.keys())
-                fmt = "\t".join('%s' for x in xrange(num_fields))
-                filter_func = filter_tsv
-
-        # Extract the list of headers from the field_data dictionary.  Ensure
-        # they are extracted in the desired order by using the custom sort
-        # function.
-        hdrs = map(get_header, sorted(filter(filter_func, field_data.values()),
-            sort_fields))
-
-        # Output a header if desired.
-        if not omit_headers:
-                msg(fmt % tuple(hdrs))
-
-        for entry in field_values:
-                map(set_value, (
-                    (field_data[f], v)
-                    for f, v in entry.iteritems()
-                ))
-                values = map(get_value, sorted(filter(filter_func,
-                    field_data.values()), sort_fields))
-                msg(fmt % tuple(values))
 
 
 def get_repo(conf, read_only=True, subcommand=None):
@@ -462,6 +281,68 @@ def setup_transport(conf, subcommand=None):
             xport_cfg, remote_prefix=True)
 
         return xport, src_pub, tmp_dir
+
+
+def subcmd_add_publisher(conf, args):
+        """Add publisher(s) to the specified repository."""
+
+        subcommand = "add-publisher"
+
+        opts, pargs = getopt.getopt(args, "s:")
+        for opt, arg in opts:
+                if opt == "-s":
+                        conf["repo_uri"] = parse_uri(arg)
+
+        repo_uri = conf.get("repo_uri", None)
+        if not repo_uri:
+                usage(_("No repository location specified."), cmd=subcommand)
+        if repo_uri.scheme != "file":
+                usage(_("Network repositories are not currently supported "
+                    "for this operation."), cmd=subcommand)
+
+        if not pargs:
+                usage(_("At least one publisher must be specified"),
+                    cmd=subcommand)
+
+        abort = False
+        for pfx in pargs:
+                if not misc.valid_pub_prefix(pfx):
+                        error(_("Invalid publisher prefix '%s'") % pfx,
+                            cmd=subcommand)
+                        abort = True
+        if abort:
+                return EXIT_OOPS
+
+        repo = get_repo(conf, read_only=False, subcommand=subcommand)
+        make_default = not repo.publishers
+        existing = repo.publishers & set(pargs)
+
+        # Elide the publishers that already exist, but retain the order
+        # publishers were specified in.
+        new_pubs = [
+            pfx for pfx in pargs
+            if pfx not in repo.publishers
+        ]
+
+        # Tricky logic; _set_pub will happily add new publishers if necessary
+        # and not set any properties if you didn't specify any.
+        rval = _set_pub(conf, subcommand, {}, new_pubs, repo)
+
+        if make_default:
+                # No publisher existed previously, so set the default publisher
+                # to be the first new one that was added.
+                _set_repo(conf, subcommand, { "publisher": {
+                    "prefix": new_pubs[0] } }, repo)
+
+        if rval == EXIT_OK and existing:
+                # Some of the publishers that were requested for addition
+                # were already known.
+                error(_("specified publisher(s) already exist: %s") %
+                    ", ".join(existing), cmd=subcommand)
+                if new_pubs:
+                        return EXIT_PARTIAL
+                return EXIT_OOPS
+        return rval
 
 
 def subcmd_create(conf, args):
@@ -520,7 +401,7 @@ def subcmd_get(conf, args):
                                 usage(_("Unrecognized format %(format)s."
                                     " Supported formats: %(valid)s") % \
                                     { "format": out_format,
-                                    "valid": LISTING_FORMATS }, cmd="get")
+                                    "valid": LISTING_FORMATS }, cmd=subcommand)
                                 return EXIT_OOPS
                 elif opt == "-H":
                         omit_headers = True
@@ -587,19 +468,21 @@ def _get_repo(conf, subcommand, xport, xpub, omit_headers, out_format, pargs):
         #    <sec_2> <prop_2> <prop_2_value>
         #    ...
         field_data = {
-            "section" : [("default", "tsv"), _("SECTION"), ""],
-            "property" : [("default", "tsv"), _("PROPERTY"), ""],
-            "value" : [("default", "tsv"), _("VALUE"), ""],
+            "section" : [("default", "json", "tsv"), _("SECTION"), ""],
+            "property" : [("default", "json", "tsv"), _("PROPERTY"), ""],
+            "value" : [("default", "json", "tsv"), _("VALUE"), ""],
         }
-        desired_field_order = ((_("SECTION"), _("PROPERTY"), _("VALUE")))
+        desired_field_order = (_("SECTION"), _("PROPERTY"), _("VALUE"))
 
         # Default output formatting.
         def_fmt = "%-" + str(max_sname_len) + "s %-" + str(max_pname_len) + \
             "s %s"
 
         if found or (not req_props and out_format == "default"):
-                print_col_listing(desired_field_order, field_data,
-                    gen_listing(), out_format, def_fmt, omit_headers)
+                # print without trailing newline.
+                sys.stdout.write(misc.get_listing(desired_field_order,
+                    field_data, gen_listing(), out_format, def_fmt,
+                    omit_headers))
 
         if found and notfound:
                 return EXIT_PARTIAL
@@ -612,9 +495,8 @@ def _get_repo(conf, subcommand, xport, xpub, omit_headers, out_format, pargs):
         return EXIT_OK
 
 
-def _get_pub(conf, subcommand, xport, xpub, omit_headers, out_format, pubs,
-    pargs):
-        """Display publisher properties."""
+def _get_matching_pubs(subcommand, pubs, xport, xpub, out_format="default",
+    use_transport=False):
 
         # Retrieve publisher information.
         pub_data = xport.get_publisherdata(xpub)
@@ -622,9 +504,15 @@ def _get_pub(conf, subcommand, xport, xpub, omit_headers, out_format, pubs,
         if len(pubs) > 0 and "all" not in pubs:
                 found = known_pubs & pubs
                 notfound = pubs - found
+                pub_data = [p for p in pub_data if p.prefix in found]
         else:
                 found = known_pubs
                 notfound = set()
+
+        if use_transport:
+                # Assign transport information.
+                for p in pub_data:
+                        p.repository = xpub.repository
 
         # Establish initial return value and perform early exit if appropriate.
         rval = EXIT_OK
@@ -635,7 +523,18 @@ def _get_pub(conf, subcommand, xport, xpub, omit_headers, out_format, pubs,
                         # Don't pollute other output formats.
                         error(_("no matching publishers found"),
                             cmd=subcommand)
-                return EXIT_OOPS
+                return EXIT_OOPS, None, None
+        return rval, found, pub_data
+
+
+def _get_pub(conf, subcommand, xport, xpub, omit_headers, out_format, pubs,
+    pargs):
+        """Display publisher properties."""
+
+        rval, found, pub_data = _get_matching_pubs(subcommand, pubs, xport,
+            xpub, out_format=out_format)
+        if rval == EXIT_OOPS:
+                return rval
 
         # Set minimum widths for section and property name columns by using the
         # length of the column headers and data.
@@ -648,9 +547,6 @@ def _get_pub(conf, subcommand, xport, xpub, omit_headers, out_format, pubs,
         # For each requested publisher, retrieve the requested property data.
         pub_idx = {}
         for pub in pub_data:
-                if pub.prefix not in found:
-                        continue
-
                 pub_idx[pub.prefix] = {
                     "publisher": {
                         "alias": pub.alias,
@@ -658,7 +554,7 @@ def _get_pub(conf, subcommand, xport, xpub, omit_headers, out_format, pubs,
                     },
                 }
 
-                pub_repo = pub.selected_repository
+                pub_repo = pub.repository
                 if pub_repo:
                         pub_idx[pub.prefix]["repository"] = {
                             "collection-type": pub_repo.collection_type,
@@ -720,10 +616,10 @@ def _get_pub(conf, subcommand, xport, xpub, omit_headers, out_format, pubs,
         #    <pub_1>   <sec_2> <prop_2> <prop_2_value>
         #    ...
         field_data = {
-            "publisher" : [("default", "tsv"), _("PUBLISHER"), ""],
-            "section" : [("default", "tsv"), _("SECTION"), ""],
-            "property" : [("default", "tsv"), _("PROPERTY"), ""],
-            "value" : [("default", "tsv"), _("VALUE"), ""],
+            "publisher" : [("default", "json", "tsv"), _("PUBLISHER"), ""],
+            "section" : [("default", "json", "tsv"), _("SECTION"), ""],
+            "property" : [("default", "json", "tsv"), _("PROPERTY"), ""],
+            "value" : [("default", "json", "tsv"), _("VALUE"), ""],
         }
         desired_field_order = (_("PUBLISHER"), _("SECTION"), _("PROPERTY"),
             _("VALUE"))
@@ -733,8 +629,10 @@ def _get_pub(conf, subcommand, xport, xpub, omit_headers, out_format, pubs,
             "s %-" + str(max_pname_len) + "s %s"
 
         if found or (not req_props and out_format == "default"):
-                print_col_listing(desired_field_order, field_data,
-                    gen_listing(), out_format, def_fmt, omit_headers)
+                # print without trailing newline.
+                sys.stdout.write(misc.get_listing(desired_field_order,
+                    field_data, gen_listing(), out_format, def_fmt,
+                    omit_headers))
 
         if found and notfound:
                 rval = EXIT_PARTIAL
@@ -764,7 +662,7 @@ def subcmd_info(conf, args):
                                 usage(_("Unrecognized format %(format)s."
                                     " Supported formats: %(valid)s") % \
                                     { "format": arg,
-                                    "valid": LISTING_FORMATS }, cmd="publisher")
+                                    "valid": LISTING_FORMATS }, cmd=subcommand)
                                 return EXIT_OOPS
                         out_format = arg
                 elif opt == "-H":
@@ -818,10 +716,10 @@ def subcmd_info(conf, args):
         #    <pub_2>   <num_uniq_pkgs> <status> <cat_last_modified>
         #    ...
         field_data = {
-            "publisher" : [("default", "tsv"), _("PUBLISHER"), ""],
-            "packages" : [("default", "tsv"), _("PACKAGES"), ""],
-            "status" : [("default", "tsv"), _("STATUS"), ""],
-            "updated" : [("default", "tsv"), _("UPDATED"), ""],
+            "publisher" : [("default", "json", "tsv"), _("PUBLISHER"), ""],
+            "packages" : [("default", "json", "tsv"), _("PACKAGES"), ""],
+            "status" : [("default", "json", "tsv"), _("STATUS"), ""],
+            "updated" : [("default", "json", "tsv"), _("UPDATED"), ""],
         }
 
         desired_field_order = (_("PUBLISHER"), "", _("PACKAGES"), _("STATUS"),
@@ -834,8 +732,10 @@ def subcmd_info(conf, args):
         def_fmt = "%-" + pub_len + "s %-8s %-16s %s"
 
         if found or (not pubs and out_format == "default"):
-                print_col_listing(desired_field_order, field_data,
-                    gen_listing(), out_format, def_fmt, omit_headers)
+                # print without trailing newline.
+                sys.stdout.write(misc.get_listing(desired_field_order,
+                    field_data, gen_listing(), out_format, def_fmt,
+                    omit_headers))
 
         if found and notfound:
                 return EXIT_PARTIAL
@@ -847,6 +747,153 @@ def subcmd_info(conf, args):
                 return EXIT_OOPS
         return EXIT_OK
 
+def subcmd_list(conf, args):
+        """List all packages matching the specified patterns."""
+
+        subcommand = "list"
+        omit_headers = False
+        out_format = "default"
+        pubs = set()
+
+        opts, pargs = getopt.getopt(args, "F:Hp:s:")
+        for opt, arg in opts:
+                if opt == "-F":
+                        out_format = arg
+                        if out_format not in LISTING_FORMATS:
+                                usage(_("Unrecognized format %(format)s."
+                                    " Supported formats: %(valid)s") %
+                                    { "format": out_format,
+                                    "valid": LISTING_FORMATS }, cmd=subcommand)
+                                return EXIT_OOPS
+                elif opt == "-H":
+                        omit_headers = True
+                elif opt == "-p":
+                        pubs.add(arg)
+                elif opt == "-s":
+                        conf["repo_uri"] = parse_uri(arg)
+
+        # Setup transport so configuration can be retrieved.
+        if not conf.get("repo_uri", None):
+                usage(_("A package repository location must be provided "
+                    "using -s."), cmd=subcommand)
+        xport, xpub, tmp_dir = setup_transport(conf, subcommand=subcommand)
+
+        rval, found, pub_data = _get_matching_pubs(subcommand, pubs, xport,
+            xpub, out_format=out_format, use_transport=True)
+        if rval == EXIT_OOPS:
+                return rval
+
+        temp_root = misc.config_temp_root()
+        progtrack = get_tracker()
+        for pub in pub_data:
+                meta_root = tempfile.mkdtemp(dir=temp_root)
+                tmpdirs.append(meta_root)
+                pub.meta_root = meta_root
+                pub.transport = xport
+
+                progtrack.catalog_start(pub.prefix)
+                try:
+                        pub.refresh(True, True)
+                except apx.TransportError:
+                        # Assume that a catalog doesn't exist for the target
+                        # publisher and drive on.
+                        pass
+                finally:
+                        progtrack.catalog_done()
+
+        listed = {}
+        matched = set()
+        unmatched = set()
+
+        def gen_listing():
+                collect_attrs = out_format.startswith("json")
+                for pub in pub_data:
+                        cat = pub.catalog
+                        for f, states, attrs in cat.gen_packages(
+                            collect_attrs=collect_attrs, matched=matched,
+                            patterns=pargs, pubs=[pub.prefix],
+                            unmatched=unmatched, return_fmris=True):
+                                if not listed:
+                                        listed["packages"] = True
+
+                                state = None
+                                if out_format == "default" or \
+                                    out_format == "tsv":
+                                        if cat.PKG_STATE_OBSOLETE in states:
+                                                state = "o"
+                                        elif cat.PKG_STATE_RENAMED in states:
+                                                state = "r"
+
+                                ret = {
+                                    "publisher": f.publisher,
+                                    "name": f.pkg_name,
+                                    "version": str(f.version),
+                                    "release": str(f.version.release),
+                                    "build-release":
+                                        str(f.version.build_release),
+                                    "branch": str(f.version.branch),
+                                    "timestamp":
+                                        str(f.version.timestr),
+                                    "pkg.fmri": str(f),
+                                    "short_state": state,
+                                }
+
+                                for attr in attrs:
+                                        ret[attr] = []
+                                        for mods in attrs[attr]:
+                                                d = dict(mods)
+                                                d["value"] = \
+                                                    attrs[attr][mods]
+                                                ret[attr].append(d)
+                                yield ret
+
+                        unmatched.difference_update(matched)
+
+        field_data = {
+            "publisher": [("default", "json", "tsv"), _("PUBLISHER"), ""],
+            "name": [("default", "json", "tsv"), _("NAME"), ""],
+            "version": [("default", "json"), _("VERSION"), ""],
+            "release": [("json", "tsv",), _("RELEASE"), ""],
+            "build-release": [("json", "tsv",), _("BUILD RELEASE"), ""],
+            "branch": [("json", "tsv",), _("BRANCH"), ""],
+            "timestamp": [("json", "tsv",), _("PACKAGING DATE"), ""],
+            "pkg.fmri": [("json", "tsv",), _("FMRI"), ""],
+            "short_state": [("default", "tsv"), "O", ""],
+         }
+
+        desired_field_order = (_("PUBLISHER"), _("NAME"), "O", _("VERSION"),
+            _("SUMMARY"), _("DESCRIPTION"), _("CATEGORIES"), _("RELEASE"),
+            _("BUILD RELEASE"), _("BRANCH"), _("PACKAGING DATE"), _("FMRI"),
+            _("STATE"))
+
+        # Default output formatting.
+        max_pub_name_len = str(
+            max(list(len(p) for p in found) + [len(_("PUBLISHER"))]))
+        def_fmt = "%-" + max_pub_name_len + "s %-45s %-1s %-s"
+
+        # print without trailing newline.
+        sys.stdout.write(misc.get_listing(
+            desired_field_order, field_data, gen_listing(),
+            out_format, def_fmt, omit_headers))
+
+        if not listed and pargs:
+                # No matching packages.
+                logger.error("")
+                if not unmatched:
+                        unmatched = pargs
+                error(apx.PackageMatchErrors(unmatched_fmris=unmatched),
+                    cmd=subcommand)
+                return EXIT_OOPS
+        elif unmatched:
+                # One or more patterns didn't match a package from any
+                # publisher; only display the error.
+                logger.error("")
+                error(apx.PackageMatchErrors(unmatched_fmris=unmatched),
+                    cmd=subcommand)
+                return EXIT_PARTIAL
+
+        return EXIT_OK
+
 
 def subcmd_rebuild(conf, args):
         """Rebuild the repository's catalog and index data (as permitted)."""
@@ -855,9 +902,15 @@ def subcmd_rebuild(conf, args):
         build_catalog = True
         build_index = True
 
-        opts, pargs = getopt.getopt(args, "s:", ["no-catalog", "no-index"])
+        opts, pargs = getopt.getopt(args, "p:s:", ["no-catalog", "no-index"])
+        pubs = set()
         for opt, arg in opts:
-                if opt == "-s":
+                if opt == "-p":
+                        if not misc.valid_pub_prefix(arg):
+                                error(_("Invalid publisher prefix '%s'") % arg,
+                                    cmd=subcommand)
+                        pubs.add(arg)
+                elif opt == "-s":
                         conf["repo_uri"] = parse_uri(arg)
                 elif opt == "--no-catalog":
                         build_catalog = False
@@ -875,17 +928,27 @@ def subcmd_rebuild(conf, args):
         if not conf.get("repo_uri", None):
                 usage(_("A package repository location must be provided "
                     "using -s."), cmd=subcommand)
-        xport, src_pub, tmp_dir = setup_transport(conf, subcommand=subcommand)
 
-        logger.info("Repository rebuild initiated.")
-        if build_catalog and build_index:
-                xport.publish_rebuild(src_pub)
-        elif build_catalog:
-                xport.publish_rebuild_packages(src_pub)
-        elif build_index:
-                xport.publish_rebuild_indexes(src_pub)
+        def do_rebuild(xport, xpub):
+                if build_catalog and build_index:
+                        xport.publish_rebuild(xpub)
+                elif build_catalog:
+                        xport.publish_rebuild_packages(xpub)
+                elif build_index:
+                        xport.publish_rebuild_indexes(xpub)
 
-        return EXIT_OK
+        xport, xpub, tmp_dir = setup_transport(conf, subcommand=subcommand)
+        rval, found, pub_data = _get_matching_pubs(subcommand, pubs, xport,
+            xpub)
+        if rval == EXIT_OOPS:
+                return rval
+
+        logger.info("Initiating repository rebuild.")
+        for pfx in found:
+                xpub.prefix = pfx
+                do_rebuild(xport, xpub)
+
+        return rval
 
 
 def subcmd_refresh(conf, args):
@@ -895,9 +958,15 @@ def subcmd_refresh(conf, args):
         add_content = True
         refresh_index = True
 
-        opts, pargs = getopt.getopt(args, "s:", ["no-catalog", "no-index"])
+        opts, pargs = getopt.getopt(args, "p:s:", ["no-catalog", "no-index"])
+        pubs = set()
         for opt, arg in opts:
-                if opt == "-s":
+                if opt == "-p":
+                        if not misc.valid_pub_prefix(arg):
+                                error(_("Invalid publisher prefix '%s'") % arg,
+                                    cmd=subcommand)
+                        pubs.add(arg)
+                elif opt == "-s":
                         conf["repo_uri"] = parse_uri(arg)
                 elif opt == "--no-catalog":
                         add_content = False
@@ -915,23 +984,33 @@ def subcmd_refresh(conf, args):
         if not conf.get("repo_uri", None):
                 usage(_("A package repository location must be provided "
                     "using -s."), cmd=subcommand)
-        xport, src_pub, tmp_dir = setup_transport(conf, subcommand=subcommand)
 
-        logger.info("Repository refresh initiated.")
-        if add_content and refresh_index:
-                xport.publish_refresh(src_pub)
-        elif add_content:
-                xport.publish_refresh_packages(src_pub)
-        elif refresh_index:
-                xport.publish_refresh_indexes(src_pub)
-        return EXIT_OK
+        def do_refresh(xport, xpub):
+                if add_content and refresh_index:
+                        xport.publish_refresh(xpub)
+                elif add_content:
+                        xport.publish_refresh_packages(xpub)
+                elif refresh_index:
+                        xport.publish_refresh_indexes(xpub)
+
+        xport, xpub, tmp_dir = setup_transport(conf, subcommand=subcommand)
+        rval, found, pub_data = _get_matching_pubs(subcommand, pubs, xport,
+            xpub)
+        if rval == EXIT_OOPS:
+                return rval
+
+        logger.info("Initiating repository refresh.")
+        for pfx in found:
+                xpub.prefix = pfx
+                do_refresh(xport, xpub)
+
+        return rval
 
 
 def subcmd_set(conf, args):
         """Set repository properties."""
 
         subcommand = "set"
-        omit_headers = False
         pubs = set()
 
         opts, pargs = getopt.getopt(args, "p:s:")
@@ -994,13 +1073,12 @@ def subcmd_set(conf, args):
 
         # Set properties.
         if pubs:
-                return _set_pub(conf, subcommand, omit_headers, props, pubs,
-                    repo)
+                return _set_pub(conf, subcommand, props, pubs, repo)
 
-        return _set_repo(conf, subcommand, omit_headers, props, repo)
+        return _set_repo(conf, subcommand, props, repo)
 
 
-def _set_pub(conf, subcommand, omit_headers, props, pubs, repo):
+def _set_pub(conf, subcommand, props, pubs, repo):
         """Set publisher properties."""
 
         for sname, sprops in props.iteritems():
@@ -1047,10 +1125,10 @@ def _set_pub(conf, subcommand, omit_headers, props, pubs, repo):
                                 if sname == "publisher":
                                         target = pub
                                 elif sname == "repository":
-                                        target = pub.selected_repository
+                                        target = pub.repository
                                         if not target:
                                                 target = publisher.Repository()
-                                                pub.repositories.append(target)
+                                                pub.repository = target
 
                                 for pname, val in sprops.iteritems():
                                         attrname = pname.replace("-", "_")
@@ -1085,7 +1163,7 @@ def _set_pub(conf, subcommand, omit_headers, props, pubs, repo):
         return EXIT_OK
 
 
-def _set_repo(conf, subcommand, omit_headers, props, repo):
+def _set_repo(conf, subcommand, props, repo):
         """Set repository properties."""
 
         # Set properties.
@@ -1109,18 +1187,6 @@ def subcmd_version(conf, args):
 
 def main_func():
         global_settings.client_name = PKG_CLIENT_NAME
-
-        global orig_cwd
-
-        try:
-                orig_cwd = os.getcwd()
-        except OSError, e:
-                try:
-                        orig_cwd = os.environ["PWD"]
-                        if not orig_cwd or orig_cwd[0] != "/":
-                                orig_cwd = None
-                except KeyError:
-                        orig_cwd = None
 
         try:
                 opts, pargs = getopt.getopt(sys.argv[1:], "s:?",
@@ -1170,11 +1236,8 @@ def handle_errors(func, *args, **kwargs):
         a message and/or exit with an appropriate return code.
         """
 
-        traceback_str = _("\n\nThis is an internal error.  Please let the "
-            "developers know about this\nproblem by filing a bug at "
-            "http://defect.opensolaris.org and including the\nabove "
-            "traceback and this message.  The version of pkg(5) is "
-            "'%s'.") % pkg.VERSION
+        traceback_str = misc.get_traceback_message()
+
         try:
                 # Out of memory errors can be raised as EnvironmentErrors with
                 # an errno of ENOMEM, so in order to handle those exceptions
@@ -1190,9 +1253,11 @@ def handle_errors(func, *args, **kwargs):
                         __ret = EXIT_OOPS
         except SystemExit, __e:
                 raise __e
-        except (PipeError, KeyboardInterrupt):
+        except (IOError, PipeError, KeyboardInterrupt), __e:
                 # Don't display any messages here to prevent possible further
                 # broken pipe (EPIPE) errors.
+                if isinstance(__e, IOError) and __e.errno != errno.EPIPE:
+                        error(str(__e))
                 __ret = EXIT_OOPS
         except apx.VersionException, __e:
                 error(_("The pkgrepo command appears out of sync with the "

@@ -21,8 +21,7 @@
 #
 
 #
-# Copyright 2010 Sun Microsystems, Inc.  All rights reserved.
-# Use is subject to license terms.
+# Copyright (c) 2007, 2011, Oracle and/or its affiliates. All rights reserved.
 #
 
 """module describing a directory packaging object
@@ -45,19 +44,28 @@ class DirectoryAction(generic.Action):
 
         name = "dir"
         key_attr = "path"
-        globally_unique = True
-
-        def __init__(self, data=None, **attrs):
-                generic.Action.__init__(self, data, **attrs)
-                if "path" in self.attrs:
-                        self.attrs["path"] = self.attrs["path"].lstrip(
-                            os.path.sep)
-                        if not self.attrs["path"]:
-                                raise pkg.actions.InvalidActionError(
-                                    str(self), _("Empty path attribute"))
+        unique_attrs = "path", "mode", "owner", "group"
+        globally_identical = True
+        refcountable = True
+        namespace_group = "path"
 
         def compare(self, other):
                 return cmp(self.attrs["path"], other.attrs["path"])
+
+        def differences(self, other):
+                """Returns a list of attributes that have different values
+                between 'other' and 'self'.  This differs from the generic
+                Action's differences() method in that it normalizes the 'mode'
+                attribute so that, say, '0755' and '755' are treated as
+                identical."""
+
+                diffs = generic.Action.differences(self, other)
+
+                if "mode" in diffs and \
+                    int(self.attrs.get("mode", "0"), 8) == int(other.attrs.get("mode", "0"), 8):
+                        diffs.remove("mode")
+
+                return diffs
 
         def directory_references(self):
                 return [os.path.normpath(self.attrs["path"])]
@@ -140,13 +148,22 @@ class DirectoryAction(generic.Action):
                                         # file, or a package has been poorly
                                         # implemented.  Salvage what's there,
                                         # and drive on.
-                                        pkgplan.image.salvage(path)
+                                        pkgplan.salvage(path)
                                         os.mkdir(path, mode)
                                 elif stat.S_ISDIR(fs_mode):
                                         # The directory already exists, but
                                         # ensure that the mode matches what's
                                         # expected.
                                         os.chmod(path, mode)
+                        # if we're salvaging contents, move 'em now.
+                        # directories with "salvage-from" attribute
+                        # set will scavenge any available contents
+                        # that matches specified directory and
+                        # move it underneath itself on initial install.
+                        # This is here to support directory rename
+                        # when old directory has unpackaged contents
+                        for salvage_from in self.attrlist("salvage-from"):
+                                pkgplan.salvage_from(salvage_from, path)
 
                 # The downside of chmodding the directory is that as a non-root
                 # user, if we set perms u-w, we won't be able to put anything in
@@ -190,12 +207,12 @@ class DirectoryAction(generic.Action):
                         elif e.errno in (errno.EEXIST, errno.ENOTEMPTY):
                                 # Cannot remove directory since it's
                                 # not empty.
-                                pkgplan.image.salvage(path)
+                                pkgplan.salvage(path)
                         elif e.errno == errno.ENOTDIR:
                                 # Either the user or another package has changed
                                 # this directory into a link or file.  Salvage
                                 # what's there and drive on.
-                                pkgplan.image.salvage(path)
+                                pkgplan.salvage(path)
                         elif e.errno == errno.EBUSY and os.path.ismount(path):
                                 # User has replaced directory with mountpoint,
                                 # or a package has been poorly implemented.
@@ -224,10 +241,10 @@ class DirectoryAction(generic.Action):
                 generic.py for a more detailed explanation."""
 
                 return [
-                    ("directory", "basename",
+                    (self.name, "basename",
                     os.path.basename(self.attrs["path"].rstrip(os.path.sep)),
                     None),
-                    ("directory", "path", os.path.sep + self.attrs["path"],
+                    (self.name, "path", os.path.sep + self.attrs["path"],
                     None)
                 ]
 
@@ -242,4 +259,9 @@ class DirectoryAction(generic.Action):
                 'fmri' is an optional package FMRI (object or string) indicating
                 what package contained this action."""
 
-                return self.validate_fsobj_common(fmri=fmri)
+                errors = generic.Action._validate(self, fmri=fmri,
+                    raise_errors=False, required_attrs=("owner", "group"))
+                errors.extend(self._validate_fsobj_common())
+                if errors:
+                        raise pkg.actions.InvalidActionAttributesError(self,
+                            errors, fmri=fmri)

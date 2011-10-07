@@ -22,20 +22,19 @@
 
 # Copyright (c) 2007, 2011, Oracle and/or its affiliates. All rights reserved.
 
-import calendar
+import OpenSSL.crypto as osc
 import cStringIO
+import calendar
 import datetime
 import errno
+import getopt
 import hashlib
 import locale
-import OpenSSL.crypto as osc
-import operator
 import os
-import pkg.client.api_errors as api_errors
-import pkg.portable as portable
 import platform
 import re
 import shutil
+import simplejson as json
 import stat
 import struct
 import sys
@@ -44,9 +43,14 @@ import urllib
 import urlparse
 import zlib
 
-from pkg.pkggzip import PkgGzipFile
-from pkg.client.imagetypes import img_type_names, IMG_NONE
+import pkg.client.api_errors as api_errors
+import pkg.portable as portable
+
 from pkg import VERSION
+from pkg.client import global_settings
+from pkg.client.debugvalues import DebugValues
+from pkg.client.imagetypes import img_type_names, IMG_NONE
+from pkg.pkggzip import PkgGzipFile
 
 # Minimum number of days to issue warning before a certificate expires
 MIN_WARN_DAYS = datetime.timedelta(days=30)
@@ -57,13 +61,28 @@ PKG_STATE_INSTALLED = 2
 # Constant string used across many modules as a property name.
 SIGNATURE_POLICY = "signature-policy"
 
+# Bug URI Constants (deprecated)
+BUG_URI_CLI = "https://defect.opensolaris.org/bz/enter_bug.cgi?product=pkg&component=cli"
+BUG_URI_GUI = "https://defect.opensolaris.org/bz/enter_bug.cgi?product=pkg&component=gui"
+
+# Traceback message.
+def get_traceback_message():
+        """This function returns the standard traceback message.  A function
+        is necessary since the _() call must be done at runtime after locale
+        setup."""
+
+        return _("""\n
+This is an internal error in pkg(5) version %(version)s.  Please log a
+Service Request about this issue including the information above and this
+message.""") % { "version": VERSION }
+
 def get_release_notes_url():
         """Return a release note URL pointing to the correct release notes
            for this version"""
 
         # TBD: replace with a call to api.info() that can return a "release"
         # attribute of form YYYYMM against the SUNWsolnm package
-        return "http://download.oracle.com/docs/cd/E19963-01/"
+        return "http://www.oracle.com/pls/topic/lookup?ctx=E23824&id=SERNS"
 
 def time_to_timestamp(t):
         """convert seconds since epoch to %Y%m%dT%H%M%SZ format"""
@@ -74,6 +93,10 @@ def timestamp_to_time(ts):
         """convert %Y%m%dT%H%M%SZ format to seconds since epoch"""
         # XXX optimize?
         return calendar.timegm(time.strptime(ts, "%Y%m%dT%H%M%SZ"))
+
+def timestamp_to_datetime(ts):
+        """convert %Y%m%dT%H%M%SZ format to a datetime object"""
+        return datetime.datetime.strptime(ts,"%Y%m%dT%H%M%SZ")
 
 def copyfile(src_path, dst_path):
         """copy a file, preserving attributes, ownership, etc. where possible"""
@@ -116,8 +139,8 @@ def user_agent_str(img, client_name):
 
         return useragent
 
-_hostname_re = re.compile("^[a-zA-Z0-9](?:[a-zA-Z0-9\-]*[a-zA-Z0-9]+\.?)*$")
-_invalid_host_chars = re.compile(".*[^a-zA-Z0-9\-\.]+")
+_hostname_re = re.compile("^[a-zA-Z0-9\[](?:[a-zA-Z0-9\-:]*[a-zA-Z0-9:\]]+\.?)*$")
+_invalid_host_chars = re.compile(".*[^a-zA-Z0-9\-\.:\[\]]+")
 _valid_proto = ["file", "http", "https"]
 
 def valid_pub_prefix(prefix):
@@ -284,6 +307,10 @@ def setlocale(category, loc=None, printer=None):
                 printer("Unable to set locale%s; locale package may be broken "
                     "or\nnot installed.  Reverting to C locale." % dl)
                 locale.setlocale(category, "C")
+def N_(message):
+        """Return its argument; used to mark strings for localization when
+        their use is delayed by the program."""
+        return message
 
 def bytes_to_str(bytes, format=None):
         """Returns a human-formatted string representing the number of bytes
@@ -589,7 +616,7 @@ class DictProperty(object):
                                 raise AttributeError, "can't iterate"
                         return self.__iter(self.__obj)
 
-        def __init__(self, fget=None, fset=None, fdel=None, iteritems=None, 
+        def __init__(self, fget=None, fset=None, fdel=None, iteritems=None,
             keys=None, values=None, iterator=None, doc=None, fgetdefault=None,
             fsetdefault=None, update=None, pop=None):
                 self.__fget = fget
@@ -608,20 +635,11 @@ class DictProperty(object):
         def __get__(self, obj, objtype=None):
                 if obj is None:
                         return self
-                return self.__InternalProxy(obj, self.__fget, self.__fset, 
+                return self.__InternalProxy(obj, self.__fget, self.__fset,
                     self.__fdel, self.__iteritems, self.__keys, self.__values,
                     self.__iter, self.__fgetdefault, self.__fsetdefault,
                     self.__update, self.__pop)
 
-        
-def get_sorted_publishers(pubs, preferred=None):
-        spubs = []
-        for p in sorted(pubs, key=operator.attrgetter("prefix")):
-                if preferred and preferred == p.prefix:
-                        spubs.insert(0, p)
-                else:
-                        spubs.append(p)
-        return spubs
 
 def build_cert(path, uri=None, pub=None):
         """Take the file given in path, open it, and use it to create
@@ -735,14 +753,21 @@ def config_temp_root():
 
         return default_root
 
-def parse_uri(uri):
+def parse_uri(uri, cwd=None):
         """Parse the repository location provided and attempt to transform it
         into a valid repository URI.
+
+        'cwd' is the working directory to use to turn paths into an absolute
+        path.  If not provided, the current working directory is used.
         """
 
         if uri.find("://") == -1 and not uri.startswith("file:/"):
                 # Convert the file path to a URI.
-                uri = os.path.abspath(uri)
+                if not cwd:
+                        uri = os.path.abspath(uri)
+                elif not os.path.isabs(uri):
+                        uri = os.path.normpath(os.path.join(cwd, uri))
+
                 uri = urlparse.urlunparse(("file", "",
                     urllib.pathname2url(uri), "", "", ""))
 
@@ -816,13 +841,14 @@ class Singleton(type):
         def __init__(self, name, bases, dictionary):
                 super(Singleton, self).__init__(name, bases, dictionary)
                 self.instance = None
- 
+
         def __call__(self, *args, **kw):
                 if self.instance is None:
                         self.instance = super(Singleton, self).__call__(*args,
                             **kw)
- 
+
                 return self.instance
+
 
 EmptyDict = ImmutableDict()
 
@@ -842,3 +868,409 @@ def relpath(path, start="."):
         if path and start and start == "/" and path[0] == "/":
                 return path.lstrip("/")
         return os.path.relpath(path, start=start)
+
+def recursive_chown_dir(d, uid, gid):
+        """Change the ownership of all files under directory d to uid:gid."""
+        for dirpath, dirnames, filenames in os.walk(d):
+                for name in dirnames:
+                        path = os.path.join(dirpath, name)
+                        portable.chown(path, uid, gid)
+                for name in filenames:
+                        path = os.path.join(dirpath, name)
+                        portable.chown(path, uid, gid)
+def opts_parse(op, api_inst, args, table, pargs_limit, usage_cb):
+        """Generic table-based options parsing function.  Returns a tuple
+        consisting of a dictionary of parsed options and the remaining
+        unparsed options.
+
+        'op' is the operation being performed.
+
+        'api_inst' is an image api object that is passed to options handling
+        callbacks (passed in via 'table').
+
+        'args' is the arguments that should be parsed.
+
+        'table' is a list of options and callbacks.Each entry is either a
+        a tuple or a callback function.
+
+        tuples in 'table' specify allowable options and have the following
+        format:
+
+                (<short opt>, <long opt>, <key>, <default value>)
+
+        An example of a short opt is "f", which maps to a "-f" option.  An
+        example of a long opt is "foo", which maps to a "--foo" option.  Key
+        is the value of this option in the parsed option dictionary.  The
+        default value not only represents the default value assigned to the
+        option, but it also implicitly determines how the option is parsed.  If
+        the default value is True or False, the option doesn't take any
+        arguments, can only be specified once, and if specified it inverts the
+        default value.  If the default value is 0, the option doesn't take any
+        arguments, can be specified multiple times, and if specified its value
+        will be the number of times it was seen.  If the default value is
+        None, the option requires an argument, can only be specified once, and
+        if specified its value will be its argument string.  If the default
+        value is an empty list, the option requires an argument, may be
+        specified multiple times, and if specified its value will be a list
+        with all the specified argument values.
+
+        callbacks in 'table' specify callback functions that are invoked after
+        all options have been parsed.  Callback functions must have the
+        following signature:
+                callback(api_inst, opts, opts_new)
+
+        The opts parameter is a dictionary containing all the raw, parsed
+        options.  Callbacks should never update the contents of this
+        dictionary.  The opts_new parameter is a dictionary which is initially
+        a copy of the opts dictionary.  This is the dictionary that will be
+        returned to the caller of opts_parse().  If a callback function wants
+        to update the arguments dictionary that will be returned to the
+        caller, they should make all their updates to the opts_new dictionary.
+
+        'pargs_limit' specified how to handle extra arguments not parsed by
+        getops.  A value of -1 indicates that we allow an unlimited number of
+        extra arguments.  A value of 0 or greater indicates the number of
+        allowed additional unparsed options.
+
+        'usage_cb' is a function pointer that should display usage information
+        and will be invoked if invalid arguments are detected."""
+
+
+        assert type(table) == list
+
+        # return dictionary
+        rv = dict()
+
+        # option string passed to getopt
+        opts_s_str = ""
+        # long options list passed to getopt
+        opts_l_list = list()
+
+        # dict to map options returned by getopt to keys
+        opts_keys = dict()
+
+        # sanity checking to make sure each option is unique
+        opts_s_set = set()
+        opts_l_set = set()
+        opts_seen = dict()
+
+        # callbacks to invoke after processing options
+        callbacks = []
+
+        # process each option entry
+        for entry in table:
+                # check for a callback
+                if type(entry) != tuple:
+                        callbacks.append(entry)
+                        continue
+
+                # decode the table entry
+                # s: a short option, ex: -f
+                # l: a long option, ex: --foo
+                # k: the key value for the options dictionary
+                # v: the default value
+                (s, l, k, v) = entry
+
+                # make sure an option was specified
+                assert s or l
+                # sanity check the default value
+                assert (v == None) or (v == []) or \
+                    (type(v) == bool) or (type(v) == int)
+                # make sure each key is unique
+                assert k not in rv
+                # initialize the default return dictionary entry.
+                rv[k] = v
+                if l:
+                        # make sure each option is unique
+                        assert set([l]) not in opts_l_set
+                        opts_l_set |= set([l])
+
+                        if type(v) == bool:
+                                v = not v
+                                opts_l_list.append("%s" % l)
+                        elif type(v) == int:
+                                opts_l_list.append("%s" % l)
+                        else:
+                                opts_l_list.append("%s=" % l)
+                        opts_keys["--%s" % l] = k
+                if s:
+                        # make sure each option is unique
+                        assert set([s]) not in opts_s_set
+                        opts_s_set |= set([s])
+
+                        if type(v) == bool:
+                                v = not v
+                                opts_s_str += "%s" % s
+                        elif type(v) == int:
+                                opts_s_str += "%s" % s
+                        else:
+                                opts_s_str += "%s:" % s
+                        opts_keys["-%s" % s] = k
+
+        # parse options
+        try:
+                opts, pargs = getopt.getopt(args, opts_s_str, opts_l_list)
+        except getopt.GetoptError, e:
+                usage_cb(_("illegal option -- %s") % e.opt, cmd=op)
+
+        if (pargs_limit >= 0) and (pargs_limit < len(pargs)):
+                usage_cb(_("illegal argument -- %s") % pargs[pargs_limit],
+                    cmd=op)
+
+        # update options dictionary with the specified options
+        for opt, arg in opts:
+                k = opts_keys[opt]
+                v = rv[k]
+
+                # check for duplicate options
+                if k in opts_seen and (type(v) != list and type(v) != int):
+                        if opt == opts_seen[k]:
+                                usage_cb(_("option '%s' repeated") % opt,
+                                    cmd=op)
+                        usage_cb(_("'%s' and '%s' have the same meaning") %
+                            (opts_seen[k], opt), cmd=op)
+                opts_seen[k] = opt
+
+                # update the return dict value
+                if type(v) == bool:
+                        rv[k] = not rv[k]
+                elif type(v) == list:
+                        rv[k].append(arg)
+                elif type(v) == int:
+                        rv[k] += 1
+                else:
+                        rv[k] = arg
+
+        # invoke callbacks (cast to set() to eliminate dups)
+        rv_updated = rv.copy()
+        for cb in set(callbacks):
+                cb(op, api_inst, rv, rv_updated)
+
+        return (rv_updated, pargs)
+
+def api_cmdpath():
+        """Returns the path to the executable that is invoking the api client
+        interfaces."""
+
+        cmdpath = None
+
+        if global_settings.client_args[0]:
+                cmdpath = os.path.realpath(os.path.join(sys.path[0],
+                    os.path.basename(global_settings.client_args[0])))
+
+        if "PKG_CMDPATH" in os.environ:
+                cmdpath = os.environ["PKG_CMDPATH"]
+
+        if DebugValues.get_value("simulate_cmdpath"):
+                cmdpath = DebugValues.get_value("simulate_cmdpath")
+
+        return cmdpath
+
+def liveroot():
+        """Return path to the current live root image, i.e. the image
+        that we are running from."""
+
+        live_root = DebugValues.get_value("simulate_live_root")
+        if not live_root and "PKG_LIVE_ROOT" in os.environ:
+                live_root = os.environ["PKG_LIVE_ROOT"]
+        if not live_root:
+                live_root = "/"
+        return live_root
+
+def spaceavail(path):
+        """Find out how much space is available at the specified path if
+        it exists; return -1 if path doesn't exist"""
+        try:
+                res = os.statvfs(path)
+                return res.f_frsize * res.f_bavail
+        except OSError:
+                return -1
+
+def get_dir_size(path):
+        """Return the size (in bytes) of a directory and all of its contents."""
+        try:
+                return sum(
+                    os.path.getsize(os.path.join(d, fname))
+                    for d, dnames, fnames in os.walk(path)
+                    for fname in fnames
+                )
+        except EnvironmentError, e:
+                raise api_errors._convert_error(e)
+
+def get_listing(desired_field_order, field_data, field_values, out_format,
+    def_fmt, omit_headers, escape_output=True):
+        """Returns a string containing a listing defined by provided values
+        in the specified output format.
+
+        'desired_field_order' is the list of the fields to show in the order
+        they should be output left to right.
+
+        'field_data' is a dictionary of lists of the form:
+          {
+            field_name1: {
+              [(output formats), field header, initial field value]
+            },
+            field_nameN: {
+              [(output formats), field header, initial field value]
+            }
+          }
+
+        'field_values' is a generator or list of dictionaries of the form:
+          {
+            field_name1: field_value,
+            field_nameN: field_value
+          }
+
+        'out_format' is the format to use for output.  Currently 'default',
+        'tsv', 'json', and 'json-formatted' are supported.  The first is
+        intended for columnar, human-readable output, and the others for
+        parsable output.
+
+        'def_fmt' is the default Python formatting string to use for the
+        'default' human-readable output.  It must match the fields defined
+        in 'field_data'.
+
+        'omit_headers' is a boolean specifying whether headers should be
+        included in the listing.  (If applicable to the specified output
+        format.)
+
+        'escape_output' is an optional boolean indicating whether shell
+        metacharacters or embedded control sequences should be escaped
+        before display.  (If applicable to the specified output format.)
+        """
+
+        # Custom sort function for preserving field ordering
+        def sort_fields(one, two):
+                return desired_field_order.index(get_header(one)) - \
+                    desired_field_order.index(get_header(two))
+
+        # Functions for manipulating field_data records
+        def filter_default(record):
+                return "default" in record[0]
+
+        def filter_tsv(record):
+                return "tsv" in record[0]
+
+        def get_header(record):
+                return record[1]
+
+        def get_value(record):
+                return record[2]
+
+        def quote_value(val):
+                if out_format == "tsv":
+                        # Expand tabs if tsv output requested.
+                        val = val.replace("\t", " " * 8)
+                nval = val
+                # Escape bourne shell metacharacters.
+                for c in ("\\", " ", "\t", "\n", "'", "`", ";", "&", "(", ")",
+                    "|", "^", "<", ">"):
+                        nval = nval.replace(c, "\\" + c)
+                return nval
+
+        def set_value(entry):
+                val = entry[1]
+                multi_value = False
+                if isinstance(val, (list, tuple, set, frozenset)):
+                        multi_value = True
+                elif val == "":
+                        entry[0][2] = '""'
+                        return
+                elif val is None:
+                        entry[0][2] = ''
+                        return
+                else:
+                        val = [val]
+
+                nval = []
+                for v in val:
+                        if v == "":
+                                # Indicate empty string value using "".
+                                nval.append('""')
+                        elif v is None:
+                                # Indicate no value using empty string.
+                                nval.append('')
+                        elif escape_output:
+                                # Otherwise, escape the value to be displayed.
+                                nval.append(quote_value(str(v)))
+                        else:
+                                # Caller requested value not be escaped.
+                                nval.append(str(v))
+
+                val = " ".join(nval)
+                nval = None
+                if multi_value:
+                        val = "(%s)" % val
+                entry[0][2] = val
+
+        if out_format == "default":
+                # Create a formatting string for the default output
+                # format.
+                fmt = def_fmt
+                filter_func = filter_default
+        elif out_format == "tsv":
+                # Create a formatting string for the tsv output
+                # format.
+                num_fields = sum(
+                    1 for k in field_data
+                    if filter_tsv(field_data[k])
+                )
+                fmt = "\t".join('%s' for x in xrange(num_fields))
+                filter_func = filter_tsv
+        elif out_format == "json" or out_format == "json-formatted":
+                args = { "sort_keys": True }
+                if out_format == "json-formatted":
+                        args["indent"] = 2
+
+                # 'json' formats always include any extra fields returned;
+                # any explicitly named fields are only included if 'json'
+                # is explicitly listed.
+                def fmt_val(v):
+                        if isinstance(v, basestring):
+                                return v
+                        if isinstance(v, (list, tuple, set, frozenset)):
+                                return [fmt_val(e) for e in v]
+                        if isinstance(v, dict):
+                                for k, e in v.items():
+                                        v[k] = fmt_val(e)
+                                return v
+                        return str(v)
+
+                output = json.dumps([
+                    dict(
+                        (k, fmt_val(entry[k]))
+                        for k in entry
+                        if k not in field_data or "json" in field_data[k][0]
+                    )
+                    for entry in field_values
+                ], **args)
+
+                if out_format == "json-formatted":
+                        # Include a trailing newline for readability.
+                        return output + "\n"
+                return output
+
+        # Extract the list of headers from the field_data dictionary.  Ensure
+        # they are extracted in the desired order by using the custom sort
+        # function.
+        hdrs = map(get_header, sorted(filter(filter_func, field_data.values()),
+            sort_fields))
+
+        # Output a header if desired.
+        output = ""
+        if not omit_headers:
+                output += fmt % tuple(hdrs)
+                output += "\n"
+
+        for entry in field_values:
+                map(set_value, (
+                    (field_data[f], v)
+                    for f, v in entry.iteritems()
+                    if f in field_data
+                ))
+                values = map(get_value, sorted(filter(filter_func,
+                    field_data.values()), sort_fields))
+                output += fmt % tuple(values)
+                output += "\n"
+
+        return output

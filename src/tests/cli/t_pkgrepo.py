@@ -21,7 +21,7 @@
 #
 
 #
-# Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2010, 2011, Oracle and/or its affiliates. All rights reserved.
 #
 
 import testutils
@@ -32,6 +32,7 @@ import pkg5unittest
 from pkg.server.query_parser import Query
 import os
 import pkg
+import pkg.catalog
 import pkg.depotcontroller as dc
 import pkg.fmri as fmri
 import pkg.misc as misc
@@ -46,26 +47,49 @@ import unittest
 class TestPkgRepo(pkg5unittest.SingleDepotTestCase):
         # Cleanup after every test.
         persistent_setup = False
+        # Tests in this suite use the read only data directory.
+        need_ro_data = True
 
         tree10 = """
-            open tree@1.0,5.11-0
+            open tree@1.0,5.11-0:20110804T203458Z
+            add file tmp/empty mode=0555 owner=root group=bin path=/etc/empty
+            add file tmp/truck1 mode=0444 owner=root group=bin path=/etc/trailer
+            add set name=info.classification value=org.opensolaris.category.2008:System/Core
+            add set name=pkg.summary value="Leafy SPARC package" variant.arch=sparc
+            add set name=pkg.summary value="Leafy i386 package" variant.arch=i386
+            add set name=variant.arch value=i386 value=sparc
             close
         """
 
         amber10 = """
-            open amber@1.0,5.11-0
+            open amber@1.0,5.11-0:20110804T203458Z
             add depend fmri=pkg:/tree@1.0 type=require
+            add set name=pkg.summary value="Millenia old resin"
+            add set name=pkg.human-version value="1.0a"
             close
         """
 
         amber20 = """
-            open amber@2.0,5.11-0
+            open amber@2.0,5.11-0:20110804T203458Z
             add depend fmri=pkg:/tree@1.0 type=require
             close
         """
 
+        amber30 = """
+            open amber@3.0,5.11-0:20110804T203458Z
+            add set name=pkg.renamed value=true
+            add depend fmri=pkg:/bronze@1.0 type=require
+            close
+        """
+
+        amber40 = """
+            open amber@4.0,5.11-0:20110804T203458Z
+            add set name=pkg.obsolete value=true
+            close
+        """
+
         truck10 = """
-            open truck@1.0,5.11-0
+            open truck@1.0,5.11-0:20110804T203458Z
             add file tmp/empty mode=0555 owner=root group=bin path=/etc/NOTICES/empty
             add file tmp/truck1 mode=0444 owner=root group=bin path=/etc/truck1
             add depend fmri=pkg:/amber@1.0 type=require
@@ -73,7 +97,7 @@ class TestPkgRepo(pkg5unittest.SingleDepotTestCase):
         """
 
         truck20 = """
-            open truck@2.0,5.11-0
+            open truck@2.0,5.11-0:20110804T203458Z
             add file tmp/empty mode=0555 owner=root group=bin path=/etc/NOTICES/empty
             add file tmp/truck1 mode=0444 owner=root group=bin path=/etc/truck1
             add file tmp/truck2 mode=0444 owner=root group=bin path=/etc/truck2
@@ -82,21 +106,19 @@ class TestPkgRepo(pkg5unittest.SingleDepotTestCase):
         """
 
         zoo10 = """
-            open zoo@1.0,5.11-0
+            open zoo@1.0,5.11-0:20110804T203458Z
             close
         """
 
+        fhashes = {
+             "tmp/empty": "5f5fb715934e0fa2bfb5611fd941d33228027006",
+             "tmp/truck1": "c9e257b659ace6c3fbc4d334f49326b3889fd109",
+             "tmp/truck2": "c07fd27b5b57f8131f42e5f2c719a469d9fc71c5",
+        }
+
         def setUp(self):
                 pkg5unittest.SingleDepotTestCase.setUp(self)
-                self.make_misc_files(["tmp/empty", "tmp/truck1",
-                    "tmp/truck2"])
-
-                self.path_to_certs = os.path.join(self.ro_data_root,
-                    "signing_certs", "produced")
-                self.pub_cas_dir = os.path.join(self.path_to_certs,
-                    "publisher_cas")
-                self.inter_certs_dir = os.path.join(self.path_to_certs,
-                    "inter_certs")
+                self.make_misc_files(["tmp/empty", "tmp/truck1", "tmp/truck2"])
 
         def test_00_base(self):
                 """Verify pkgrepo handles basic option and subcommand parsing
@@ -105,7 +127,7 @@ class TestPkgRepo(pkg5unittest.SingleDepotTestCase):
 
                 # --help, -? should exit with 0.
                 self.pkgrepo("--help", exit=0)
-                self.pkgrepo("-?", exit=0)
+                self.pkgrepo("'-?'", exit=0)
 
                 # unknown options should exit with 2.
                 self.pkgrepo("-U", exit=2)
@@ -191,30 +213,28 @@ class TestPkgRepo(pkg5unittest.SingleDepotTestCase):
                 for uri in (repo_uri, depot_uri):
                         self.pkgrepo("get -s %s" % uri)
                         expected = """\
-SECTION    PROPERTY           VALUE
-feed       description        ""
-feed       icon               web/_themes/pkg-block-icon.png
-feed       id                 ""
-feed       logo               web/_themes/pkg-block-logo.png
-feed       name               package\ repository\ feed
-feed       window             24
-publisher  alias              ""
-publisher  intermediate_certs ()
-publisher  prefix             test
-publisher  signing_ca_certs   ()
-repository collection_type    core
-repository description        ""
-repository detailed_url       ""
-repository legal_uris         ()
-repository maintainer         ""
-repository maintainer_url     ""
-repository mirrors            ()
-repository name               package\ repository
-repository origins            ()
-repository refresh_seconds    14400
-repository registration_uri   ""
-repository related_uris       ()
-repository version            3
+SECTION    PROPERTY         VALUE
+feed       description      ""
+feed       icon             web/_themes/pkg-block-icon.png
+feed       id               ""
+feed       logo             web/_themes/pkg-block-logo.png
+feed       name             package\ repository\ feed
+feed       window           24
+publisher  alias            ""
+publisher  prefix           test
+repository collection_type  core
+repository description      ""
+repository detailed_url     ""
+repository legal_uris       ()
+repository maintainer       ""
+repository maintainer_url   ""
+repository mirrors          ()
+repository name             package\ repository
+repository origins          ()
+repository refresh_seconds  14400
+repository registration_uri ""
+repository related_uris     ()
+repository version          3
 """
                         self.assertEqualDiff(expected, self.output)
                 self.dc.stop()
@@ -230,9 +250,7 @@ feed\tlogo\tweb/_themes/pkg-block-logo.png
 feed\tname\tpackage\ repository\ feed
 feed\twindow\t24
 publisher\talias\t""
-publisher\tintermediate_certs\t()
 publisher\tprefix\ttest
-publisher\tsigning_ca_certs\t()
 repository\tcollection_type\tcore
 repository\tdescription\t""
 repository\tdetailed_url\t""
@@ -258,16 +276,16 @@ repository\tversion\t3
                 self.pkgrepo("get -s %s publisher/prefix" %
                     repo_uri)
                 expected = """\
-SECTION    PROPERTY           VALUE
-publisher  prefix             test
+SECTION    PROPERTY         VALUE
+publisher  prefix           test
 """
                 self.assertEqualDiff(expected, self.output)
 
                 self.pkgrepo("get -s %s -H publisher/prefix "
                     "repository/origins" % repo_uri)
                 expected = """\
-publisher  prefix             test
-repository origins            ()
+publisher  prefix           test
+repository origins          ()
 """
                 self.assertEqualDiff(expected, self.output)
 
@@ -816,6 +834,16 @@ test\t3\tonline\t%sZ
                 self.__test_rebuild(repo_path, repo_uri)
                 shutil.rmtree(repo_path)
 
+                # Create a repository, add a publisher, remove its catalog,
+                # and then verify rebuild still works.
+                self.pkgrepo("create %s" % repo_path)
+                self.pkgrepo("add-publisher -s %s test" % repo_path)
+                repo = self.get_repo(repo_path, read_only=True)
+                cat = repo.get_catalog(pub="test")
+                cat.destroy()
+                self.pkgrepo("rebuild -s %s" % repo_path)
+                shutil.rmtree(repo_path)
+
                 # Create a repository and verify network-based repository
                 # access.
                 self.assert_(not os.path.exists(repo_path))
@@ -825,8 +853,75 @@ test\t3\tonline\t%sZ
                 self.dc.start()
                 repo_uri = self.dc.get_depot_url()
                 self.__test_rebuild(repo_path, repo_uri)
+
+                # Verify rebuild only rebuilds package data for specified
+                # publisher in the case that the repository contains package
+                # data for multiple publishers.
+                self.pkgsend_bulk(repo_uri, """
+                    open pkg://test2/foo@1.0
+                    close
+                    """)
+
+                repo = self.get_repo(repo_path, read_only=True)
+                cat = repo.get_catalog(pub="test")
+                test_cts = cat.created
+                cat = repo.get_catalog(pub="test2")
+                test2_cts = cat.created
+
+                self.pkgrepo("rebuild -s %s -p test" % repo_uri)
+                self.wait_repo(repo_path)
+
+                # Now compare creation timestamps of each publisher's
+                # catalog to verify only test's catalog was rebuilt.
+                repo = self.get_repo(repo_path, read_only=True)
+                cat = repo.get_catalog(pub="test")
+                self.assertNotEqual(cat.created, test_cts)
+                test_cts = cat.created
+                cat = repo.get_catalog(pub="test2")
+                self.assertEqual(cat.created, test2_cts)
+                test2_cts = cat.created
+
+                # Verify rebuild without specifying a publisher
+                # will rebuild the catalogs for all publishers.
+                self.pkgrepo("rebuild -s %s" % repo_uri)
+                self.wait_repo(repo_path)
                 self.dc.stop()
 
+                # Now compare creation timestamps of each publisher's
+                # catalog to verify all catalogs were rebuilt.
+                repo = self.get_repo(repo_path, read_only=True)
+                cat = repo.get_catalog(pub="test")
+                self.assertNotEqual(cat.created, test_cts)
+                cat = repo.get_catalog(pub="test2")
+                self.assertNotEqual(cat.created, test2_cts)
+                shutil.rmtree(repo_path)
+
+                # Now create a repository, publish a package, and deposit a
+                # junk file in the manifest directory.
+                self.assert_(not os.path.exists(repo_path))
+                self.create_repo(repo_path)
+                pfmri = self.pkgsend_bulk(repo_path, """
+                    open pkg://test/foo@1.0
+                    close
+                    """)[0]
+                repo = self.get_repo(repo_path, read_only=True)
+                mdir = os.path.dirname(repo.manifest(pfmri))
+                jpath = os.path.join(mdir, "junk")
+                with open(jpath, "wb") as f:
+                        f.write("random junk")
+                self.assertTrue(os.path.exists(jpath))
+
+                # Verify rebuild succeeds.
+                self.pkgrepo("rebuild -s %s" % repo_path)
+
+                # Verify junk file is still there.
+                self.assertTrue(os.path.exists(jpath))
+
+                # Verify expected package is still known.
+                repo = self.get_repo(repo_path, read_only=True)
+                self.assertEqualDiff([pfmri],
+                    [str(f) for f in repo.get_catalog("test").fmris()])
+ 
         def __test_refresh(self, repo_path, repo_uri):
                 """Private function to verify refresh subcommand behaviour."""
 
@@ -919,14 +1014,38 @@ test\t3\tonline\t%sZ
                 result = list(e for e in [r for r in repo.search([query])][0])
                 self.assertEqualDiff([], result)
 
+                # Store time all packages in catalog were added.
+                cat = repo.get_catalog("test")
+                uname = [part for part in cat.updates][0]
+                ulog = pkg.catalog.CatalogUpdate(uname, meta_root=cat.meta_root)
+                expected = set()
+                for pfmri, op_type, op_time, metadata in ulog.updates():
+                        expected.add((str(pfmri), op_time))
+
                 # Finally, run refresh once more and verify that all packages
-                # are now visible in the catalog.
+                # are now visible in the catalog and that refresh was
+                # incremental.
                 self.pkgrepo("refresh -s %s" % repo_uri)
                 self.wait_repo(repo_path)
                 repo = self.get_repo(repo_path, read_only=True)
                 self.assertEqual(plist, list(
                     str(f) for f in repo.get_catalog("test").fmris(ordered=True)
                 ))
+
+                # Get time all packages in catalog were added.
+                cat = repo.get_catalog("test")
+                uname = [part for part in cat.updates][0]
+                ulog = pkg.catalog.CatalogUpdate(uname, meta_root=cat.meta_root)
+                returned = set()
+                for pfmri, op_type, op_time, metadata in ulog.updates():
+                        if pfmri.pkg_name == "zoo":
+                                continue
+                        returned.add((str(pfmri), op_time))
+
+                # Entries for all packages (except zoo) should have the same
+                # operation timestamp (when they were added) before the pkgrepo
+                # refresh in update log.
+                self.assertEqualDiff(expected, returned)
 
         def test_05_refresh(self):
                 """Verify pkgrepo refresh works as expected."""
@@ -941,6 +1060,16 @@ test\t3\tonline\t%sZ
                 self.__test_refresh(repo_path, repo_uri)
                 shutil.rmtree(repo_path)
 
+                # Create a repository, add a publisher, remove its catalog,
+                # and then verify refresh still works.
+                self.pkgrepo("create %s" % repo_path)
+                self.pkgrepo("add-publisher -s %s test" % repo_path)
+                repo = self.get_repo(repo_path, read_only=True)
+                cat = repo.get_catalog(pub="test")
+                cat.destroy()
+                self.pkgrepo("refresh -s %s" % repo_path)
+                shutil.rmtree(repo_path)
+
                 # Create a repository and verify network-based repository
                 # access.
                 self.assert_(not os.path.exists(repo_path))
@@ -950,6 +1079,56 @@ test\t3\tonline\t%sZ
                 self.dc.start()
                 repo_uri = self.dc.get_depot_url()
                 self.__test_refresh(repo_path, repo_uri)
+
+                # Verify refresh only refreshes package data for specified
+                # publisher in the case that the repository contains package
+                # data for multiple publishers.
+
+                # This is needed to ensure test2 exists as a publisher before
+                # the package ever is created.
+                self.pkgrepo("set -s %s -p test2 publisher/alias=" % repo_path)
+                self.dc.stop()
+                self.dc.start()
+
+                repo = self.get_repo(repo_path, read_only=True)
+                cat = repo.get_catalog(pub="test")
+                test_plist = [str(f) for f in cat.fmris()]
+                cat = repo.get_catalog(pub="test2")
+                test2_plist = [str(f) for f in cat.fmris()]
+
+                self.pkgsend_bulk(repo_uri, """
+                    open pkg://test/refresh@1.0
+                    close
+                    open pkg://test2/refresh@1.0
+                    close
+                    """, no_catalog=True)
+
+                self.pkgrepo("refresh -s %s -p test" % repo_uri)
+                self.wait_repo(repo_path)
+
+                # Now compare package lists to ensure new package is only seen
+                # for 'test' publisher.
+                repo = self.get_repo(repo_path, read_only=True)
+                cat = repo.get_catalog(pub="test")
+                self.assertNotEqual([str(f) for f in cat.fmris()], test_plist)
+                test_plist = [str(f) for f in cat.fmris()]
+                cat = repo.get_catalog(pub="test2")
+                self.assertEqual([str(f) for f in cat.fmris()], test2_plist)
+                test2_plist = [str(f) for f in cat.fmris()]
+
+                # Verify refresh without specifying a publisher will refresh the
+                # the catalogs for all publishers.
+                self.pkgrepo("refresh -s %s" % repo_uri)
+                self.wait_repo(repo_path)
+
+                # Now compare package lists to ensure new package is seen for
+                # all publishers.
+                repo = self.get_repo(repo_path, read_only=True)
+                cat = repo.get_catalog(pub="test")
+                self.assertEqual([str(f) for f in cat.fmris()], test_plist)
+                cat = repo.get_catalog(pub="test2")
+                self.assertNotEqual([str(f) for f in cat.fmris()], test2_plist)
+
                 self.dc.stop()
 
         def test_06_version(self):
@@ -966,112 +1145,492 @@ test\t3\tonline\t%sZ
                 self.pkgrepo("version")
                 self.assert_(self.output.find(pkg.VERSION) != -1)
 
-        def __test_add_remove_certs(self, repo_uri, pubs=[]):
-                """Private helper method to test certificate add and remove
-                for default publisher case."""
-
-                pub_opt = "".join(" -p %s " % p for p in pubs)
-                exit = 0
-                if "nosuchpub" in pubs:
-                        if len(pubs) > 1:
-                                # Expect partial in this case.
-                                exit = 3
-                        else:
-                                # Expect failure in this case.
-                                exit = 1
-
-                ca3_pth = os.path.join(self.pub_cas_dir, "pubCA1_ta3_cert.pem")
-                ca1_pth = os.path.join(self.pub_cas_dir, "pubCA1_ta1_cert.pem")
-
-                ca1_hsh = self.calc_file_hash(ca1_pth)
-                ca3_hsh = self.calc_file_hash(ca3_pth)
-
-                self.pkgrepo("add-signing-ca-cert -s %s %s%s" %
-                    (repo_uri, pub_opt, ca3_pth), exit=exit)
-                self.pkgrepo("add-signing-ca-cert -s %s %s%s" %
-                    (repo_uri, pub_opt, ca1_pth), exit=exit)
-
-                self.pkgrepo("remove-signing-intermediate-cert -s %s %s%s" %
-                    (repo_uri, pub_opt, ca1_hsh), exit=exit)
-                self.pkgrepo("remove-signing-intermediate-cert -s %s %s%s" %
-                    (repo_uri, pub_opt, ca3_hsh), exit=exit)
-                self.pkgrepo("remove-signing-ca-cert -s %s %s%s" %
-                    (repo_uri, pub_opt, ca1_hsh), exit=exit)
-                self.pkgrepo("remove-signing-ca-cert -s %s %s%s" %
-                    (repo_uri, pub_opt, ca3_hsh), exit=exit)
-
-                self.pkgrepo("add-signing-intermediate-cert -s %s %s%s" %
-                    (repo_uri, pub_opt, ca3_pth), exit=exit)
-                self.pkgrepo("add-signing-intermediate-cert -s %s %s%s" %
-                    (repo_uri, pub_opt, ca1_pth), exit=exit)
-
-                self.pkgrepo("remove-signing-ca-cert -s %s %s%s" %
-                    (repo_uri, pub_opt, ca1_hsh), exit=exit)
-                self.pkgrepo("remove-signing-ca-cert -s %s %s%s" %
-                    (repo_uri, pub_opt, ca3_hsh), exit=exit)
-                self.pkgrepo("remove-signing-intermediate-cert -s %s %s%s" %
-                    (repo_uri, pub_opt, ca1_hsh), exit=exit)
-                self.pkgrepo("remove-signing-intermediate-cert -s %s %s%s" %
-                    (repo_uri, pub_opt, ca3_hsh), exit=exit)
-
-        def test_07_certs(self):
-                """Verify that certificate commands work as expected."""
+        def test_07_add_publisher(self):
+                """Verify that add-publisher subcommand works as expected."""
 
                 # Create a repository.
                 repo_path = os.path.join(self.test_root, "repo")
-                repo_uri = "file:%s" % repo_path
                 self.create_repo(repo_path)
 
-                ca3_pth = os.path.join(self.pub_cas_dir, "pubCA1_ta3_cert.pem")
-                ca1_pth = os.path.join(self.pub_cas_dir, "pubCA1_ta1_cert.pem")
+                # Verify invalid publisher prefixes are rejected gracefully.
+                self.pkgrepo("-s %s add-publisher !valid" % repo_path, exit=1)
+                self.pkgrepo("-s %s add-publisher file:%s" % (repo_path,
+                    repo_path), exit=1)
+                self.pkgrepo("-s %s add-publisher valid !valid" % repo_path,
+                    exit=1)
 
-                ca1_hsh = self.calc_file_hash(ca1_pth)
-                ca3_hsh = self.calc_file_hash(ca3_pth)
-
-                # Verify that signing commands will fail gracefully if no
-                # default publisher has been set and a publisher was not
-                # specified.
-                self.pkgrepo("-s %s add-signing-ca-cert %s" % (repo_uri,
-                    ca3_pth), exit=1)
-                self.pkgrepo("-s %s add-signing-intermediate-cert %s" %
-                    (repo_uri, ca3_pth), exit=1)
-                self.pkgrepo("-s %s remove-signing-intermediate-cert %s" %
-                    (repo_uri, ca3_hsh), exit=1)
-                self.pkgrepo("-s %s remove-signing-ca-cert %s" %
-                    (repo_uri, ca1_hsh), exit=1)
-
-                # Now verify that add / remove work as expected for a
-                # repository.
-
-                # Test default publisher case.
-                self.pkgrepo("set -s %s publisher/prefix=test" % repo_path)
-                self.__test_add_remove_certs(repo_uri)
-
-                # Test specific publisher case.
-                shutil.rmtree(repo_path)
-                self.create_repo(repo_path)
-                self.pkgrepo("set -s %s publisher/prefix=test" % repo_path)
-                self.__test_add_remove_certs(repo_uri, ["test"])
-                self.__test_add_remove_certs(repo_uri, ["nosuchpub"])
-
-                # Test multiple publisher case.
-                shutil.rmtree(repo_path)
-                self.create_repo(repo_path)
-                self.pkgrepo("set -s %s -p test publisher/alias=test" %
+                # Verify that multiple publishers can be added at a time, and
+                # that the first publisher named will be set as the default
+                # publisher if a default was not already set.
+                self.pkgrepo("-s %s add-publisher example.com example.net" %
                     repo_path)
-                self.pkgrepo("set -s %s -p test2 publisher/alias=test2" %
-                    repo_path)
-                self.__test_add_remove_certs(repo_uri, ["test", "test2"])
-                self.__test_add_remove_certs(repo_uri, ["test", "test2",
-                    "nosuchpub"])
+                self.pkgrepo("-s %s get -p example.com -p example.net "
+                    "publisher/alias" % repo_path)
+                self.pkgrepo("get -s %s -HFtsv publisher/prefix" % repo_path)
+                expected = """\
+publisher\tprefix\texample.com
+"""
+                self.assertEqualDiff(expected, self.output)
 
-                # Last, verify that add/remove works for a v3 repository.
+                # Verify that add-publisher will exit with complete failure if
+                # all publishers being added already exist.
+                self.pkgrepo("-s %s add-publisher example.com example.net" %
+                    repo_path, exit=1)
+
+                # Verify that add-publisher will exit with partial failure if
+                # only some publishers already exist.
+                self.pkgrepo("-s %s add-publisher example.com example.org" %
+                    repo_path, exit=3)
+
+                # Now set a default publisher before adding a publisher for
+                # the first time.
                 shutil.rmtree(repo_path)
-                self.create_repo(repo_path, version=3)
-                self.pkgrepo("set -s %s publisher/prefix=test" % repo_path)
-                self.__test_add_remove_certs(repo_uri, ["test"])
-                self.__test_add_remove_certs(repo_uri)
-                self.__test_add_remove_certs(repo_uri, ["nosuchpub"])
+                self.create_repo(repo_path)
+                self.pkgrepo("-s %s set publisher/prefix=example.net" %
+                    repo_path)
+                self.pkgrepo("-s %s add-publisher example.org" % repo_path)
+                self.pkgrepo("get -s %s -HFtsv publisher/prefix" % repo_path)
+                expected = """\
+publisher\tprefix\texample.net
+"""
+                self.assertEqualDiff(expected, self.output)
+
+        def test_09_remove_packages(self):
+                """Verify that remove subcommand works as expected."""
+
+                # Create a repository and then copy it somewhere for testing
+                # to make it easy to restore the original as needed.
+                src_repo = os.path.join(self.test_root, "remove-repo")
+
+                self.create_repo(src_repo)
+                self.pkgrepo("set -s %s publisher/prefix=test" % src_repo)
+
+                # Test that removing a package when no files have been published
+                # works (bug 18424).
+                published = self.pkgsend_bulk(src_repo, self.zoo10)
+                self.pkgrepo("remove -s %s zoo" % src_repo)
+
+                # Reset the src_repo for the rest of the test.
+                shutil.rmtree(src_repo)
+                self.create_repo(src_repo)
+                self.pkgrepo("set -s %s publisher/prefix=test" % src_repo)
+
+                published = self.pkgsend_bulk(src_repo, (self.tree10,
+                    self.amber10, self.amber20, self.truck10, self.truck20,
+                    self.zoo10))
+                self.pkgrepo("set -s %s publisher/prefix=test2" % src_repo)
+                published += self.pkgsend_bulk(src_repo, (self.tree10,
+                    self.zoo10))
+
+                # Restore repository for next test.
+                dest_repo = os.path.join(self.test_root, "test-repo")
+                shutil.copytree(src_repo, dest_repo)
+
+                # Verify that specifying something other than a filesystem-
+                # based repository fails.
+                self.pkgrepo("remove -s %s tree" % self.durl, exit=2)
+
+                # Verify that non-matching patterns result in error.
+                self.pkgrepo("remove -s %s nosuchpackage" % dest_repo, exit=1)
+                self.pkgrepo("remove -s %s tree nosuchpackage" % dest_repo,
+                    exit=1)
+
+                # Verify that -n works as expected.
+                self.pkgrepo("remove -n -s %s zoo" % dest_repo)
+                # Since package was not removed, this succeeds.
+                self.pkgrepo("remove -n -s %s zoo" % dest_repo) 
+
+                # Verify that -p works as expected.
+                self.pkgrepo("remove -s %s -p nosuchpub zoo" % dest_repo,
+                    exit=1)
+                self.pkgrepo("remove -s %s -p test -p test2 zoo" % dest_repo)
+                self.pkgrepo("remove -s %s -p test zoo" % dest_repo, exit=1)
+                self.pkgrepo("remove -s %s -p test2 zoo" % dest_repo, exit=1)
+
+                # Restore repository for next test.
+                shutil.rmtree(dest_repo)
+                shutil.copytree(src_repo, dest_repo)
+
+                # Verify a single version of a package can be removed and that
+                # package files will not be removed since older versions still
+                # reference them.  (This also tests that packages that only
+                # exist for one publisher in a multi-publisher repository can
+                # be removed.)
+                repo = self.get_repo(dest_repo)
+                mpath = repo.manifest(published[4])
+                self.pkgrepo("remove -s %s truck@2.0" % dest_repo)
+
+                # The manifest should no longer exist.
+                self.assert_(not os.path.exists(mpath))
+
+                # These two files are in use by other packages so should still
+                # exist.
+                repo.file(self.fhashes["tmp/empty"])
+                repo.file(self.fhashes["tmp/truck1"])
+
+                # This file was only referenced by truck@2.0 so should be gone.
+                self.assertRaises(sr.RepositoryFileNotFoundError, repo.file,
+                    self.fhashes["tmp/truck2"])
+
+                # Restore repository for next test.
+                shutil.rmtree(dest_repo)
+                shutil.copytree(src_repo, dest_repo)
+
+                # Verify that all versions of a specific package can be removed
+                # and that only files not referenced by other packages are
+                # removed.
+                self.pkgrepo("remove -s %s truck" % dest_repo)
+
+                # This file is still in use by other packages.
+                repo = self.get_repo(dest_repo)
+                repo.file(self.fhashes["tmp/empty"])
+                repo.file(self.fhashes["tmp/truck1"])
+
+                # These files should have been removed since other packages
+                # don't reference them.
+                self.assertRaises(sr.RepositoryFileNotFoundError, repo.file,
+                    self.fhashes["tmp/truck2"])
+
+                # Restore repository for next test.
+                shutil.rmtree(dest_repo)
+                shutil.copytree(src_repo, dest_repo)
+
+                # Verify that removing all packages that reference files
+                # results in all files being removed and an empty file_root
+                # for the repository.
+                repo = self.get_repo(dest_repo)
+                mpaths = []
+                for f in published:
+                        if "tree" in f or "truck" in f:
+                                mpaths.append(repo.manifest(f))
+
+                self.pkgrepo("remove -s %s tree truck" % dest_repo)
+
+                self.assertRaises(sr.RepositoryFileNotFoundError, repo.file,
+                    self.fhashes["tmp/empty"])
+                self.assertRaises(sr.RepositoryFileNotFoundError, repo.file,
+                    self.fhashes["tmp/truck1"])
+                self.assertRaises(sr.RepositoryFileNotFoundError, repo.file,
+                    self.fhashes["tmp/truck2"])
+
+                # Verify that directories for manifests no longer exist since
+                # all versions were removed.
+                for mpath in mpaths:
+                        pdir = os.path.dirname(mpath)
+                        self.assert_(not os.path.exists(pdir))
+
+                # Verify that entries for each package that was removed no
+                # longer exist in the catalog, but do exist in the catalog's
+                # updatelog.
+                repo = self.get_repo(dest_repo)
+                for pfx in ("test", "test2"):
+                        c = repo.get_catalog(pub=pfx)
+                        for f in c.fmris():
+                                self.assert_(f.pkg_name not in ("tree",
+                                    "truck"))
+
+                        removed = set()
+                        for name in c.updates:
+                                ulog = pkg.catalog.CatalogUpdate(name,
+                                    meta_root=c.meta_root, sign=False)
+
+                                for pfmri, op_type, op_time, md in ulog.updates():
+                                        if op_type == ulog.REMOVE:
+                                                removed.add(str(pfmri))
+
+                        expected = set(
+                            f
+                            for f in published
+                            if ("tree" in f or "truck" in f) and \
+                                f.startswith("pkg://%s/" % pfx)
+                        )
+                        self.assertEqualDiff(expected, removed)
+
+                # Verify repository file_root is empty.
+                for rstore in repo.rstores:
+                        if not rstore.publisher:
+                                continue
+                        self.assert_(not os.listdir(rstore.file_root))
+
+                # Cleanup.
+                shutil.rmtree(src_repo)
+                shutil.rmtree(dest_repo)
+
+        def test_10_list(self):
+                """Verify the list subcommand works as expected."""
+
+                repo_path = self.dc.get_repodir()
+                repo_uri = self.dc.get_repo_url()
+
+                # Publish some packages.
+                self.pkgsend_bulk(repo_uri, (self.tree10, self.amber10,
+                    self.amber20, self.amber30, self.amber40))
+
+                # Verify graceful exit if invalid or incomplete set of
+                # options specified.
+                self.pkgrepo("list", exit=2)
+                self.pkgrepo("-s bogus://location list", exit=1)
+                self.pkgrepo("list -s bogus://location list", exit=1)
+                self.pkgrepo("list -s %s -F bad-format" % repo_uri, exit=2)
+
+                # Verify graceful exit for bad repository.
+                self.pkgrepo("list -s /no/such/repository", exit=1)
+
+                # Verify graceful exit if invalid package name given.
+                self.pkgrepo("list -s %s ^notvalid" % repo_path, exit=1)
+
+                # Verify graceful exit if no matching package found.
+                self.pkgrepo("list -s %s nosuchpackage" % repo_path, exit=1)
+
+                # Verify default output when listing all packages for both
+                # file and http cases:
+                for src in (repo_path, repo_uri):
+                        # json output.
+                        self.pkgrepo("list -s %s -F json" % src)
+                        expected = """\
+[{"branch": "0", "build-release": "5.11", "name": "amber", "pkg.fmri": "pkg://test/amber@4.0,5.11-0:20110804T203458Z", "pkg.obsolete": [{"value": ["true"]}], "publisher": "test", "release": "4.0", "timestamp": "20110804T203458Z", "version": "4.0,5.11-0:20110804T203458Z"}, {"branch": "0", "build-release": "5.11", "name": "amber", "pkg.fmri": "pkg://test/amber@3.0,5.11-0:20110804T203458Z", "pkg.renamed": [{"value": ["true"]}], "publisher": "test", "release": "3.0", "timestamp": "20110804T203458Z", "version": "3.0,5.11-0:20110804T203458Z"}, {"branch": "0", "build-release": "5.11", "name": "amber", "pkg.fmri": "pkg://test/amber@2.0,5.11-0:20110804T203458Z", "publisher": "test", "release": "2.0", "timestamp": "20110804T203458Z", "version": "2.0,5.11-0:20110804T203458Z"}, {"branch": "0", "build-release": "5.11", "name": "amber", "pkg.fmri": "pkg://test/amber@1.0,5.11-0:20110804T203458Z", "pkg.human-version": [{"value": ["1.0a"]}], "pkg.summary": [{"value": ["Millenia old resin"]}], "publisher": "test", "release": "1.0", "timestamp": "20110804T203458Z", "version": "1.0,5.11-0:20110804T203458Z"}, {"branch": "0", "build-release": "5.11", "info.classification": [{"value": ["org.opensolaris.category.2008:System/Core"]}], "name": "tree", "pkg.fmri": "pkg://test/tree@1.0,5.11-0:20110804T203458Z", "pkg.summary": [{"value": ["Leafy i386 package"], "variant.arch": ["i386"]}, {"value": ["Leafy SPARC package"], "variant.arch": ["sparc"]}], "publisher": "test", "release": "1.0", "timestamp": "20110804T203458Z", "variant.arch": [{"value": ["i386", "sparc"]}], "version": "1.0,5.11-0:20110804T203458Z"}]"""
+                        self.assertEqualDiff(expected, self.output)
+
+                # Now verify list output in different formats but only using
+                # file repository for test efficiency.
+
+                # Human readable (default) output.
+                self.pkgrepo("list -s %s" % src)
+                expected = """\
+PUBLISHER NAME                                          O VERSION
+test      amber                                         o 4.0,5.11-0:20110804T203458Z
+test      amber                                         r 3.0,5.11-0:20110804T203458Z
+test      amber                                           2.0,5.11-0:20110804T203458Z
+test      amber                                           1.0,5.11-0:20110804T203458Z
+test      tree                                            1.0,5.11-0:20110804T203458Z
+"""
+                self.assertEqualDiff(expected, self.output)
+
+                # Human readable (default) output with no header.
+                self.pkgrepo("list -s %s -H" % repo_path)
+                expected = """\
+test      amber                                         o 4.0,5.11-0:20110804T203458Z
+test      amber                                         r 3.0,5.11-0:20110804T203458Z
+test      amber                                           2.0,5.11-0:20110804T203458Z
+test      amber                                           1.0,5.11-0:20110804T203458Z
+test      tree                                            1.0,5.11-0:20110804T203458Z
+"""
+                self.assertEqualDiff(expected, self.output)
+
+                # tsv output.
+                self.pkgrepo("list -s %s -F tsv" % repo_path)
+                expected = """\
+PUBLISHER	NAME	O	RELEASE	BUILD RELEASE	BRANCH	PACKAGING DATE	FMRI
+test	amber	o	4.0	5.11	0	20110804T203458Z	pkg://test/amber@4.0,5.11-0:20110804T203458Z
+test	amber	r	3.0	5.11	0	20110804T203458Z	pkg://test/amber@3.0,5.11-0:20110804T203458Z
+test	amber		2.0	5.11	0	20110804T203458Z	pkg://test/amber@2.0,5.11-0:20110804T203458Z
+test	amber		1.0	5.11	0	20110804T203458Z	pkg://test/amber@1.0,5.11-0:20110804T203458Z
+test	tree		1.0	5.11	0	20110804T203458Z	pkg://test/tree@1.0,5.11-0:20110804T203458Z
+"""
+                self.assertEqualDiff(expected, self.output)
+
+                # json-formatted output.
+                self.pkgrepo("list -s %s -F json-formatted" % src)
+                expected = """\
+[
+  {
+    "branch": "0", 
+    "build-release": "5.11", 
+    "name": "amber", 
+    "pkg.fmri": "pkg://test/amber@4.0,5.11-0:20110804T203458Z", 
+    "pkg.obsolete": [
+      {
+        "value": [
+          "true"
+        ]
+      }
+    ], 
+    "publisher": "test", 
+    "release": "4.0", 
+    "timestamp": "20110804T203458Z", 
+    "version": "4.0,5.11-0:20110804T203458Z"
+  }, 
+  {
+    "branch": "0", 
+    "build-release": "5.11", 
+    "name": "amber", 
+    "pkg.fmri": "pkg://test/amber@3.0,5.11-0:20110804T203458Z", 
+    "pkg.renamed": [
+      {
+        "value": [
+          "true"
+        ]
+      }
+    ], 
+    "publisher": "test", 
+    "release": "3.0", 
+    "timestamp": "20110804T203458Z", 
+    "version": "3.0,5.11-0:20110804T203458Z"
+  }, 
+  {
+    "branch": "0", 
+    "build-release": "5.11", 
+    "name": "amber", 
+    "pkg.fmri": "pkg://test/amber@2.0,5.11-0:20110804T203458Z", 
+    "publisher": "test", 
+    "release": "2.0", 
+    "timestamp": "20110804T203458Z", 
+    "version": "2.0,5.11-0:20110804T203458Z"
+  }, 
+  {
+    "branch": "0", 
+    "build-release": "5.11", 
+    "name": "amber", 
+    "pkg.fmri": "pkg://test/amber@1.0,5.11-0:20110804T203458Z", 
+    "pkg.human-version": [
+      {
+        "value": [
+          "1.0a"
+        ]
+      }
+    ], 
+    "pkg.summary": [
+      {
+        "value": [
+          "Millenia old resin"
+        ]
+      }
+    ], 
+    "publisher": "test", 
+    "release": "1.0", 
+    "timestamp": "20110804T203458Z", 
+    "version": "1.0,5.11-0:20110804T203458Z"
+  }, 
+  {
+    "branch": "0", 
+    "build-release": "5.11", 
+    "info.classification": [
+      {
+        "value": [
+          "org.opensolaris.category.2008:System/Core"
+        ]
+      }
+    ], 
+    "name": "tree", 
+    "pkg.fmri": "pkg://test/tree@1.0,5.11-0:20110804T203458Z", 
+    "pkg.summary": [
+      {
+        "value": [
+          "Leafy i386 package"
+        ], 
+        "variant.arch": [
+          "i386"
+        ]
+      }, 
+      {
+        "value": [
+          "Leafy SPARC package"
+        ], 
+        "variant.arch": [
+          "sparc"
+        ]
+      }
+    ], 
+    "publisher": "test", 
+    "release": "1.0", 
+    "timestamp": "20110804T203458Z", 
+    "variant.arch": [
+      {
+        "value": [
+          "i386", 
+          "sparc"
+        ]
+      }
+    ], 
+    "version": "1.0,5.11-0:20110804T203458Z"
+  }
+]
+"""
+                self.assertEqualDiff(expected, self.output)
+
+                # Verify ability to list specific packages.
+                self.pkgrepo("list -s %s -H -F tsv tree amber@2.0" % repo_path)
+                expected = """\
+test	amber		2.0	5.11	0	20110804T203458Z	pkg://test/amber@2.0,5.11-0:20110804T203458Z
+test	tree		1.0	5.11	0	20110804T203458Z	pkg://test/tree@1.0,5.11-0:20110804T203458Z
+"""
+                self.assertEqualDiff(expected, self.output)
+
+                self.pkgrepo("list -s %s -H -F tsv tree amber@4.0 amber@2.0" %
+                    repo_path)
+                expected = """\
+test	amber	o	4.0	5.11	0	20110804T203458Z	pkg://test/amber@4.0,5.11-0:20110804T203458Z
+test	amber		2.0	5.11	0	20110804T203458Z	pkg://test/amber@2.0,5.11-0:20110804T203458Z
+test	tree		1.0	5.11	0	20110804T203458Z	pkg://test/tree@1.0,5.11-0:20110804T203458Z
+"""
+                self.assertEqualDiff(expected, self.output)
+
+                self.pkgrepo("list -s %s -H -F tsv amber@latest tree" %
+                    repo_path)
+                expected = """\
+test	amber	o	4.0	5.11	0	20110804T203458Z	pkg://test/amber@4.0,5.11-0:20110804T203458Z
+test	tree		1.0	5.11	0	20110804T203458Z	pkg://test/tree@1.0,5.11-0:20110804T203458Z
+"""
+                self.assertEqualDiff(expected, self.output)
+
+                # Verify exit with partial failure if one match fails.
+                self.pkgrepo("list -s %s -H -F tsv tree bogus" % repo_path,
+                    exit=3)
+                expected = """\
+test	tree		1.0	5.11	0	20110804T203458Z	pkg://test/tree@1.0,5.11-0:20110804T203458Z
+"""
+                self.assertEqualDiff(expected, self.output)
+
+                #
+                # Add packages for a different publisher.
+                #
+                self.pkgrepo("set -s %s publisher/prefix=test2" % repo_path)
+                self.pkgsend_bulk(repo_path, (self.truck10, self.zoo10))
+
+                # Verify list of all package includes all publishers.
+                # tsv output.
+                self.pkgrepo("list -s %s -H -F tsv" % repo_path)
+                expected = """\
+test	amber	o	4.0	5.11	0	20110804T203458Z	pkg://test/amber@4.0,5.11-0:20110804T203458Z
+test	amber	r	3.0	5.11	0	20110804T203458Z	pkg://test/amber@3.0,5.11-0:20110804T203458Z
+test	amber		2.0	5.11	0	20110804T203458Z	pkg://test/amber@2.0,5.11-0:20110804T203458Z
+test	amber		1.0	5.11	0	20110804T203458Z	pkg://test/amber@1.0,5.11-0:20110804T203458Z
+test	tree		1.0	5.11	0	20110804T203458Z	pkg://test/tree@1.0,5.11-0:20110804T203458Z
+test2	truck		1.0	5.11	0	20110804T203458Z	pkg://test2/truck@1.0,5.11-0:20110804T203458Z
+test2	zoo		1.0	5.11	0	20110804T203458Z	pkg://test2/zoo@1.0,5.11-0:20110804T203458Z
+"""
+                self.assertEqualDiff(expected, self.output)
+
+                self.pkgrepo("list -s %s -H -F tsv -p all" % repo_path)
+                self.assertEqualDiff(expected, self.output)
+
+                # Verify that packages for a single publisher can be listed.
+                self.pkgrepo("list -s %s -H -F tsv -p test2" % repo_path)
+                expected = """\
+test2	truck		1.0	5.11	0	20110804T203458Z	pkg://test2/truck@1.0,5.11-0:20110804T203458Z
+test2	zoo		1.0	5.11	0	20110804T203458Z	pkg://test2/zoo@1.0,5.11-0:20110804T203458Z
+"""
+                self.assertEqualDiff(expected, self.output)
+
+                # Verify that patterns matching packages only provided by one
+                # publisher will not result in partial failure.
+                self.pkgrepo("list -s %s -H -F tsv zoo" % repo_path)
+                expected = """\
+test2	zoo		1.0	5.11	0	20110804T203458Z	pkg://test2/zoo@1.0,5.11-0:20110804T203458Z
+"""
+                self.assertEqualDiff(expected, self.output)
+
+                self.pkgrepo("list -s %s -H -F tsv '//test2/*'" % repo_path)
+                expected = """\
+test2	truck		1.0	5.11	0	20110804T203458Z	pkg://test2/truck@1.0,5.11-0:20110804T203458Z
+test2	zoo		1.0	5.11	0	20110804T203458Z	pkg://test2/zoo@1.0,5.11-0:20110804T203458Z
+"""
+                self.assertEqualDiff(expected, self.output)
+
+                # Verify that a package provided by no publisher will result
+                # in graceful failure when multiple publishers are present.
+                self.pkgrepo("list -s %s -H -F tsv nosuchpackage" % repo_path,
+                    exit=1)
 
 
 if __name__ == "__main__":

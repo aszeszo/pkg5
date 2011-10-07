@@ -21,9 +21,11 @@
 #
 
 #
-# Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2008, 2011, Oracle and/or its affiliates. All rights reserved.
 #
 
+import json
+import multiprocessing
 import os
 import sys
 
@@ -89,8 +91,13 @@ ostype = os.name
 if ostype == '':
         ostype = 'unknown'
 
+jobs = 1
 
-def find_tests(testdir, testpats, startatpat=False, output=OUTPUT_DOTS):
+class Pkg5TestLoader(unittest.TestLoader):
+        suiteClass = pkg5unittest.Pkg5TestSuite
+
+def find_tests(testdir, testpats, startatpat=False, output=OUTPUT_DOTS,
+    time_estimates=None):
         # Test pattern to match against
         pats = [ re.compile("%s" % pat, re.IGNORECASE) for pat in testpats ]
         startatpat = re.compile("%s" % startattest, re.IGNORECASE)
@@ -111,8 +118,7 @@ def find_tests(testdir, testpats, startatpat=False, output=OUTPUT_DOTS):
                 if output == OUTPUT_VERBOSE or output == OUTPUT_PARSEABLE:
                         print ' '.join([str(l) for l in text]),
 
-        loader = unittest.TestLoader()
-        suite = unittest.TestSuite()
+        loader = Pkg5TestLoader()
         testclasses = []
         # "testdir" will be "api", "cli", etc., so find all the files in that 
         # directory that match the pattern "t_*.py".
@@ -176,12 +182,34 @@ def find_tests(testdir, testpats, startatpat=False, output=OUTPUT_DOTS):
                                         delattr(classobj, attrname)
                         testclasses.append(classobj)
         _vprint("\n#\n")
-                        
-        for cobj in testclasses:
-                suite.addTest(unittest.makeSuite(cobj, 'test',
-                    suiteClass=pkg5unittest.Pkg5TestSuite))
 
-        return suite
+        testclasses = [
+            loader.loadTestsFromTestCase(cobj) for cobj in testclasses
+        ]
+        if time_estimates is None:
+                def __key(c):
+                        return c.test_count()
+        else:
+                def __key(c):
+                        if testdir not in time_estimates:
+                                return c.test_count()
+                        if not c.tests:
+                                return 0
+                        mod, c_name = pkg5unittest.find_names(c.tests[0])
+                        res = 0
+                        for test in c.tests:
+                                res += pkg5unittest.Pkg5TestRunner.\
+                                    estimate_method_time(
+                                    time_estimates, testdir, c_name,
+                                    test.methodName)
+                        return res
+        suite_list = []
+        for t in sorted(testclasses, key=__key, reverse=True):
+                if t.test_count():
+                        suite_list.append(t)
+                else:
+                        break
+        return suite_list
 
 def usage():
         print >> sys.stderr, "Usage: %s [-cghptv] [-b filename] [-o regexp]" \
@@ -190,18 +218,22 @@ def usage():
                 "[-o regexp]" % sys.argv[0]
         print >> sys.stderr, \
 """   -a <dir>       Archive failed test cases to <dir>/$pid/$testcasename
+   -b <filename>  Baseline filename
    -c             Collect code coverage data
    -d             Show debug output, including commands run, and outputs
    -f             Show fail/error information even when test is expected to fail
    -g             Generate result baseline
    -h             This help message
+   -j             Parallelism
+   -o <regexp>    Run only tests that match regexp
    -p             Parseable output format
+   -q             Quiet output
+   -s <regexp>    Run tests starting at regexp
    -t             Generate timing info file
+   -u             Enable IPS GUI tests, disabled by default
    -v             Verbose output
    -x             Stop after the first baseline mismatch
-   -b <filename>  Baseline filename
-   -o <regexp>    Run only tests that match regexp
-   -s <regexp>    Run tests starting at regexp
+   -z <port>      Lowest port the test suite should use
 """
         sys.exit(2)
 
@@ -217,9 +249,9 @@ if __name__ == "__main__":
                 # If you add options here, you need to also update setup.py's
                 # test_func to include said options.
                 #
-                opts, pargs = getopt.getopt(sys.argv[1:], "a:cdfghptvxb:o:s:",
-                    ["generate-baseline", "parseable", "timing", "verbose",
-                    "baseline-file", "only"])
+                opts, pargs = getopt.getopt(sys.argv[1:], "a:cdfghj:pqtuvxb:o:s:z:",
+                    ["generate-baseline", "parseable", "port", "timing",
+                    "verbose", "baseline-file", "only"])
         except getopt.GetoptError, e:
                 print >> sys.stderr, "Illegal option -- %s" % e.opt
                 sys.exit(1)
@@ -234,7 +266,10 @@ if __name__ == "__main__":
         do_coverage = False
         debug_output = False
         show_on_expected_fail = False
+        enable_gui_tests = False
         archive_dir = None
+        port = 12001
+        quiet = False
 
         for opt, arg in opts:
                 if opt == "-v":
@@ -253,6 +288,8 @@ if __name__ == "__main__":
                         bfile = arg
                 if opt == "-o":
                         onlyval.append(arg)
+                if opt == "-u":
+                        enable_gui_tests = True
                 if opt == "-x":
                         bailonfail = True
                 if opt == "-t":
@@ -261,10 +298,27 @@ if __name__ == "__main__":
                         startattest = arg
                 if opt == "-a":
                         archive_dir = arg
+                if opt == "-z":
+                        try:
+                                port = int(arg)
+                        except ValueError:
+                                print >> sys.stderr, "The provided port must " \
+                                    "be an integer."
+                                usage()
                 if opt == "-h":
 			usage()
+                if opt == "-j":
+                        jobs = int(arg)
+                if opt == "-q":
+                        quiet = True
         if (bailonfail or startattest) and generate:
                 usage()
+        if quiet and (output != OUTPUT_DOTS):
+                print >> sys.stderr, "-q cannot be used with -v or -p"
+                usage()
+
+        if output != OUTPUT_DOTS:
+                quiet = True
         if not onlyval:
                 onlyval = [ "" ]
 
@@ -295,28 +349,41 @@ if __name__ == "__main__":
                             ppriv, "-s", "A-sys_linkdir", str(os.getpid())
                         ])
 
-        api_suite = find_tests("api", onlyval, startattest, output)
-        cli_suite = find_tests("cli", onlyval, startattest, output)
+
+        time_estimates = {}
+        timing_history = os.path.join(os.getcwd(), ".timing_history.txt")
+        if os.path.exists(timing_history):
+                with open(timing_history, "rb") as fh:
+                        ver, time_estimates = json.load(fh)
+
+        api_suite = find_tests("api", onlyval, startattest, output,
+            time_estimates)
+        cli_suite = find_tests("cli", onlyval, startattest, output,
+            time_estimates)
+        distro_suite = find_tests("distro-import", onlyval, startattest, output,
+            time_estimates)
 
         suites = []
         suites.append(api_suite)
         if ostype == "posix":
                 suites.append(cli_suite)
-                try:
-                        import gui.testutils
-                except Exception, e:
-                        print "# %s" % e
-                else:
-                        if not gui.testutils.check_for_gtk():
-                                print "# GTK not present or $DISPLAY not " \
-                                    "set, GUI tests disabled."
-                        elif not gui.testutils.check_if_a11y_enabled():
-                                print "# Accessibility not enabled, GUI " \
-                                    "tests disabled."
+                suites.append(distro_suite)
+                if enable_gui_tests:
+                        try:
+                                import gui.testutils
+                        except Exception, e:
+                                print "# %s" % e
                         else:
-                                gui_suite = find_tests("gui", onlyval,
-                                    startattest, output)
-                                suites.append(gui_suite)
+                                if not gui.testutils.check_for_gtk():
+                                        print "# GTK not present or $DISPLAY not " \
+                                            "set, GUI tests disabled."
+                                elif not gui.testutils.check_if_a11y_enabled():
+                                        print "# Accessibility not enabled, GUI " \
+                                            "tests disabled."
+                                else:
+                                        gui_suite = find_tests("gui", onlyval,
+                                            startattest, output, time_estimates)
+                                        suites.append(gui_suite)
 
         # This is primarily of interest to developers altering the test suite,
         # so don't enable it for now.  The testsuite suite tends to emit a bunch
@@ -349,18 +416,30 @@ if __name__ == "__main__":
         else:
                 cov_env = {}
                 cov_cmd = ""
+
+        # Set the task id for this process so that we can cleanly kill
+        # all processes started.
+        cmd = ["newtask", "-c", str(os.getpid())]
+        ret = subprocess.call(cmd)
+        if ret != 0:
+                print >> sys.stderr, "Couldn't find the 'newtask' command.  " \
+                    "Please ensure it's in your path before running the test " \
+                    "suite."
+                sys.exit(1)
         
         # Run the python test suites
         runner = pkg5unittest.Pkg5TestRunner(baseline, output=output,
             timing_file=timing_file,
+            timing_history=timing_history,
             bailonfail=bailonfail,
             coverage=(cov_cmd, cov_env),
             show_on_expected_fail=show_on_expected_fail,
             archive_dir=archive_dir)
         exitval = 0
-        for x in suites:
+        for suite_list in suites:
                 try:
-                        res = runner.run(x)
+                        res = runner.run(suite_list, jobs, port,
+                            time_estimates, quiet, bfile)
                 except pkg5unittest.Pkg5TestCase.failureException, e:
                         exitval = 1
                         print >> sys.stderr
@@ -415,5 +494,4 @@ if __name__ == "__main__":
                                 os.chown("htmlcov/%s" % f, uid, gid)
                 except EnvironmentError:
                         pass
-
         sys.exit(exitval)
