@@ -29,8 +29,18 @@ set name=pkg.depend.install-hold value=core-os.ips
 set name=info.classification \
     value=org.opensolaris.category.2008:System/Packaging
 
-# Since these are not delivered through the package gate, they are explicitly
-# declared here since no other package incorporates them in build 151.
+#
+# Since these are no longer delivered through the package gate, they are
+# explicitly declared here since no other package incorporates them in
+# build 151a.
+#
+depend type=incorporate fmri=SUNWldtp@1.7.1-0.133 pkg.debug.keepme=true
+depend type=incorporate fmri=SUNWpython-cherrypy@3.1.2-0.133 \
+    pkg.debug.keepme=true
+depend type=incorporate fmri=SUNWpython-mako@0.2.2-0.133 pkg.debug.keepme=true
+depend type=incorporate fmri=SUNWpython-ply@3.1-0.133 pkg.debug.keepme=true
+depend type=incorporate fmri=SUNWpython-pycurl@7.19.0.1-0.133 \
+    pkg.debug.keepme=true
 depend type=incorporate fmri=library/python-2/cherrypy@3.1.2-0.151.0.1 \
     pkg.debug.keepme=true
 depend type=incorporate fmri=library/python-2/coverage@3.2-0.151.0.1 \
